@@ -1,7 +1,7 @@
 --[[
 	Aero Key System
-	Supports: weekly / monthly / lifetime
-	Keys file is encrypted (useless if opened)
+	Supports: weekly / monthly / lifetime keys
+	Keys are stored only in remote keys.txt
 ]]
 local UserInputService = game:GetService('UserInputService')
 local TweenService = game:GetService('TweenService')
@@ -13,84 +13,9 @@ local LocalPlayer = Players.LocalPlayer
 -- ======================== KEY CONFIG ========================
 local REMOTE_KEYS_URL = "https://raw.githubusercontent.com/og6crep-max/Aeroo/main/keys.txt"
 
--- Change this secret to anything you want (keep it private)
-local ENCRYPT_SECRET = "AeroStarSecret9Xk2"
-
 local KEY_SAVE_FILE = "aero_key.txt"
-local KEY_DATA_FILE = "aero_key_data.txt"
+local KEY_DATA_FILE = "aero_key_data.txt"   -- stores activation time + type
 -- ============================================================
-
--- Simple XOR + base64 style encode/decode
-local function xorCrypt(data, key)
-    local result = {}
-    local keyLen = #key
-    for i = 1, #data do
-        local byte = string.byte(data, i)
-        local keyByte = string.byte(key, ((i - 1) % keyLen) + 1)
-        table.insert(result, string.char(bit32.bxor(byte, keyByte)))
-    end
-    return table.concat(result)
-end
-
-local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-local function base64Encode(data)
-    local result = {}
-    local len = #data
-    local i = 1
-    while i <= len do
-        local a = string.byte(data, i) or 0
-        local b = string.byte(data, i + 1) or 0
-        local c = string.byte(data, i + 2) or 0
-        local n = a * 65536 + b * 256 + c
-        local c1 = math.floor(n / 262144) % 64 + 1
-        local c2 = math.floor(n / 4096) % 64 + 1
-        local c3 = math.floor(n / 64) % 64 + 1
-        local c4 = n % 64 + 1
-        local pad = (i + 1 > len) and 2 or (i + 2 > len) and 1 or 0
-        table.insert(result, b64chars:sub(c1, c1))
-        table.insert(result, b64chars:sub(c2, c2))
-        table.insert(result, pad >= 2 and "=" or b64chars:sub(c3, c3))
-        table.insert(result, pad >= 1 and "=" or b64chars:sub(c4, c4))
-        i = i + 3
-    end
-    return table.concat(result)
-end
-
-local function base64Decode(data)
-    data = data:gsub("[^" .. b64chars .. "=]", "")
-    local result = {}
-    local i = 1
-    while i <= #data do
-        local c1 = (b64chars:find(data:sub(i, i), 1, true) or 1) - 1
-        local c2 = (b64chars:find(data:sub(i + 1, i + 1), 1, true) or 1) - 1
-        local c3 = (b64chars:find(data:sub(i + 2, i + 2), 1, true) or 1) - 1
-        local c4 = (b64chars:find(data:sub(i + 3, i + 3), 1, true) or 1) - 1
-        local n = c1 * 262144 + c2 * 4096 + c3 * 64 + c4
-        table.insert(result, string.char(math.floor(n / 65536) % 256))
-        if data:sub(i + 2, i + 2) ~= "=" then
-            table.insert(result, string.char(math.floor(n / 256) % 256))
-        end
-        if data:sub(i + 3, i + 3) ~= "=" then
-            table.insert(result, string.char(n % 256))
-        end
-        i = i + 4
-    end
-    return table.concat(result)
-end
-
-local function encryptKeys(plainText)
-    local xored = xorCrypt(plainText, ENCRYPT_SECRET)
-    return base64Encode(xored)
-end
-
-local function decryptKeys(encoded)
-    local ok, decoded = pcall(base64Decode, encoded)
-    if not ok or not decoded then return nil end
-    local ok2, result = pcall(xorCrypt, decoded, ENCRYPT_SECRET)
-    if not ok2 then return nil end
-    return result
-end
 
 local function getUIParent()
     local success = pcall(function() return CoreGui.Name end)
@@ -134,6 +59,13 @@ local function loadKeyData()
     return nil
 end
 
+-- Parse keys.txt
+-- Supported formats (one per line):
+--   KEY                    → lifetime
+--   KEY | lifetime
+--   KEY | weekly
+--   KEY | monthly
+--   KEY | weekly | 2026-11-12     (optional fixed expiry date YYYY-MM-DD)
 local function fetchRemoteKeys()
     if not REMOTE_KEYS_URL or REMOTE_KEYS_URL == "" then
         return {}
@@ -145,23 +77,19 @@ local function fetchRemoteKeys()
         return {}
     end
 
-    -- Try decrypt first (encrypted file). If it fails, treat as plain text (backwards compatible)
-    local plain = decryptKeys(result:gsub("%s+", ""))
-    if not plain or plain == "" or not plain:find("AERO") then
-        plain = result  -- fallback to plain text
-    end
-
     local keys = {}
-    for line in plain:gmatch("[^\r\n]+") do
+    for line in result:gmatch("[^\r\n]+") do
         line = line:gsub("^%s+", ""):gsub("%s+$", "")
         if line ~= "" and not line:match("^#") and not line:match("^//") then
             local parts = {}
             for part in line:gmatch("[^|]+") do
                 table.insert(parts, part:gsub("^%s+", ""):gsub("%s+$", ""))
             end
+
             local key = parts[1]
             local keyType = (parts[2] or "lifetime"):lower()
-            local expiryDate = parts[3]
+            local expiryDate = parts[3]  -- optional YYYY-MM-DD
+
             if key and key ~= "" then
                 keys[key] = {
                     type = keyType,
@@ -179,26 +107,35 @@ local function getDurationSeconds(keyType)
     elseif keyType == "monthly" then
         return 30 * 24 * 60 * 60
     else
-        return nil
+        return nil  -- lifetime
     end
 end
 
 local function isKeyStillValid(key, keyInfo)
     if not keyInfo then return false end
+
     local data = loadKeyData()
     local now = os.time()
 
+    -- Fixed expiry date in keys.txt (YYYY-MM-DD)
     if keyInfo.expiry and keyInfo.expiry ~= "" then
         local y, m, d = keyInfo.expiry:match("(%d+)-(%d+)-(%d+)")
         if y and m and d then
             local exp = os.time({year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 23, min = 59, sec = 59})
-            if now > exp then return false end
+            if now > exp then
+                return false
+            end
         end
     end
 
     local duration = getDurationSeconds(keyInfo.type)
-    if not duration then return true end
 
+    -- Lifetime
+    if not duration then
+        return true
+    end
+
+    -- First time using this key → activate it now
     if not data or data.key ~= key then
         saveKeyData({
             key = key,
@@ -208,19 +145,27 @@ local function isKeyStillValid(key, keyInfo)
         return true
     end
 
+    -- Already activated → check remaining time
     local activated = tonumber(data.activated) or now
-    if now > (activated + duration) then
-        return false
+    local expiresAt = activated + duration
+
+    if now > expiresAt then
+        return false  -- expired
     end
+
     return true
 end
 
 local function isValidKey(inputKey)
     if not inputKey or inputKey == "" then return false end
     inputKey = inputKey:gsub("%s+", "")
+
     local remote = fetchRemoteKeys()
     local keyInfo = remote[inputKey]
-    if not keyInfo then return false end
+    if not keyInfo then
+        return false
+    end
+
     return isKeyStillValid(inputKey, keyInfo)
 end
 
@@ -228,22 +173,30 @@ local function getKeyStatusText(key)
     local remote = fetchRemoteKeys()
     local keyInfo = remote[key]
     if not keyInfo then return "Invalid" end
+
     if keyInfo.type == "lifetime" or not getDurationSeconds(keyInfo.type) then
         return "Lifetime"
     end
+
     local data = loadKeyData()
     if not data or data.key ~= key then
         return keyInfo.type:upper()
     end
+
     local duration = getDurationSeconds(keyInfo.type)
     local activated = tonumber(data.activated) or os.time()
     local remaining = (activated + duration) - os.time()
-    if remaining <= 0 then return "Expired" end
+
+    if remaining <= 0 then
+        return "Expired"
+    end
+
     local days = math.floor(remaining / 86400)
     local hours = math.floor((remaining % 86400) / 3600)
     return string.format("%s (%dd %dh left)", keyInfo.type:upper(), days, hours)
 end
 
+-- Auto-check saved key
 local saved = loadSavedKey()
 local alreadyValid = saved and isValidKey(saved)
 
@@ -367,8 +320,10 @@ if not alreadyValid then
             Status.TextColor3 = Color3.fromRGB(239, 68, 68)
             return
         end
+
         Status.Text = "Checking..."
         Status.TextColor3 = Color3.fromRGB(160, 160, 165)
+
         task.spawn(function()
             if isValidKey(key) then
                 Status.Text = "Key accepted - " .. getKeyStatusText(key)
@@ -399,53 +354,6 @@ if not alreadyValid then
 end
 
 -- ======================== MAIN SCRIPT STARTS HERE ========================
--- Shared key time helper (used by UI countdown)
-local function AeroGetRemaining()
-    local KEY_DATA_FILE = "aero_key_data.txt"
-    local HttpService = game:GetService("HttpService")
-    if not (isfile and readfile and isfile(KEY_DATA_FILE)) then
-        return nil, "Lifetime"
-    end
-    local ok, raw = pcall(readfile, KEY_DATA_FILE)
-    if not ok or not raw or raw == "" then
-        return nil, "Lifetime"
-    end
-    local success, data = pcall(function()
-        return HttpService:JSONDecode(raw)
-    end)
-    if not success or type(data) ~= "table" then
-        return nil, "Lifetime"
-    end
-    local keyType = tostring(data.type or "lifetime"):lower()
-    if keyType == "lifetime" then
-        return nil, "Lifetime"
-    end
-    local duration = 0
-    if keyType == "weekly" then
-        duration = 7 * 24 * 60 * 60
-    elseif keyType == "monthly" then
-        duration = 30 * 24 * 60 * 60
-    else
-        return nil, "Lifetime"
-    end
-    local activated = tonumber(data.activated) or os.time()
-    local remaining = (activated + duration) - os.time()
-    if remaining < 0 then remaining = 0 end
-    return remaining, keyType
-end
-
-local function AeroFormatRemaining(seconds)
-    if seconds == nil then
-        return "Lifetime"
-    end
-    seconds = math.max(0, math.floor(seconds))
-    local days = math.floor(seconds / 86400)
-    local hours = math.floor((seconds % 86400) / 3600)
-    local mins = math.floor((seconds % 3600) / 60)
-    return string.format("%dd %dh %dm", days, hours, mins)
-end
-
-
 local UserInputService = game:GetService('UserInputService')
 local TweenService = game:GetService('TweenService')
 local RunService = game:GetService('RunService')
@@ -1154,7 +1062,7 @@ AeroLib.CreateWindow = function(self, options)
         Parent = LogoContainer,
         BackgroundTransparency = 1,
         Position = UDim2.new(0, 22, 0, 0),
-        Size = UDim2.new(0, 52, 1, 0),
+        Size = UDim2.new(0, 80, 1, 0),
         Font = Enum.Font.GothamBold,
         Text = 'Aero',
         TextColor3 = Theme.TextMain,
@@ -1164,44 +1072,7 @@ AeroLib.CreateWindow = function(self, options)
     })
     regTheme(TitleLabel, function() TitleLabel.TextColor3 = Theme.TextMain end)
 
-    -- Live key time remaining next to Aero
-    local TimeLabel = createInstance('TextLabel', {
-        Parent = LogoContainer,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 74, 0, 0),
-        Size = UDim2.new(0, 120, 1, 0),
-        Font = Enum.Font.GothamMedium,
-        Text = '',
-        TextColor3 = Theme.TextSub,
-        TextSize = 11,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Center
-    })
-    regTheme(TimeLabel, function() TimeLabel.TextColor3 = Theme.TextSub end)
-
-    LogoContainer.Size = UDim2.new(0, 200, 1, 0)
-
-    task.spawn(function()
-        while TimeLabel and TimeLabel.Parent do
-            local remaining, keyType = AeroGetRemaining()
-            if remaining == nil then
-                TimeLabel.Text = "· Lifetime"
-                TimeLabel.TextColor3 = Theme.Accent
-            else
-                TimeLabel.Text = "· " .. AeroFormatRemaining(remaining)
-                if remaining <= 3600 then
-                    TimeLabel.TextColor3 = Color3.fromRGB(239, 68, 68) -- red when < 1 hour
-                elseif remaining <= 86400 then
-                    TimeLabel.TextColor3 = Color3.fromRGB(251, 191, 36) -- yellow when < 1 day
-                else
-                    TimeLabel.TextColor3 = Theme.TextSub
-                end
-            end
-            task.wait(30) -- update every 30s
-        end
-    end)
-
-    local titleBounds = Vector2.new(200, 48)
+    local titleBounds = Vector2.new(110, 48)
     local cleanTitle = 'Aero' 
 
     local profileText = 'Welcome, ' .. LocalPlayer.Name
@@ -1421,7 +1292,7 @@ AeroLib.CreateWindow = function(self, options)
         PopulateSearch(SearchInputBox.Text)
     end)
 
-    local startX = 14 + titleBounds.X + 8
+    local startX = 14 + titleBounds.X + 12
     local endX = 580 - 15 - (profileBounds.X + 42) - 15 - 30
     local subTabsWidth = endX - startX
 
@@ -6856,7 +6727,9 @@ task.spawn(function()
             if not adminTag then continue end
             
             if adminTag.Value ~= "" and antiAdmin.Value then
-                player:Kick("[Aero] Detected Admin\nName: " .. admin.Name .. "\nID: " .. admin.UserId)
+                player:Kick("[Aero] Detected Admin\
+Name: " .. admin.Name .. "\
+ID: " .. admin.UserId)
             end
         end
     end

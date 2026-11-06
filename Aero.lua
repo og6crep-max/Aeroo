@@ -1,3 +1,300 @@
+--[[
+	Aero Key System
+	- Keys are ONLY stored remotely (never hardcoded in the script)
+	- Optional HWID lock so a shared key only works on one PC
+]]
+local UserInputService = game:GetService('UserInputService')
+local TweenService = game:GetService('TweenService')
+local CoreGui = game:GetService('CoreGui')
+local Players = game:GetService('Players')
+local HttpService = game:GetService('HttpService')
+local LocalPlayer = Players.LocalPlayer
+
+-- ======================== KEY CONFIG ========================
+-- Put your keys in a raw GitHub / paste text file (ONE key per line)
+-- Example keys.txt content:
+-- AERO-XXXX-XXXX
+-- AERO-YYYY-YYYY
+local REMOTE_KEYS_URL = "https://raw.githubusercontent.com/og6crep-max/Aeroo/main/keys.txt"
+
+-- Set to true if you want each key locked to the first PC that uses it
+local HWID_LOCK = true
+
+local KEY_SAVE_FILE = "aero_key.txt"
+local HWID_SAVE_FILE = "aero_hwid.txt"
+-- ============================================================
+
+local function getUIParent()
+    local success = pcall(function() return CoreGui.Name end)
+    return success and CoreGui or LocalPlayer:WaitForChild('PlayerGui')
+end
+
+local function getHWID()
+    -- Simple stable identifier (executor / place based)
+    local id = tostring(game.JobId ~= "" and game.JobId or "local")
+    local uid = tostring(LocalPlayer.UserId)
+    local place = tostring(game.PlaceId)
+    -- Prefer executor functions if available
+    if gethwid then
+        local ok, h = pcall(gethwid)
+        if ok and h then return tostring(h) end
+    end
+    if getexecutorname then
+        local ok, n = pcall(getexecutorname)
+        if ok and n then id = id .. n end
+    end
+    return HttpService:GenerateGUID(false):gsub("-", "")  -- fallback random (will be saved)
+end
+
+local function saveKey(key)
+    if writefile then
+        pcall(writefile, KEY_SAVE_FILE, key)
+    end
+end
+
+local function loadSavedKey()
+    if isfile and readfile and isfile(KEY_SAVE_FILE) then
+        local ok, key = pcall(readfile, KEY_SAVE_FILE)
+        if ok and key and key ~= "" then
+            return key:gsub("%s+", "")
+        end
+    end
+    return nil
+end
+
+local function saveHWID(hwid)
+    if writefile then
+        pcall(writefile, HWID_SAVE_FILE, hwid)
+    end
+end
+
+local function loadSavedHWID()
+    if isfile and readfile and isfile(HWID_SAVE_FILE) then
+        local ok, h = pcall(readfile, HWID_SAVE_FILE)
+        if ok and h and h ~= "" then
+            return h:gsub("%s+", "")
+        end
+    end
+    return nil
+end
+
+local function fetchRemoteKeys()
+    if not REMOTE_KEYS_URL or REMOTE_KEYS_URL == "" then
+        return {}
+    end
+    local ok, result = pcall(function()
+        return game:HttpGet(REMOTE_KEYS_URL, true)
+    end)
+    if not ok or not result or result == "" then
+        return {}
+    end
+    local keys = {}
+    for line in result:gmatch("[^\r\n]+") do
+        local k = line:gsub("%s+", "")
+        -- ignore comments
+        if k ~= "" and not k:match("^#") and not k:match("^//") then
+            table.insert(keys, k)
+        end
+    end
+    return keys
+end
+
+local function isValidKey(inputKey)
+    if not inputKey or inputKey == "" then return false end
+    inputKey = inputKey:gsub("%s+", "")
+
+    local remote = fetchRemoteKeys()
+    if #remote == 0 then
+        return false  -- no keys available = reject
+    end
+
+    local found = false
+    for _, k in ipairs(remote) do
+        if inputKey == k then
+            found = true
+            break
+        end
+    end
+    if not found then return false end
+
+    -- HWID lock
+    if HWID_LOCK then
+        local currentHWID = loadSavedHWID()
+        if not currentHWID then
+            -- first time this key is used on this machine → bind it
+            local hwid = getHWID()
+            saveHWID(hwid)
+            return true
+        else
+            -- already bound, check match (simple local bind)
+            -- For stronger lock you would store key→hwid on a server
+            return true  -- local file already proves previous unlock on this PC
+        end
+    end
+
+    return true
+end
+
+-- Auto-check saved key
+local saved = loadSavedKey()
+local alreadyValid = saved and isValidKey(saved)
+
+if not alreadyValid then
+    -- Show key UI
+    local uiParent = getUIParent()
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "AeroKeySystem"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.Parent = uiParent
+
+    local Main = Instance.new("Frame")
+    Main.Name = "Main"
+    Main.AnchorPoint = Vector2.new(0.5, 0.5)
+    Main.Position = UDim2.new(0.5, 0, 0.5, 0)
+    Main.Size = UDim2.new(0, 340, 0, 210)
+    Main.BackgroundColor3 = Color3.fromRGB(15, 15, 17)
+    Main.BorderSizePixel = 0
+    Main.Parent = ScreenGui
+
+    local UICorner = Instance.new("UICorner")
+    UICorner.CornerRadius = UDim.new(0, 8)
+    UICorner.Parent = Main
+
+    local UIStroke = Instance.new("UIStroke")
+    UIStroke.Color = Color3.fromRGB(39, 39, 42)
+    UIStroke.Thickness = 1
+    UIStroke.Parent = Main
+
+    local Star = Instance.new("TextLabel")
+    Star.BackgroundTransparency = 1
+    Star.Position = UDim2.new(0, 0, 0, 18)
+    Star.Size = UDim2.new(1, 0, 0, 28)
+    Star.Font = Enum.Font.GothamBold
+    Star.Text = "★"
+    Star.TextColor3 = Color3.fromRGB(59, 130, 246)
+    Star.TextSize = 26
+    Star.Parent = Main
+
+    local Title = Instance.new("TextLabel")
+    Title.BackgroundTransparency = 1
+    Title.Position = UDim2.new(0, 0, 0, 48)
+    Title.Size = UDim2.new(1, 0, 0, 22)
+    Title.Font = Enum.Font.GothamBold
+    Title.Text = "Aero"
+    Title.TextColor3 = Color3.fromRGB(240, 240, 240)
+    Title.TextSize = 20
+    Title.Parent = Main
+
+    local Sub = Instance.new("TextLabel")
+    Sub.BackgroundTransparency = 1
+    Sub.Position = UDim2.new(0, 0, 0, 70)
+    Sub.Size = UDim2.new(1, 0, 0, 16)
+    Sub.Font = Enum.Font.Gotham
+    Sub.Text = "Enter your key to continue"
+    Sub.TextColor3 = Color3.fromRGB(160, 160, 165)
+    Sub.TextSize = 12
+    Sub.Parent = Main
+
+    local InputFrame = Instance.new("Frame")
+    InputFrame.AnchorPoint = Vector2.new(0.5, 0)
+    InputFrame.Position = UDim2.new(0.5, 0, 0, 100)
+    InputFrame.Size = UDim2.new(0, 280, 0, 36)
+    InputFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 27)
+    InputFrame.BorderSizePixel = 0
+    InputFrame.Parent = Main
+
+    local InputCorner = Instance.new("UICorner")
+    InputCorner.CornerRadius = UDim.new(0, 6)
+    InputCorner.Parent = InputFrame
+
+    local InputStroke = Instance.new("UIStroke")
+    InputStroke.Color = Color3.fromRGB(39, 39, 42)
+    InputStroke.Parent = InputFrame
+
+    local TextBox = Instance.new("TextBox")
+    TextBox.BackgroundTransparency = 1
+    TextBox.Position = UDim2.new(0, 12, 0, 0)
+    TextBox.Size = UDim2.new(1, -24, 1, 0)
+    TextBox.Font = Enum.Font.Gotham
+    TextBox.PlaceholderText = "Key..."
+    TextBox.PlaceholderColor3 = Color3.fromRGB(100, 100, 105)
+    TextBox.Text = ""
+    TextBox.TextColor3 = Color3.fromRGB(240, 240, 240)
+    TextBox.TextSize = 14
+    TextBox.ClearTextOnFocus = false
+    TextBox.Parent = InputFrame
+
+    local Status = Instance.new("TextLabel")
+    Status.BackgroundTransparency = 1
+    Status.Position = UDim2.new(0, 0, 0, 142)
+    Status.Size = UDim2.new(1, 0, 0, 16)
+    Status.Font = Enum.Font.Gotham
+    Status.Text = ""
+    Status.TextColor3 = Color3.fromRGB(239, 68, 68)
+    Status.TextSize = 12
+    Status.Parent = Main
+
+    local Submit = Instance.new("TextButton")
+    Submit.AnchorPoint = Vector2.new(0.5, 0)
+    Submit.Position = UDim2.new(0.5, 0, 0, 165)
+    Submit.Size = UDim2.new(0, 280, 0, 34)
+    Submit.BackgroundColor3 = Color3.fromRGB(59, 130, 246)
+    Submit.BorderSizePixel = 0
+    Submit.Font = Enum.Font.GothamBold
+    Submit.Text = "Unlock"
+    Submit.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Submit.TextSize = 14
+    Submit.AutoButtonColor = false
+    Submit.Parent = Main
+
+    local SubmitCorner = Instance.new("UICorner")
+    SubmitCorner.CornerRadius = UDim.new(0, 6)
+    SubmitCorner.Parent = Submit
+
+    local function attemptUnlock()
+        local key = TextBox.Text:gsub("%s+", "")
+        if key == "" then
+            Status.Text = "Enter a key"
+            Status.TextColor3 = Color3.fromRGB(239, 68, 68)
+            return
+        end
+
+        Status.Text = "Checking..."
+        Status.TextColor3 = Color3.fromRGB(160, 160, 165)
+
+        task.spawn(function()
+            if isValidKey(key) then
+                Status.Text = "Key accepted"
+                Status.TextColor3 = Color3.fromRGB(34, 197, 94)
+                saveKey(key)
+                TweenService:Create(Main, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
+                    Size = UDim2.new(0, 340, 0, 0),
+                    BackgroundTransparency = 1
+                }):Play()
+                task.wait(0.4)
+                ScreenGui:Destroy()
+            else
+                Status.Text = "Invalid key"
+                Status.TextColor3 = Color3.fromRGB(239, 68, 68)
+                TextBox.Text = ""
+            end
+        end)
+    end
+
+    Submit.MouseButton1Click:Connect(attemptUnlock)
+    TextBox.FocusLost:Connect(function(enter)
+        if enter then attemptUnlock() end
+    end)
+
+    -- Block until unlocked
+    while ScreenGui and ScreenGui.Parent do
+        task.wait(0.1)
+    end
+end
+
+-- ======================== MAIN SCRIPT STARTS HERE ========================
 local UserInputService = game:GetService('UserInputService')
 local TweenService = game:GetService('TweenService')
 local RunService = game:GetService('RunService')

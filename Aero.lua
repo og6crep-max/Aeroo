@@ -1,7037 +1,3505 @@
---[[
-	Aero Key System
-	Supports: weekly / monthly / lifetime keys
-	Keys are stored only in remote keys.txt
-]]
-local UserInputService = game:GetService('UserInputService')
-local TweenService = game:GetService('TweenService')
-local CoreGui = game:GetService('CoreGui')
-local Players = game:GetService('Players')
-local HttpService = game:GetService('HttpService')
-local LocalPlayer = Players.LocalPlayer
-
--- ======================== KEY CONFIG ========================
-local REMOTE_KEYS_URL = "https://raw.githubusercontent.com/og6crep-max/Aeroo/main/keys.txt"
-
-local KEY_SAVE_FILE = "aero_key.txt"
-local KEY_DATA_FILE = "aero_key_data.txt"   -- stores activation time + type
--- ============================================================
-
-local function getUIParent()
-    local success = pcall(function() return CoreGui.Name end)
-    return success and CoreGui or LocalPlayer:WaitForChild('PlayerGui')
-end
-
-local function saveKey(key)
-    if writefile then
-        pcall(writefile, KEY_SAVE_FILE, key)
-    end
-end
-
-local function loadSavedKey()
-    if isfile and readfile and isfile(KEY_SAVE_FILE) then
-        local ok, key = pcall(readfile, KEY_SAVE_FILE)
-        if ok and key and key ~= "" then
-            return key:gsub("%s+", "")
-        end
-    end
-    return nil
-end
-
-local function saveKeyData(data)
-    if writefile then
-        pcall(writefile, KEY_DATA_FILE, HttpService:JSONEncode(data))
-    end
-end
-
-local function loadKeyData()
-    if isfile and readfile and isfile(KEY_DATA_FILE) then
-        local ok, raw = pcall(readfile, KEY_DATA_FILE)
-        if ok and raw and raw ~= "" then
-            local success, data = pcall(function()
-                return HttpService:JSONDecode(raw)
-            end)
-            if success and type(data) == "table" then
-                return data
-            end
-        end
-    end
-    return nil
-end
-
--- Parse keys.txt
--- Supported formats (one per line):
---   KEY                    → lifetime
---   KEY | lifetime
---   KEY | weekly
---   KEY | monthly
---   KEY | weekly | 2026-11-12     (optional fixed expiry date YYYY-MM-DD)
-local function fetchRemoteKeys()
-    if not REMOTE_KEYS_URL or REMOTE_KEYS_URL == "" then
-        return {}
-    end
-    local ok, result = pcall(function()
-        return game:HttpGet(REMOTE_KEYS_URL, true)
-    end)
-    if not ok or not result or result == "" then
-        return {}
-    end
-
-    local keys = {}
-    for line in result:gmatch("[^\r\n]+") do
-        line = line:gsub("^%s+", ""):gsub("%s+$", "")
-        if line ~= "" and not line:match("^#") and not line:match("^//") then
-            local parts = {}
-            for part in line:gmatch("[^|]+") do
-                table.insert(parts, part:gsub("^%s+", ""):gsub("%s+$", ""))
-            end
-
-            local key = parts[1]
-            local keyType = (parts[2] or "lifetime"):lower()
-            local expiryDate = parts[3]  -- optional YYYY-MM-DD
-
-            if key and key ~= "" then
-                keys[key] = {
-                    type = keyType,
-                    expiry = expiryDate
-                }
-            end
-        end
-    end
-    return keys
-end
-
-local function getDurationSeconds(keyType)
-    if keyType == "weekly" then
-        return 7 * 24 * 60 * 60
-    elseif keyType == "monthly" then
-        return 30 * 24 * 60 * 60
-    else
-        return nil  -- lifetime
-    end
-end
-
-local function isKeyStillValid(key, keyInfo)
-    if not keyInfo then return false end
-
-    local data = loadKeyData()
-    local now = os.time()
-
-    -- Fixed expiry date in keys.txt (YYYY-MM-DD)
-    if keyInfo.expiry and keyInfo.expiry ~= "" then
-        local y, m, d = keyInfo.expiry:match("(%d+)-(%d+)-(%d+)")
-        if y and m and d then
-            local exp = os.time({year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 23, min = 59, sec = 59})
-            if now > exp then
-                return false
-            end
-        end
-    end
-
-    local duration = getDurationSeconds(keyInfo.type)
-
-    -- Lifetime
-    if not duration then
-        return true
-    end
-
-    -- First time using this key → activate it now
-    if not data or data.key ~= key then
-        saveKeyData({
-            key = key,
-            type = keyInfo.type,
-            activated = now
-        })
-        return true
-    end
-
-    -- Already activated → check remaining time
-    local activated = tonumber(data.activated) or now
-    local expiresAt = activated + duration
-
-    if now > expiresAt then
-        return false  -- expired
-    end
-
-    return true
-end
-
-local function isValidKey(inputKey)
-    if not inputKey or inputKey == "" then return false end
-    inputKey = inputKey:gsub("%s+", "")
-
-    local remote = fetchRemoteKeys()
-    local keyInfo = remote[inputKey]
-    if not keyInfo then
-        return false
-    end
-
-    return isKeyStillValid(inputKey, keyInfo)
-end
-
-local function getKeyStatusText(key)
-    local remote = fetchRemoteKeys()
-    local keyInfo = remote[key]
-    if not keyInfo then return "Invalid" end
-
-    if keyInfo.type == "lifetime" or not getDurationSeconds(keyInfo.type) then
-        return "Lifetime"
-    end
-
-    local data = loadKeyData()
-    if not data or data.key ~= key then
-        return keyInfo.type:upper()
-    end
-
-    local duration = getDurationSeconds(keyInfo.type)
-    local activated = tonumber(data.activated) or os.time()
-    local remaining = (activated + duration) - os.time()
-
-    if remaining <= 0 then
-        return "Expired"
-    end
-
-    local days = math.floor(remaining / 86400)
-    local hours = math.floor((remaining % 86400) / 3600)
-    return string.format("%s (%dd %dh left)", keyInfo.type:upper(), days, hours)
-end
-
--- Auto-check saved key
-local saved = loadSavedKey()
-local alreadyValid = saved and isValidKey(saved)
-
-if not alreadyValid then
-    local uiParent = getUIParent()
-
-    local ScreenGui = Instance.new("ScreenGui")
-    ScreenGui.Name = "AeroKeySystem"
-    ScreenGui.ResetOnSpawn = false
-    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    ScreenGui.Parent = uiParent
-
-    local Main = Instance.new("Frame")
-    Main.Name = "Main"
-    Main.AnchorPoint = Vector2.new(0.5, 0.5)
-    Main.Position = UDim2.new(0.5, 0, 0.5, 0)
-    Main.Size = UDim2.new(0, 340, 0, 210)
-    Main.BackgroundColor3 = Color3.fromRGB(15, 15, 17)
-    Main.BorderSizePixel = 0
-    Main.Parent = ScreenGui
-
-    local UICorner = Instance.new("UICorner")
-    UICorner.CornerRadius = UDim.new(0, 8)
-    UICorner.Parent = Main
-
-    local UIStroke = Instance.new("UIStroke")
-    UIStroke.Color = Color3.fromRGB(39, 39, 42)
-    UIStroke.Thickness = 1
-    UIStroke.Parent = Main
-
-    local Star = Instance.new("TextLabel")
-    Star.BackgroundTransparency = 1
-    Star.Position = UDim2.new(0, 0, 0, 18)
-    Star.Size = UDim2.new(1, 0, 0, 28)
-    Star.Font = Enum.Font.GothamBold
-    Star.Text = "★"
-    Star.TextColor3 = Color3.fromRGB(59, 130, 246)
-    Star.TextSize = 26
-    Star.Parent = Main
-
-    local Title = Instance.new("TextLabel")
-    Title.BackgroundTransparency = 1
-    Title.Position = UDim2.new(0, 0, 0, 48)
-    Title.Size = UDim2.new(1, 0, 0, 22)
-    Title.Font = Enum.Font.GothamBold
-    Title.Text = "Aero"
-    Title.TextColor3 = Color3.fromRGB(240, 240, 240)
-    Title.TextSize = 20
-    Title.Parent = Main
-
-    local Sub = Instance.new("TextLabel")
-    Sub.BackgroundTransparency = 1
-    Sub.Position = UDim2.new(0, 0, 0, 70)
-    Sub.Size = UDim2.new(1, 0, 0, 16)
-    Sub.Font = Enum.Font.Gotham
-    Sub.Text = "Enter your key to continue"
-    Sub.TextColor3 = Color3.fromRGB(160, 160, 165)
-    Sub.TextSize = 12
-    Sub.Parent = Main
-
-    local InputFrame = Instance.new("Frame")
-    InputFrame.AnchorPoint = Vector2.new(0.5, 0)
-    InputFrame.Position = UDim2.new(0.5, 0, 0, 100)
-    InputFrame.Size = UDim2.new(0, 280, 0, 36)
-    InputFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 27)
-    InputFrame.BorderSizePixel = 0
-    InputFrame.Parent = Main
-
-    local InputCorner = Instance.new("UICorner")
-    InputCorner.CornerRadius = UDim.new(0, 6)
-    InputCorner.Parent = InputFrame
-
-    local InputStroke = Instance.new("UIStroke")
-    InputStroke.Color = Color3.fromRGB(39, 39, 42)
-    InputStroke.Parent = InputFrame
-
-    local TextBox = Instance.new("TextBox")
-    TextBox.BackgroundTransparency = 1
-    TextBox.Position = UDim2.new(0, 12, 0, 0)
-    TextBox.Size = UDim2.new(1, -24, 1, 0)
-    TextBox.Font = Enum.Font.Gotham
-    TextBox.PlaceholderText = "Key..."
-    TextBox.PlaceholderColor3 = Color3.fromRGB(100, 100, 105)
-    TextBox.Text = ""
-    TextBox.TextColor3 = Color3.fromRGB(240, 240, 240)
-    TextBox.TextSize = 14
-    TextBox.ClearTextOnFocus = false
-    TextBox.Parent = InputFrame
-
-    local Status = Instance.new("TextLabel")
-    Status.BackgroundTransparency = 1
-    Status.Position = UDim2.new(0, 0, 0, 142)
-    Status.Size = UDim2.new(1, 0, 0, 16)
-    Status.Font = Enum.Font.Gotham
-    Status.Text = ""
-    Status.TextColor3 = Color3.fromRGB(239, 68, 68)
-    Status.TextSize = 12
-    Status.Parent = Main
-
-    local Submit = Instance.new("TextButton")
-    Submit.AnchorPoint = Vector2.new(0.5, 0)
-    Submit.Position = UDim2.new(0.5, 0, 0, 165)
-    Submit.Size = UDim2.new(0, 280, 0, 34)
-    Submit.BackgroundColor3 = Color3.fromRGB(59, 130, 246)
-    Submit.BorderSizePixel = 0
-    Submit.Font = Enum.Font.GothamBold
-    Submit.Text = "Unlock"
-    Submit.TextColor3 = Color3.fromRGB(255, 255, 255)
-    Submit.TextSize = 14
-    Submit.AutoButtonColor = false
-    Submit.Parent = Main
-
-    local SubmitCorner = Instance.new("UICorner")
-    SubmitCorner.CornerRadius = UDim.new(0, 6)
-    SubmitCorner.Parent = Submit
-
-    local function attemptUnlock()
-        local key = TextBox.Text:gsub("%s+", "")
-        if key == "" then
-            Status.Text = "Enter a key"
-            Status.TextColor3 = Color3.fromRGB(239, 68, 68)
-            return
-        end
-
-        Status.Text = "Checking..."
-        Status.TextColor3 = Color3.fromRGB(160, 160, 165)
-
-        task.spawn(function()
-            if isValidKey(key) then
-                Status.Text = "Key accepted - " .. getKeyStatusText(key)
-                Status.TextColor3 = Color3.fromRGB(34, 197, 94)
-                saveKey(key)
-                TweenService:Create(Main, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
-                    Size = UDim2.new(0, 340, 0, 0),
-                    BackgroundTransparency = 1
-                }):Play()
-                task.wait(0.45)
-                ScreenGui:Destroy()
-            else
-                Status.Text = "Invalid or expired key"
-                Status.TextColor3 = Color3.fromRGB(239, 68, 68)
-                TextBox.Text = ""
-            end
-        end)
-    end
-
-    Submit.MouseButton1Click:Connect(attemptUnlock)
-    TextBox.FocusLost:Connect(function(enter)
-        if enter then attemptUnlock() end
-    end)
-
-    while ScreenGui and ScreenGui.Parent do
-        task.wait(0.1)
-    end
-end
-
--- ======================== MAIN SCRIPT STARTS HERE ========================
-local UserInputService = game:GetService('UserInputService')
-local TweenService = game:GetService('TweenService')
-local RunService = game:GetService('RunService')
-local CoreGui = game:GetService('CoreGui')
-local Players = game:GetService('Players')
-local TextService = game:GetService('TextService')
-local HttpService = game:GetService('HttpService')
-
-local LocalPlayer = Players.LocalPlayer
-local uiParent = (pcall(function() return CoreGui.Name end) and CoreGui) or LocalPlayer:WaitForChild('PlayerGui')
-
-local Themes = {
-    ['Default'] = {
-        MainBG = Color3.fromRGB(15, 15, 17),
-        SidebarBG = Color3.fromRGB(18, 18, 21),
-        TopbarBG = Color3.fromRGB(12, 12, 14),
-        ElementBG = Color3.fromRGB(24, 24, 27),
-        Accent = Color3.fromRGB(59, 130, 246),
-        TextMain = Color3.fromRGB(240, 240, 240),
-        TextSub = Color3.fromRGB(160, 160, 165),
-        Border = Color3.fromRGB(39, 39, 42),
-        DropdownListBG = Color3.fromRGB(24, 24, 27),
-        DropdownListStroke = Color3.fromRGB(39, 39, 42)
-    },
-    ['Dracula'] = {
-        MainBG = Color3.fromRGB(40, 42, 54),
-        SidebarBG = Color3.fromRGB(33, 34, 44),
-        TopbarBG = Color3.fromRGB(24, 25, 33),
-        ElementBG = Color3.fromRGB(56, 58, 89),
-        Accent = Color3.fromRGB(189, 147, 249),
-        TextMain = Color3.fromRGB(248, 248, 242),
-        TextSub = Color3.fromRGB(160, 165, 180),
-        Border = Color3.fromRGB(68, 71, 90),
-        DropdownListBG = Color3.fromRGB(56, 58, 89),
-        DropdownListStroke = Color3.fromRGB(68, 71, 90)
-    },
-    ['Tokyo Night'] = {
-        MainBG = Color3.fromRGB(26, 27, 38),
-        SidebarBG = Color3.fromRGB(31, 35, 53),
-        TopbarBG = Color3.fromRGB(22, 22, 30),
-        ElementBG = Color3.fromRGB(41, 46, 66),
-        Accent = Color3.fromRGB(122, 162, 247),
-        TextMain = Color3.fromRGB(192, 202, 245),
-        TextSub = Color3.fromRGB(120, 124, 153),
-        Border = Color3.fromRGB(56, 62, 86),
-        DropdownListBG = Color3.fromRGB(41, 46, 66),
-        DropdownListStroke = Color3.fromRGB(56, 62, 86)
-    },
-    ['Catppuccin'] = {
-        MainBG = Color3.fromRGB(30, 30, 46),
-        SidebarBG = Color3.fromRGB(24, 24, 37),
-        TopbarBG = Color3.fromRGB(17, 17, 27),
-        ElementBG = Color3.fromRGB(49, 50, 68),
-        Accent = Color3.fromRGB(203, 166, 247),
-        TextMain = Color3.fromRGB(205, 214, 244),
-        TextSub = Color3.fromRGB(166, 173, 200),
-        Border = Color3.fromRGB(69, 71, 90),
-        DropdownListBG = Color3.fromRGB(49, 50, 68),
-        DropdownListStroke = Color3.fromRGB(69, 71, 90)
-    },
-    ['Rose Pine'] = {
-        MainBG = Color3.fromRGB(25, 23, 36),
-        SidebarBG = Color3.fromRGB(31, 29, 46),
-        TopbarBG = Color3.fromRGB(20, 18, 28),
-        ElementBG = Color3.fromRGB(38, 35, 58),
-        Accent = Color3.fromRGB(235, 188, 186),
-        TextMain = Color3.fromRGB(224, 222, 244),
-        TextSub = Color3.fromRGB(144, 140, 170),
-        Border = Color3.fromRGB(49, 47, 68),
-        DropdownListBG = Color3.fromRGB(38, 35, 58),
-        DropdownListStroke = Color3.fromRGB(49, 47, 68)
-    },
-    ['Minimal White'] = {
-        MainBG = Color3.fromRGB(15, 15, 15),
-        SidebarBG = Color3.fromRGB(20, 20, 20),
-        TopbarBG = Color3.fromRGB(10, 10, 10),
-        ElementBG = Color3.fromRGB(26, 26, 26),
-        Accent = Color3.fromRGB(255, 255, 255),
-        TextMain = Color3.fromRGB(255, 255, 255),
-        TextSub = Color3.fromRGB(170, 170, 170),
-        Border = Color3.fromRGB(40, 40, 40),
-        DropdownListBG = Color3.fromRGB(26, 26, 26),
-        DropdownListStroke = Color3.fromRGB(40, 40, 40)
-    }
+-- Aero
+local _A={
+"LS1bWwoJQWVybyBLZXkgU3lzdGVtCglTdXBwb3J0czogd2Vla2x5IC8gbW9udGhseSAvIGxpZmV0aW1lCglLZXlzIGZpbGUgaXMg",
+"ZW5jcnlwdGVkICh1c2VsZXNzIGlmIG9wZW5lZCkKXV0KbG9jYWwgVXNlcklucHV0U2VydmljZSA9IGdhbWU6R2V0U2VydmljZSgn",
+"VXNlcklucHV0U2VydmljZScpCmxvY2FsIFR3ZWVuU2VydmljZSA9IGdhbWU6R2V0U2VydmljZSgnVHdlZW5TZXJ2aWNlJykKbG9j",
+"YWwgQ29yZUd1aSA9IGdhbWU6R2V0U2VydmljZSgnQ29yZUd1aScpCmxvY2FsIFBsYXllcnMgPSBnYW1lOkdldFNlcnZpY2UoJ1Bs",
+"YXllcnMnKQpsb2NhbCBIdHRwU2VydmljZSA9IGdhbWU6R2V0U2VydmljZSgnSHR0cFNlcnZpY2UnKQpsb2NhbCBMb2NhbFBsYXll",
+"ciA9IFBsYXllcnMuTG9jYWxQbGF5ZXIKCi0tID09PT09PT09PT09PT09PT09PT09PT09PSBLRVkgQ09ORklHID09PT09PT09PT09",
+"PT09PT09PT09PT09PQpsb2NhbCBSRU1PVEVfS0VZU19VUkwgPSAiaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL29n",
+"NmNyZXAtbWF4L0Flcm9vL21haW4va2V5cy50eHQiCgotLSBDaGFuZ2UgdGhpcyBzZWNyZXQgdG8gYW55dGhpbmcgeW91IHdhbnQg",
+"KGtlZXAgaXQgcHJpdmF0ZSkKbG9jYWwgRU5DUllQVF9TRUNSRVQgPSAiQWVyb1N0YXJTZWNyZXQ5WGsyIgoKbG9jYWwgS0VZX1NB",
+"VkVfRklMRSA9ICJhZXJvX2tleS50eHQiCmxvY2FsIEtFWV9EQVRBX0ZJTEUgPSAiYWVyb19rZXlfZGF0YS50eHQiCi0tID09PT09",
+"PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PQoKLS0gU2ltcGxlIFhPUiArIGJh",
+"c2U2NCBzdHlsZSBlbmNvZGUvZGVjb2RlCmxvY2FsIGZ1bmN0aW9uIHhvckNyeXB0KGRhdGEsIGtleSkKICAgIGxvY2FsIHJlc3Vs",
+"dCA9IHt9CiAgICBsb2NhbCBrZXlMZW4gPSAja2V5CiAgICBmb3IgaSA9IDEsICNkYXRhIGRvCiAgICAgICAgbG9jYWwgYnl0ZSA9",
+"IHN0cmluZy5ieXRlKGRhdGEsIGkpCiAgICAgICAgbG9jYWwga2V5Qnl0ZSA9IHN0cmluZy5ieXRlKGtleSwgKChpIC0gMSkgJSBr",
+"ZXlMZW4pICsgMSkKICAgICAgICB0YWJsZS5pbnNlcnQocmVzdWx0LCBzdHJpbmcuY2hhcihiaXQzMi5ieG9yKGJ5dGUsIGtleUJ5",
+"dGUpKSkKICAgIGVuZAogICAgcmV0dXJuIHRhYmxlLmNvbmNhdChyZXN1bHQpCmVuZAoKbG9jYWwgYjY0Y2hhcnMgPSAiQUJDREVG",
+"R0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLyIKCmxvY2FsIGZ1bmN0aW9u",
+"IGJhc2U2NEVuY29kZShkYXRhKQogICAgbG9jYWwgcmVzdWx0ID0ge30KICAgIGxvY2FsIGxlbiA9ICNkYXRhCiAgICBsb2NhbCBp",
+"ID0gMQogICAgd2hpbGUgaSA8PSBsZW4gZG8KICAgICAgICBsb2NhbCBhID0gc3RyaW5nLmJ5dGUoZGF0YSwgaSkgb3IgMAogICAg",
+"ICAgIGxvY2FsIGIgPSBzdHJpbmcuYnl0ZShkYXRhLCBpICsgMSkgb3IgMAogICAgICAgIGxvY2FsIGMgPSBzdHJpbmcuYnl0ZShk",
+"YXRhLCBpICsgMikgb3IgMAogICAgICAgIGxvY2FsIG4gPSBhICogNjU1MzYgKyBiICogMjU2ICsgYwogICAgICAgIGxvY2FsIGMx",
+"ID0gbWF0aC5mbG9vcihuIC8gMjYyMTQ0KSAlIDY0ICsgMQogICAgICAgIGxvY2FsIGMyID0gbWF0aC5mbG9vcihuIC8gNDA5Nikg",
+"JSA2NCArIDEKICAgICAgICBsb2NhbCBjMyA9IG1hdGguZmxvb3IobiAvIDY0KSAlIDY0ICsgMQogICAgICAgIGxvY2FsIGM0ID0g",
+"biAlIDY0ICsgMQogICAgICAgIGxvY2FsIHBhZCA9IChpICsgMSA+IGxlbikgYW5kIDIgb3IgKGkgKyAyID4gbGVuKSBhbmQgMSBv",
+"ciAwCiAgICAgICAgdGFibGUuaW5zZXJ0KHJlc3VsdCwgYjY0Y2hhcnM6c3ViKGMxLCBjMSkpCiAgICAgICAgdGFibGUuaW5zZXJ0",
+"KHJlc3VsdCwgYjY0Y2hhcnM6c3ViKGMyLCBjMikpCiAgICAgICAgdGFibGUuaW5zZXJ0KHJlc3VsdCwgcGFkID49IDIgYW5kICI9",
+"IiBvciBiNjRjaGFyczpzdWIoYzMsIGMzKSkKICAgICAgICB0YWJsZS5pbnNlcnQocmVzdWx0LCBwYWQgPj0gMSBhbmQgIj0iIG9y",
+"IGI2NGNoYXJzOnN1YihjNCwgYzQpKQogICAgICAgIGkgPSBpICsgMwogICAgZW5kCiAgICByZXR1cm4gdGFibGUuY29uY2F0KHJl",
+"c3VsdCkKZW5kCgpsb2NhbCBmdW5jdGlvbiBiYXNlNjREZWNvZGUoZGF0YSkKICAgIGRhdGEgPSBkYXRhOmdzdWIoIlteIiAuLiBi",
+"NjRjaGFycyAuLiAiPV0iLCAiIikKICAgIGxvY2FsIHJlc3VsdCA9IHt9CiAgICBsb2NhbCBpID0gMQogICAgd2hpbGUgaSA8PSAj",
+"ZGF0YSBkbwogICAgICAgIGxvY2FsIGMxID0gKGI2NGNoYXJzOmZpbmQoZGF0YTpzdWIoaSwgaSksIDEsIHRydWUpIG9yIDEpIC0g",
+"MQogICAgICAgIGxvY2FsIGMyID0gKGI2NGNoYXJzOmZpbmQoZGF0YTpzdWIoaSArIDEsIGkgKyAxKSwgMSwgdHJ1ZSkgb3IgMSkg",
+"LSAxCiAgICAgICAgbG9jYWwgYzMgPSAoYjY0Y2hhcnM6ZmluZChkYXRhOnN1YihpICsgMiwgaSArIDIpLCAxLCB0cnVlKSBvciAx",
+"KSAtIDEKICAgICAgICBsb2NhbCBjNCA9IChiNjRjaGFyczpmaW5kKGRhdGE6c3ViKGkgKyAzLCBpICsgMyksIDEsIHRydWUpIG9y",
+"IDEpIC0gMQogICAgICAgIGxvY2FsIG4gPSBjMSAqIDI2MjE0NCArIGMyICogNDA5NiArIGMzICogNjQgKyBjNAogICAgICAgIHRh",
+"YmxlLmluc2VydChyZXN1bHQsIHN0cmluZy5jaGFyKG1hdGguZmxvb3IobiAvIDY1NTM2KSAlIDI1NikpCiAgICAgICAgaWYgZGF0",
+"YTpzdWIoaSArIDIsIGkgKyAyKSB+PSAiPSIgdGhlbgogICAgICAgICAgICB0YWJsZS5pbnNlcnQocmVzdWx0LCBzdHJpbmcuY2hh",
+"cihtYXRoLmZsb29yKG4gLyAyNTYpICUgMjU2KSkKICAgICAgICBlbmQKICAgICAgICBpZiBkYXRhOnN1YihpICsgMywgaSArIDMp",
+"IH49ICI9IiB0aGVuCiAgICAgICAgICAgIHRhYmxlLmluc2VydChyZXN1bHQsIHN0cmluZy5jaGFyKG4gJSAyNTYpKQogICAgICAg",
+"IGVuZAogICAgICAgIGkgPSBpICsgNAogICAgZW5kCiAgICByZXR1cm4gdGFibGUuY29uY2F0KHJlc3VsdCkKZW5kCgpsb2NhbCBm",
+"dW5jdGlvbiBlbmNyeXB0S2V5cyhwbGFpblRleHQpCiAgICBsb2NhbCB4b3JlZCA9IHhvckNyeXB0KHBsYWluVGV4dCwgRU5DUllQ",
+"VF9TRUNSRVQpCiAgICByZXR1cm4gYmFzZTY0RW5jb2RlKHhvcmVkKQplbmQKCmxvY2FsIGZ1bmN0aW9uIGRlY3J5cHRLZXlzKGVu",
+"Y29kZWQpCiAgICBsb2NhbCBvaywgZGVjb2RlZCA9IHBjYWxsKGJhc2U2NERlY29kZSwgZW5jb2RlZCkKICAgIGlmIG5vdCBvayBv",
+"ciBub3QgZGVjb2RlZCB0aGVuIHJldHVybiBuaWwgZW5kCiAgICBsb2NhbCBvazIsIHJlc3VsdCA9IHBjYWxsKHhvckNyeXB0LCBk",
+"ZWNvZGVkLCBFTkNSWVBUX1NFQ1JFVCkKICAgIGlmIG5vdCBvazIgdGhlbiByZXR1cm4gbmlsIGVuZAogICAgcmV0dXJuIHJlc3Vs",
+"dAplbmQKCmxvY2FsIGZ1bmN0aW9uIGdldFVJUGFyZW50KCkKICAgIGxvY2FsIHN1Y2Nlc3MgPSBwY2FsbChmdW5jdGlvbigpIHJl",
+"dHVybiBDb3JlR3VpLk5hbWUgZW5kKQogICAgcmV0dXJuIHN1Y2Nlc3MgYW5kIENvcmVHdWkgb3IgTG9jYWxQbGF5ZXI6V2FpdEZv",
+"ckNoaWxkKCdQbGF5ZXJHdWknKQplbmQKCmxvY2FsIGZ1bmN0aW9uIHNhdmVLZXkoa2V5KQogICAgaWYgd3JpdGVmaWxlIHRoZW4K",
+"ICAgICAgICBwY2FsbCh3cml0ZWZpbGUsIEtFWV9TQVZFX0ZJTEUsIGtleSkKICAgIGVuZAplbmQKCmxvY2FsIGZ1bmN0aW9uIGxv",
+"YWRTYXZlZEtleSgpCiAgICBpZiBpc2ZpbGUgYW5kIHJlYWRmaWxlIGFuZCBpc2ZpbGUoS0VZX1NBVkVfRklMRSkgdGhlbgogICAg",
+"ICAgIGxvY2FsIG9rLCBrZXkgPSBwY2FsbChyZWFkZmlsZSwgS0VZX1NBVkVfRklMRSkKICAgICAgICBpZiBvayBhbmQga2V5IGFu",
+"ZCBrZXkgfj0gIiIgdGhlbgogICAgICAgICAgICByZXR1cm4ga2V5OmdzdWIoIiVzKyIsICIiKQogICAgICAgIGVuZAogICAgZW5k",
+"CiAgICByZXR1cm4gbmlsCmVuZAoKbG9jYWwgZnVuY3Rpb24gc2F2ZUtleURhdGEoZGF0YSkKICAgIGlmIHdyaXRlZmlsZSB0aGVu",
+"CiAgICAgICAgcGNhbGwod3JpdGVmaWxlLCBLRVlfREFUQV9GSUxFLCBIdHRwU2VydmljZTpKU09ORW5jb2RlKGRhdGEpKQogICAg",
+"ZW5kCmVuZAoKbG9jYWwgZnVuY3Rpb24gbG9hZEtleURhdGEoKQogICAgaWYgaXNmaWxlIGFuZCByZWFkZmlsZSBhbmQgaXNmaWxl",
+"KEtFWV9EQVRBX0ZJTEUpIHRoZW4KICAgICAgICBsb2NhbCBvaywgcmF3ID0gcGNhbGwocmVhZGZpbGUsIEtFWV9EQVRBX0ZJTEUp",
+"CiAgICAgICAgaWYgb2sgYW5kIHJhdyBhbmQgcmF3IH49ICIiIHRoZW4KICAgICAgICAgICAgbG9jYWwgc3VjY2VzcywgZGF0YSA9",
+"IHBjYWxsKGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgIHJldHVybiBIdHRwU2VydmljZTpKU09ORGVjb2RlKHJhdykKICAgICAg",
+"ICAgICAgZW5kKQogICAgICAgICAgICBpZiBzdWNjZXNzIGFuZCB0eXBlKGRhdGEpID09ICJ0YWJsZSIgdGhlbgogICAgICAgICAg",
+"ICAgICAgcmV0dXJuIGRhdGEKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKICAgIHJldHVybiBuaWwKZW5kCgps",
+"b2NhbCBmdW5jdGlvbiBmZXRjaFJlbW90ZUtleXMoKQogICAgaWYgbm90IFJFTU9URV9LRVlTX1VSTCBvciBSRU1PVEVfS0VZU19V",
+"UkwgPT0gIiIgdGhlbgogICAgICAgIHJldHVybiB7fQogICAgZW5kCiAgICBsb2NhbCBvaywgcmVzdWx0ID0gcGNhbGwoZnVuY3Rp",
+"b24oKQogICAgICAgIHJldHVybiBnYW1lOkh0dHBHZXQoUkVNT1RFX0tFWVNfVVJMLCB0cnVlKQogICAgZW5kKQogICAgaWYgbm90",
+"IG9rIG9yIG5vdCByZXN1bHQgb3IgcmVzdWx0ID09ICIiIHRoZW4KICAgICAgICByZXR1cm4ge30KICAgIGVuZAoKICAgIC0tIFRy",
+"eSBkZWNyeXB0IGZpcnN0IChlbmNyeXB0ZWQgZmlsZSkuIElmIGl0IGZhaWxzLCB0cmVhdCBhcyBwbGFpbiB0ZXh0IChiYWNrd2Fy",
+"ZHMgY29tcGF0aWJsZSkKICAgIGxvY2FsIHBsYWluID0gZGVjcnlwdEtleXMocmVzdWx0OmdzdWIoIiVzKyIsICIiKSkKICAgIGlm",
+"IG5vdCBwbGFpbiBvciBwbGFpbiA9PSAiIiBvciBub3QgcGxhaW46ZmluZCgiQUVSTyIpIHRoZW4KICAgICAgICBwbGFpbiA9IHJl",
+"c3VsdCAgLS0gZmFsbGJhY2sgdG8gcGxhaW4gdGV4dAogICAgZW5kCgogICAgbG9jYWwga2V5cyA9IHt9CiAgICBmb3IgbGluZSBp",
+"biBwbGFpbjpnbWF0Y2goIlteXHJcbl0rIikgZG8KICAgICAgICBsaW5lID0gbGluZTpnc3ViKCJeJXMrIiwgIiIpOmdzdWIoIiVz",
+"KyQiLCAiIikKICAgICAgICBpZiBsaW5lIH49ICIiIGFuZCBub3QgbGluZTptYXRjaCgiXiMiKSBhbmQgbm90IGxpbmU6bWF0Y2go",
+"Il4vLyIpIHRoZW4KICAgICAgICAgICAgbG9jYWwgcGFydHMgPSB7fQogICAgICAgICAgICBmb3IgcGFydCBpbiBsaW5lOmdtYXRj",
+"aCgiW158XSsiKSBkbwogICAgICAgICAgICAgICAgdGFibGUuaW5zZXJ0KHBhcnRzLCBwYXJ0OmdzdWIoIl4lcysiLCAiIik6Z3N1",
+"YigiJXMrJCIsICIiKSkKICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGxvY2FsIGtleSA9IHBhcnRzWzFdCiAgICAgICAgICAg",
+"IGxvY2FsIGtleVR5cGUgPSAocGFydHNbMl0gb3IgImxpZmV0aW1lIik6bG93ZXIoKQogICAgICAgICAgICBsb2NhbCBleHBpcnlE",
+"YXRlID0gcGFydHNbM10KICAgICAgICAgICAgaWYga2V5IGFuZCBrZXkgfj0gIiIgdGhlbgogICAgICAgICAgICAgICAga2V5c1tr",
+"ZXldID0gewogICAgICAgICAgICAgICAgICAgIHR5cGUgPSBrZXlUeXBlLAogICAgICAgICAgICAgICAgICAgIGV4cGlyeSA9IGV4",
+"cGlyeURhdGUKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKICAgIHJldHVybiBr",
+"ZXlzCmVuZAoKbG9jYWwgZnVuY3Rpb24gZ2V0RHVyYXRpb25TZWNvbmRzKGtleVR5cGUpCiAgICBpZiBrZXlUeXBlID09ICJ3ZWVr",
+"bHkiIHRoZW4KICAgICAgICByZXR1cm4gNyAqIDI0ICogNjAgKiA2MAogICAgZWxzZWlmIGtleVR5cGUgPT0gIm1vbnRobHkiIHRo",
+"ZW4KICAgICAgICByZXR1cm4gMzAgKiAyNCAqIDYwICogNjAKICAgIGVsc2UKICAgICAgICByZXR1cm4gbmlsCiAgICBlbmQKZW5k",
+"Cgpsb2NhbCBmdW5jdGlvbiBpc0tleVN0aWxsVmFsaWQoa2V5LCBrZXlJbmZvKQogICAgaWYgbm90IGtleUluZm8gdGhlbiByZXR1",
+"cm4gZmFsc2UgZW5kCiAgICBsb2NhbCBkYXRhID0gbG9hZEtleURhdGEoKQogICAgbG9jYWwgbm93ID0gb3MudGltZSgpCgogICAg",
+"aWYga2V5SW5mby5leHBpcnkgYW5kIGtleUluZm8uZXhwaXJ5IH49ICIiIHRoZW4KICAgICAgICBsb2NhbCB5LCBtLCBkID0ga2V5",
+"SW5mby5leHBpcnk6bWF0Y2goIiglZCspLSglZCspLSglZCspIikKICAgICAgICBpZiB5IGFuZCBtIGFuZCBkIHRoZW4KICAgICAg",
+"ICAgICAgbG9jYWwgZXhwID0gb3MudGltZSh7eWVhciA9IHRvbnVtYmVyKHkpLCBtb250aCA9IHRvbnVtYmVyKG0pLCBkYXkgPSB0",
+"b251bWJlcihkKSwgaG91ciA9IDIzLCBtaW4gPSA1OSwgc2VjID0gNTl9KQogICAgICAgICAgICBpZiBub3cgPiBleHAgdGhlbiBy",
+"ZXR1cm4gZmFsc2UgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKCiAgICBsb2NhbCBkdXJhdGlvbiA9IGdldER1cmF0aW9uU2Vjb25k",
+"cyhrZXlJbmZvLnR5cGUpCiAgICBpZiBub3QgZHVyYXRpb24gdGhlbiByZXR1cm4gdHJ1ZSBlbmQKCiAgICBpZiBub3QgZGF0YSBv",
+"ciBkYXRhLmtleSB+PSBrZXkgdGhlbgogICAgICAgIHNhdmVLZXlEYXRhKHsKICAgICAgICAgICAga2V5ID0ga2V5LAogICAgICAg",
+"ICAgICB0eXBlID0ga2V5SW5mby50eXBlLAogICAgICAgICAgICBhY3RpdmF0ZWQgPSBub3cKICAgICAgICB9KQogICAgICAgIHJl",
+"dHVybiB0cnVlCiAgICBlbmQKCiAgICBsb2NhbCBhY3RpdmF0ZWQgPSB0b251bWJlcihkYXRhLmFjdGl2YXRlZCkgb3Igbm93CiAg",
+"ICBpZiBub3cgPiAoYWN0aXZhdGVkICsgZHVyYXRpb24pIHRoZW4KICAgICAgICByZXR1cm4gZmFsc2UKICAgIGVuZAogICAgcmV0",
+"dXJuIHRydWUKZW5kCgpsb2NhbCBmdW5jdGlvbiBpc1ZhbGlkS2V5KGlucHV0S2V5KQogICAgaWYgbm90IGlucHV0S2V5IG9yIGlu",
+"cHV0S2V5ID09ICIiIHRoZW4gcmV0dXJuIGZhbHNlIGVuZAogICAgaW5wdXRLZXkgPSBpbnB1dEtleTpnc3ViKCIlcysiLCAiIikK",
+"ICAgIGxvY2FsIHJlbW90ZSA9IGZldGNoUmVtb3RlS2V5cygpCiAgICBsb2NhbCBrZXlJbmZvID0gcmVtb3RlW2lucHV0S2V5XQog",
+"ICAgaWYgbm90IGtleUluZm8gdGhlbiByZXR1cm4gZmFsc2UgZW5kCiAgICByZXR1cm4gaXNLZXlTdGlsbFZhbGlkKGlucHV0S2V5",
+"LCBrZXlJbmZvKQplbmQKCmxvY2FsIGZ1bmN0aW9uIGdldEtleVN0YXR1c1RleHQoa2V5KQogICAgbG9jYWwgcmVtb3RlID0gZmV0",
+"Y2hSZW1vdGVLZXlzKCkKICAgIGxvY2FsIGtleUluZm8gPSByZW1vdGVba2V5XQogICAgaWYgbm90IGtleUluZm8gdGhlbiByZXR1",
+"cm4gIkludmFsaWQiIGVuZAogICAgaWYga2V5SW5mby50eXBlID09ICJsaWZldGltZSIgb3Igbm90IGdldER1cmF0aW9uU2Vjb25k",
+"cyhrZXlJbmZvLnR5cGUpIHRoZW4KICAgICAgICByZXR1cm4gIkxpZmV0aW1lIgogICAgZW5kCiAgICBsb2NhbCBkYXRhID0gbG9h",
+"ZEtleURhdGEoKQogICAgaWYgbm90IGRhdGEgb3IgZGF0YS5rZXkgfj0ga2V5IHRoZW4KICAgICAgICByZXR1cm4ga2V5SW5mby50",
+"eXBlOnVwcGVyKCkKICAgIGVuZAogICAgbG9jYWwgZHVyYXRpb24gPSBnZXREdXJhdGlvblNlY29uZHMoa2V5SW5mby50eXBlKQog",
+"ICAgbG9jYWwgYWN0aXZhdGVkID0gdG9udW1iZXIoZGF0YS5hY3RpdmF0ZWQpIG9yIG9zLnRpbWUoKQogICAgbG9jYWwgcmVtYWlu",
+"aW5nID0gKGFjdGl2YXRlZCArIGR1cmF0aW9uKSAtIG9zLnRpbWUoKQogICAgaWYgcmVtYWluaW5nIDw9IDAgdGhlbiByZXR1cm4g",
+"IkV4cGlyZWQiIGVuZAogICAgbG9jYWwgZGF5cyA9IG1hdGguZmxvb3IocmVtYWluaW5nIC8gODY0MDApCiAgICBsb2NhbCBob3Vy",
+"cyA9IG1hdGguZmxvb3IoKHJlbWFpbmluZyAlIDg2NDAwKSAvIDM2MDApCiAgICByZXR1cm4gc3RyaW5nLmZvcm1hdCgiJXMgKCVk",
+"ZCAlZGggbGVmdCkiLCBrZXlJbmZvLnR5cGU6dXBwZXIoKSwgZGF5cywgaG91cnMpCmVuZAoKbG9jYWwgc2F2ZWQgPSBsb2FkU2F2",
+"ZWRLZXkoKQpsb2NhbCBhbHJlYWR5VmFsaWQgPSBzYXZlZCBhbmQgaXNWYWxpZEtleShzYXZlZCkKCmlmIG5vdCBhbHJlYWR5VmFs",
+"aWQgdGhlbgogICAgbG9jYWwgdWlQYXJlbnQgPSBnZXRVSVBhcmVudCgpCgogICAgbG9jYWwgU2NyZWVuR3VpID0gSW5zdGFuY2Uu",
+"bmV3KCJTY3JlZW5HdWkiKQogICAgU2NyZWVuR3VpLk5hbWUgPSAiQWVyb0tleVN5c3RlbSIKICAgIFNjcmVlbkd1aS5SZXNldE9u",
+"U3Bhd24gPSBmYWxzZQogICAgU2NyZWVuR3VpLlpJbmRleEJlaGF2aW9yID0gRW51bS5aSW5kZXhCZWhhdmlvci5TaWJsaW5nCiAg",
+"ICBTY3JlZW5HdWkuUGFyZW50ID0gdWlQYXJlbnQKCiAgICBsb2NhbCBNYWluID0gSW5zdGFuY2UubmV3KCJGcmFtZSIpCiAgICBN",
+"YWluLk5hbWUgPSAiTWFpbiIKICAgIE1haW4uQW5jaG9yUG9pbnQgPSBWZWN0b3IyLm5ldygwLjUsIDAuNSkKICAgIE1haW4uUG9z",
+"aXRpb24gPSBVRGltMi5uZXcoMC41LCAwLCAwLjUsIDApCiAgICBNYWluLlNpemUgPSBVRGltMi5uZXcoMCwgMzQwLCAwLCAyMTAp",
+"CiAgICBNYWluLkJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigxNSwgMTUsIDE3KQogICAgTWFpbi5Cb3JkZXJTaXpl",
+"UGl4ZWwgPSAwCiAgICBNYWluLlBhcmVudCA9IFNjcmVlbkd1aQoKICAgIGxvY2FsIFVJQ29ybmVyID0gSW5zdGFuY2UubmV3KCJV",
+"SUNvcm5lciIpCiAgICBVSUNvcm5lci5Db3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA4KQogICAgVUlDb3JuZXIuUGFyZW50ID0g",
+"TWFpbgoKICAgIGxvY2FsIFVJU3Ryb2tlID0gSW5zdGFuY2UubmV3KCJVSVN0cm9rZSIpCiAgICBVSVN0cm9rZS5Db2xvciA9IENv",
+"bG9yMy5mcm9tUkdCKDM5LCAzOSwgNDIpCiAgICBVSVN0cm9rZS5UaGlja25lc3MgPSAxCiAgICBVSVN0cm9rZS5QYXJlbnQgPSBN",
+"YWluCgogICAgbG9jYWwgU3RhciA9IEluc3RhbmNlLm5ldygiVGV4dExhYmVsIikKICAgIFN0YXIuQmFja2dyb3VuZFRyYW5zcGFy",
+"ZW5jeSA9IDEKICAgIFN0YXIuUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMCwgMTgpCiAgICBTdGFyLlNpemUgPSBVRGltMi5u",
+"ZXcoMSwgMCwgMCwgMjgpCiAgICBTdGFyLkZvbnQgPSBFbnVtLkZvbnQuR290aGFtQm9sZAogICAgU3Rhci5UZXh0ID0gIuKYhSIK",
+"ICAgIFN0YXIuVGV4dENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDU5LCAxMzAsIDI0NikKICAgIFN0YXIuVGV4dFNpemUgPSAyNgog",
+"ICAgU3Rhci5QYXJlbnQgPSBNYWluCgogICAgbG9jYWwgVGl0bGUgPSBJbnN0YW5jZS5uZXcoIlRleHRMYWJlbCIpCiAgICBUaXRs",
+"ZS5CYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMQogICAgVGl0bGUuUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMCwgNDgpCiAg",
+"ICBUaXRsZS5TaXplID0gVURpbTIubmV3KDEsIDAsIDAsIDIyKQogICAgVGl0bGUuRm9udCA9IEVudW0uRm9udC5Hb3RoYW1Cb2xk",
+"CiAgICBUaXRsZS5UZXh0ID0gIkFlcm8iCiAgICBUaXRsZS5UZXh0Q29sb3IzID0gQ29sb3IzLmZyb21SR0IoMjQwLCAyNDAsIDI0",
+"MCkKICAgIFRpdGxlLlRleHRTaXplID0gMjAKICAgIFRpdGxlLlBhcmVudCA9IE1haW4KCiAgICBsb2NhbCBTdWIgPSBJbnN0YW5j",
+"ZS5uZXcoIlRleHRMYWJlbCIpCiAgICBTdWIuQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEKICAgIFN1Yi5Qb3NpdGlvbiA9IFVE",
+"aW0yLm5ldygwLCAwLCAwLCA3MCkKICAgIFN1Yi5TaXplID0gVURpbTIubmV3KDEsIDAsIDAsIDE2KQogICAgU3ViLkZvbnQgPSBF",
+"bnVtLkZvbnQuR290aGFtCiAgICBTdWIuVGV4dCA9ICJFbnRlciB5b3VyIGtleSB0byBjb250aW51ZSIKICAgIFN1Yi5UZXh0Q29s",
+"b3IzID0gQ29sb3IzLmZyb21SR0IoMTYwLCAxNjAsIDE2NSkKICAgIFN1Yi5UZXh0U2l6ZSA9IDEyCiAgICBTdWIuUGFyZW50ID0g",
+"TWFpbgoKICAgIGxvY2FsIElucHV0RnJhbWUgPSBJbnN0YW5jZS5uZXcoIkZyYW1lIikKICAgIElucHV0RnJhbWUuQW5jaG9yUG9p",
+"bnQgPSBWZWN0b3IyLm5ldygwLjUsIDApCiAgICBJbnB1dEZyYW1lLlBvc2l0aW9uID0gVURpbTIubmV3KDAuNSwgMCwgMCwgMTAw",
+"KQogICAgSW5wdXRGcmFtZS5TaXplID0gVURpbTIubmV3KDAsIDI4MCwgMCwgMzYpCiAgICBJbnB1dEZyYW1lLkJhY2tncm91bmRD",
+"b2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNCwgMjQsIDI3KQogICAgSW5wdXRGcmFtZS5Cb3JkZXJTaXplUGl4ZWwgPSAwCiAgICBJ",
+"bnB1dEZyYW1lLlBhcmVudCA9IE1haW4KCiAgICBsb2NhbCBJbnB1dENvcm5lciA9IEluc3RhbmNlLm5ldygiVUlDb3JuZXIiKQog",
+"ICAgSW5wdXRDb3JuZXIuQ29ybmVyUmFkaXVzID0gVURpbS5uZXcoMCwgNikKICAgIElucHV0Q29ybmVyLlBhcmVudCA9IElucHV0",
+"RnJhbWUKCiAgICBsb2NhbCBJbnB1dFN0cm9rZSA9IEluc3RhbmNlLm5ldygiVUlTdHJva2UiKQogICAgSW5wdXRTdHJva2UuQ29s",
+"b3IgPSBDb2xvcjMuZnJvbVJHQigzOSwgMzksIDQyKQogICAgSW5wdXRTdHJva2UuUGFyZW50ID0gSW5wdXRGcmFtZQoKICAgIGxv",
+"Y2FsIFRleHRCb3ggPSBJbnN0YW5jZS5uZXcoIlRleHRCb3giKQogICAgVGV4dEJveC5CYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0g",
+"MQogICAgVGV4dEJveC5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAxMiwgMCwgMCkKICAgIFRleHRCb3guU2l6ZSA9IFVEaW0yLm5l",
+"dygxLCAtMjQsIDEsIDApCiAgICBUZXh0Qm94LkZvbnQgPSBFbnVtLkZvbnQuR290aGFtCiAgICBUZXh0Qm94LlBsYWNlaG9sZGVy",
+"VGV4dCA9ICJLZXkuLi4iCiAgICBUZXh0Qm94LlBsYWNlaG9sZGVyQ29sb3IzID0gQ29sb3IzLmZyb21SR0IoMTAwLCAxMDAsIDEw",
+"NSkKICAgIFRleHRCb3guVGV4dCA9ICIiCiAgICBUZXh0Qm94LlRleHRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNDAsIDI0MCwg",
+"MjQwKQogICAgVGV4dEJveC5UZXh0U2l6ZSA9IDE0CiAgICBUZXh0Qm94LkNsZWFyVGV4dE9uRm9jdXMgPSBmYWxzZQogICAgVGV4",
+"dEJveC5QYXJlbnQgPSBJbnB1dEZyYW1lCgogICAgbG9jYWwgU3RhdHVzID0gSW5zdGFuY2UubmV3KCJUZXh0TGFiZWwiKQogICAg",
+"U3RhdHVzLkJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxCiAgICBTdGF0dXMuUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMCwg",
+"MTQyKQogICAgU3RhdHVzLlNpemUgPSBVRGltMi5uZXcoMSwgMCwgMCwgMTYpCiAgICBTdGF0dXMuRm9udCA9IEVudW0uRm9udC5H",
+"b3RoYW0KICAgIFN0YXR1cy5UZXh0ID0gIiIKICAgIFN0YXR1cy5UZXh0Q29sb3IzID0gQ29sb3IzLmZyb21SR0IoMjM5LCA2OCwg",
+"NjgpCiAgICBTdGF0dXMuVGV4dFNpemUgPSAxMgogICAgU3RhdHVzLlBhcmVudCA9IE1haW4KCiAgICBsb2NhbCBTdWJtaXQgPSBJ",
+"bnN0YW5jZS5uZXcoIlRleHRCdXR0b24iKQogICAgU3VibWl0LkFuY2hvclBvaW50ID0gVmVjdG9yMi5uZXcoMC41LCAwKQogICAg",
+"U3VibWl0LlBvc2l0aW9uID0gVURpbTIubmV3KDAuNSwgMCwgMCwgMTY1KQogICAgU3VibWl0LlNpemUgPSBVRGltMi5uZXcoMCwg",
+"MjgwLCAwLCAzNCkKICAgIFN1Ym1pdC5CYWNrZ3JvdW5kQ29sb3IzID0gQ29sb3IzLmZyb21SR0IoNTksIDEzMCwgMjQ2KQogICAg",
+"U3VibWl0LkJvcmRlclNpemVQaXhlbCA9IDAKICAgIFN1Ym1pdC5Gb250ID0gRW51bS5Gb250LkdvdGhhbUJvbGQKICAgIFN1Ym1p",
+"dC5UZXh0ID0gIlVubG9jayIKICAgIFN1Ym1pdC5UZXh0Q29sb3IzID0gQ29sb3IzLmZyb21SR0IoMjU1LCAyNTUsIDI1NSkKICAg",
+"IFN1Ym1pdC5UZXh0U2l6ZSA9IDE0CiAgICBTdWJtaXQuQXV0b0J1dHRvbkNvbG9yID0gZmFsc2UKICAgIFN1Ym1pdC5QYXJlbnQg",
+"PSBNYWluCgogICAgbG9jYWwgU3VibWl0Q29ybmVyID0gSW5zdGFuY2UubmV3KCJVSUNvcm5lciIpCiAgICBTdWJtaXRDb3JuZXIu",
+"Q29ybmVyUmFkaXVzID0gVURpbS5uZXcoMCwgNikKICAgIFN1Ym1pdENvcm5lci5QYXJlbnQgPSBTdWJtaXQKCiAgICBsb2NhbCBm",
+"dW5jdGlvbiBhdHRlbXB0VW5sb2NrKCkKICAgICAgICBsb2NhbCBrZXkgPSBUZXh0Qm94LlRleHQ6Z3N1YigiJXMrIiwgIiIpCiAg",
+"ICAgICAgaWYga2V5ID09ICIiIHRoZW4KICAgICAgICAgICAgU3RhdHVzLlRleHQgPSAiRW50ZXIgYSBrZXkiCiAgICAgICAgICAg",
+"IFN0YXR1cy5UZXh0Q29sb3IzID0gQ29sb3IzLmZyb21SR0IoMjM5LCA2OCwgNjgpCiAgICAgICAgICAgIHJldHVybgogICAgICAg",
+"IGVuZAogICAgICAgIFN0YXR1cy5UZXh0ID0gIkNoZWNraW5nLi4uIgogICAgICAgIFN0YXR1cy5UZXh0Q29sb3IzID0gQ29sb3Iz",
+"LmZyb21SR0IoMTYwLCAxNjAsIDE2NSkKICAgICAgICB0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgICAgICAgICAgaWYgaXNWYWxp",
+"ZEtleShrZXkpIHRoZW4KICAgICAgICAgICAgICAgIFN0YXR1cy5UZXh0ID0gIktleSBhY2NlcHRlZCAtICIgLi4gZ2V0S2V5U3Rh",
+"dHVzVGV4dChrZXkpCiAgICAgICAgICAgICAgICBTdGF0dXMuVGV4dENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDM0LCAxOTcsIDk0",
+"KQogICAgICAgICAgICAgICAgc2F2ZUtleShrZXkpCiAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKE1haW4sIFR3",
+"ZWVuSW5mby5uZXcoMC4zNSwgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uSW4pLCB7CiAgICAg",
+"ICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCAzNDAsIDAsIDApLAogICAgICAgICAgICAgICAgICAgIEJhY2tncm91",
+"bmRUcmFuc3BhcmVuY3kgPSAxCiAgICAgICAgICAgICAgICB9KTpQbGF5KCkKICAgICAgICAgICAgICAgIHRhc2sud2FpdCgwLjQ1",
+"KQogICAgICAgICAgICAgICAgU2NyZWVuR3VpOkRlc3Ryb3koKQogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICBTdGF0",
+"dXMuVGV4dCA9ICJJbnZhbGlkIG9yIGV4cGlyZWQga2V5IgogICAgICAgICAgICAgICAgU3RhdHVzLlRleHRDb2xvcjMgPSBDb2xv",
+"cjMuZnJvbVJHQigyMzksIDY4LCA2OCkKICAgICAgICAgICAgICAgIFRleHRCb3guVGV4dCA9ICIiCiAgICAgICAgICAgIGVuZAog",
+"ICAgICAgIGVuZCkKICAgIGVuZAoKICAgIFN1Ym1pdC5Nb3VzZUJ1dHRvbjFDbGljazpDb25uZWN0KGF0dGVtcHRVbmxvY2spCiAg",
+"ICBUZXh0Qm94LkZvY3VzTG9zdDpDb25uZWN0KGZ1bmN0aW9uKGVudGVyKQogICAgICAgIGlmIGVudGVyIHRoZW4gYXR0ZW1wdFVu",
+"bG9jaygpIGVuZAogICAgZW5kKQoKICAgIHdoaWxlIFNjcmVlbkd1aSBhbmQgU2NyZWVuR3VpLlBhcmVudCBkbwogICAgICAgIHRh",
+"c2sud2FpdCgwLjEpCiAgICBlbmQKZW5kCgotLSA9PT09PT09PT09PT09PT09PT09PT09PT0gTUFJTiBTQ1JJUFQgU1RBUlRTIEhF",
+"UkUgPT09PT09PT09PT09PT09PT09PT09PT09Ci0tIFNoYXJlZCBrZXkgdGltZSBoZWxwZXIgKHVzZWQgYnkgVUkgY291bnRkb3du",
+"KQpsb2NhbCBmdW5jdGlvbiBBZXJvR2V0UmVtYWluaW5nKCkKICAgIGxvY2FsIEtFWV9EQVRBX0ZJTEUgPSAiYWVyb19rZXlfZGF0",
+"YS50eHQiCiAgICBsb2NhbCBIdHRwU2VydmljZSA9IGdhbWU6R2V0U2VydmljZSgiSHR0cFNlcnZpY2UiKQogICAgaWYgbm90IChp",
+"c2ZpbGUgYW5kIHJlYWRmaWxlIGFuZCBpc2ZpbGUoS0VZX0RBVEFfRklMRSkpIHRoZW4KICAgICAgICByZXR1cm4gbmlsLCAiTGlm",
+"ZXRpbWUiCiAgICBlbmQKICAgIGxvY2FsIG9rLCByYXcgPSBwY2FsbChyZWFkZmlsZSwgS0VZX0RBVEFfRklMRSkKICAgIGlmIG5v",
+"dCBvayBvciBub3QgcmF3IG9yIHJhdyA9PSAiIiB0aGVuCiAgICAgICAgcmV0dXJuIG5pbCwgIkxpZmV0aW1lIgogICAgZW5kCiAg",
+"ICBsb2NhbCBzdWNjZXNzLCBkYXRhID0gcGNhbGwoZnVuY3Rpb24oKQogICAgICAgIHJldHVybiBIdHRwU2VydmljZTpKU09ORGVj",
+"b2RlKHJhdykKICAgIGVuZCkKICAgIGlmIG5vdCBzdWNjZXNzIG9yIHR5cGUoZGF0YSkgfj0gInRhYmxlIiB0aGVuCiAgICAgICAg",
+"cmV0dXJuIG5pbCwgIkxpZmV0aW1lIgogICAgZW5kCiAgICBsb2NhbCBrZXlUeXBlID0gdG9zdHJpbmcoZGF0YS50eXBlIG9yICJs",
+"aWZldGltZSIpOmxvd2VyKCkKICAgIGlmIGtleVR5cGUgPT0gImxpZmV0aW1lIiB0aGVuCiAgICAgICAgcmV0dXJuIG5pbCwgIkxp",
+"ZmV0aW1lIgogICAgZW5kCiAgICBsb2NhbCBkdXJhdGlvbiA9IDAKICAgIGlmIGtleVR5cGUgPT0gIndlZWtseSIgdGhlbgogICAg",
+"ICAgIGR1cmF0aW9uID0gNyAqIDI0ICogNjAgKiA2MAogICAgZWxzZWlmIGtleVR5cGUgPT0gIm1vbnRobHkiIHRoZW4KICAgICAg",
+"ICBkdXJhdGlvbiA9IDMwICogMjQgKiA2MCAqIDYwCiAgICBlbHNlCiAgICAgICAgcmV0dXJuIG5pbCwgIkxpZmV0aW1lIgogICAg",
+"ZW5kCiAgICBsb2NhbCBhY3RpdmF0ZWQgPSB0b251bWJlcihkYXRhLmFjdGl2YXRlZCkgb3Igb3MudGltZSgpCiAgICBsb2NhbCBy",
+"ZW1haW5pbmcgPSAoYWN0aXZhdGVkICsgZHVyYXRpb24pIC0gb3MudGltZSgpCiAgICBpZiByZW1haW5pbmcgPCAwIHRoZW4gcmVt",
+"YWluaW5nID0gMCBlbmQKICAgIHJldHVybiByZW1haW5pbmcsIGtleVR5cGUKZW5kCgpsb2NhbCBmdW5jdGlvbiBBZXJvRm9ybWF0",
+"UmVtYWluaW5nKHNlY29uZHMpCiAgICBpZiBzZWNvbmRzID09IG5pbCB0aGVuCiAgICAgICAgcmV0dXJuICJMaWZldGltZSIKICAg",
+"IGVuZAogICAgc2Vjb25kcyA9IG1hdGgubWF4KDAsIG1hdGguZmxvb3Ioc2Vjb25kcykpCiAgICBsb2NhbCBkYXlzID0gbWF0aC5m",
+"bG9vcihzZWNvbmRzIC8gODY0MDApCiAgICBsb2NhbCBob3VycyA9IG1hdGguZmxvb3IoKHNlY29uZHMgJSA4NjQwMCkgLyAzNjAw",
+"KQogICAgbG9jYWwgbWlucyA9IG1hdGguZmxvb3IoKHNlY29uZHMgJSAzNjAwKSAvIDYwKQogICAgcmV0dXJuIHN0cmluZy5mb3Jt",
+"YXQoIiVkZCAlZGggJWRtIiwgZGF5cywgaG91cnMsIG1pbnMpCmVuZAoKCmxvY2FsIFVzZXJJbnB1dFNlcnZpY2UgPSBnYW1lOkdl",
+"dFNlcnZpY2UoJ1VzZXJJbnB1dFNlcnZpY2UnKQpsb2NhbCBUd2VlblNlcnZpY2UgPSBnYW1lOkdldFNlcnZpY2UoJ1R3ZWVuU2Vy",
+"dmljZScpCmxvY2FsIFJ1blNlcnZpY2UgPSBnYW1lOkdldFNlcnZpY2UoJ1J1blNlcnZpY2UnKQpsb2NhbCBDb3JlR3VpID0gZ2Ft",
+"ZTpHZXRTZXJ2aWNlKCdDb3JlR3VpJykKbG9jYWwgUGxheWVycyA9IGdhbWU6R2V0U2VydmljZSgnUGxheWVycycpCmxvY2FsIFRl",
+"eHRTZXJ2aWNlID0gZ2FtZTpHZXRTZXJ2aWNlKCdUZXh0U2VydmljZScpCmxvY2FsIEh0dHBTZXJ2aWNlID0gZ2FtZTpHZXRTZXJ2",
+"aWNlKCdIdHRwU2VydmljZScpCgpsb2NhbCBMb2NhbFBsYXllciA9IFBsYXllcnMuTG9jYWxQbGF5ZXIKbG9jYWwgdWlQYXJlbnQg",
+"PSAocGNhbGwoZnVuY3Rpb24oKSByZXR1cm4gQ29yZUd1aS5OYW1lIGVuZCkgYW5kIENvcmVHdWkpIG9yIExvY2FsUGxheWVyOldh",
+"aXRGb3JDaGlsZCgnUGxheWVyR3VpJykKCmxvY2FsIFRoZW1lcyA9IHsKICAgIFsnRGVmYXVsdCddID0gewogICAgICAgIE1haW5C",
+"RyA9IENvbG9yMy5mcm9tUkdCKDE1LCAxNSwgMTcpLAogICAgICAgIFNpZGViYXJCRyA9IENvbG9yMy5mcm9tUkdCKDE4LCAxOCwg",
+"MjEpLAogICAgICAgIFRvcGJhckJHID0gQ29sb3IzLmZyb21SR0IoMTIsIDEyLCAxNCksCiAgICAgICAgRWxlbWVudEJHID0gQ29s",
+"b3IzLmZyb21SR0IoMjQsIDI0LCAyNyksCiAgICAgICAgQWNjZW50ID0gQ29sb3IzLmZyb21SR0IoNTksIDEzMCwgMjQ2KSwKICAg",
+"ICAgICBUZXh0TWFpbiA9IENvbG9yMy5mcm9tUkdCKDI0MCwgMjQwLCAyNDApLAogICAgICAgIFRleHRTdWIgPSBDb2xvcjMuZnJv",
+"bVJHQigxNjAsIDE2MCwgMTY1KSwKICAgICAgICBCb3JkZXIgPSBDb2xvcjMuZnJvbVJHQigzOSwgMzksIDQyKSwKICAgICAgICBE",
+"cm9wZG93bkxpc3RCRyA9IENvbG9yMy5mcm9tUkdCKDI0LCAyNCwgMjcpLAogICAgICAgIERyb3Bkb3duTGlzdFN0cm9rZSA9IENv",
+"bG9yMy5mcm9tUkdCKDM5LCAzOSwgNDIpCiAgICB9LAogICAgWydEcmFjdWxhJ10gPSB7CiAgICAgICAgTWFpbkJHID0gQ29sb3Iz",
+"LmZyb21SR0IoNDAsIDQyLCA1NCksCiAgICAgICAgU2lkZWJhckJHID0gQ29sb3IzLmZyb21SR0IoMzMsIDM0LCA0NCksCiAgICAg",
+"ICAgVG9wYmFyQkcgPSBDb2xvcjMuZnJvbVJHQigyNCwgMjUsIDMzKSwKICAgICAgICBFbGVtZW50QkcgPSBDb2xvcjMuZnJvbVJH",
+"Qig1NiwgNTgsIDg5KSwKICAgICAgICBBY2NlbnQgPSBDb2xvcjMuZnJvbVJHQigxODksIDE0NywgMjQ5KSwKICAgICAgICBUZXh0",
+"TWFpbiA9IENvbG9yMy5mcm9tUkdCKDI0OCwgMjQ4LCAyNDIpLAogICAgICAgIFRleHRTdWIgPSBDb2xvcjMuZnJvbVJHQigxNjAs",
+"IDE2NSwgMTgwKSwKICAgICAgICBCb3JkZXIgPSBDb2xvcjMuZnJvbVJHQig2OCwgNzEsIDkwKSwKICAgICAgICBEcm9wZG93bkxp",
+"c3RCRyA9IENvbG9yMy5mcm9tUkdCKDU2LCA1OCwgODkpLAogICAgICAgIERyb3Bkb3duTGlzdFN0cm9rZSA9IENvbG9yMy5mcm9t",
+"UkdCKDY4LCA3MSwgOTApCiAgICB9LAogICAgWydUb2t5byBOaWdodCddID0gewogICAgICAgIE1haW5CRyA9IENvbG9yMy5mcm9t",
+"UkdCKDI2LCAyNywgMzgpLAogICAgICAgIFNpZGViYXJCRyA9IENvbG9yMy5mcm9tUkdCKDMxLCAzNSwgNTMpLAogICAgICAgIFRv",
+"cGJhckJHID0gQ29sb3IzLmZyb21SR0IoMjIsIDIyLCAzMCksCiAgICAgICAgRWxlbWVudEJHID0gQ29sb3IzLmZyb21SR0IoNDEs",
+"IDQ2LCA2NiksCiAgICAgICAgQWNjZW50ID0gQ29sb3IzLmZyb21SR0IoMTIyLCAxNjIsIDI0NyksCiAgICAgICAgVGV4dE1haW4g",
+"PSBDb2xvcjMuZnJvbVJHQigxOTIsIDIwMiwgMjQ1KSwKICAgICAgICBUZXh0U3ViID0gQ29sb3IzLmZyb21SR0IoMTIwLCAxMjQs",
+"IDE1MyksCiAgICAgICAgQm9yZGVyID0gQ29sb3IzLmZyb21SR0IoNTYsIDYyLCA4NiksCiAgICAgICAgRHJvcGRvd25MaXN0Qkcg",
+"PSBDb2xvcjMuZnJvbVJHQig0MSwgNDYsIDY2KSwKICAgICAgICBEcm9wZG93bkxpc3RTdHJva2UgPSBDb2xvcjMuZnJvbVJHQig1",
+"NiwgNjIsIDg2KQogICAgfSwKICAgIFsnQ2F0cHB1Y2NpbiddID0gewogICAgICAgIE1haW5CRyA9IENvbG9yMy5mcm9tUkdCKDMw",
+"LCAzMCwgNDYpLAogICAgICAgIFNpZGViYXJCRyA9IENvbG9yMy5mcm9tUkdCKDI0LCAyNCwgMzcpLAogICAgICAgIFRvcGJhckJH",
+"ID0gQ29sb3IzLmZyb21SR0IoMTcsIDE3LCAyNyksCiAgICAgICAgRWxlbWVudEJHID0gQ29sb3IzLmZyb21SR0IoNDksIDUwLCA2",
+"OCksCiAgICAgICAgQWNjZW50ID0gQ29sb3IzLmZyb21SR0IoMjAzLCAxNjYsIDI0NyksCiAgICAgICAgVGV4dE1haW4gPSBDb2xv",
+"cjMuZnJvbVJHQigyMDUsIDIxNCwgMjQ0KSwKICAgICAgICBUZXh0U3ViID0gQ29sb3IzLmZyb21SR0IoMTY2LCAxNzMsIDIwMCks",
+"CiAgICAgICAgQm9yZGVyID0gQ29sb3IzLmZyb21SR0IoNjksIDcxLCA5MCksCiAgICAgICAgRHJvcGRvd25MaXN0QkcgPSBDb2xv",
+"cjMuZnJvbVJHQig0OSwgNTAsIDY4KSwKICAgICAgICBEcm9wZG93bkxpc3RTdHJva2UgPSBDb2xvcjMuZnJvbVJHQig2OSwgNzEs",
+"IDkwKQogICAgfSwKICAgIFsnUm9zZSBQaW5lJ10gPSB7CiAgICAgICAgTWFpbkJHID0gQ29sb3IzLmZyb21SR0IoMjUsIDIzLCAz",
+"NiksCiAgICAgICAgU2lkZWJhckJHID0gQ29sb3IzLmZyb21SR0IoMzEsIDI5LCA0NiksCiAgICAgICAgVG9wYmFyQkcgPSBDb2xv",
+"cjMuZnJvbVJHQigyMCwgMTgsIDI4KSwKICAgICAgICBFbGVtZW50QkcgPSBDb2xvcjMuZnJvbVJHQigzOCwgMzUsIDU4KSwKICAg",
+"ICAgICBBY2NlbnQgPSBDb2xvcjMuZnJvbVJHQigyMzUsIDE4OCwgMTg2KSwKICAgICAgICBUZXh0TWFpbiA9IENvbG9yMy5mcm9t",
+"UkdCKDIyNCwgMjIyLCAyNDQpLAogICAgICAgIFRleHRTdWIgPSBDb2xvcjMuZnJvbVJHQigxNDQsIDE0MCwgMTcwKSwKICAgICAg",
+"ICBCb3JkZXIgPSBDb2xvcjMuZnJvbVJHQig0OSwgNDcsIDY4KSwKICAgICAgICBEcm9wZG93bkxpc3RCRyA9IENvbG9yMy5mcm9t",
+"UkdCKDM4LCAzNSwgNTgpLAogICAgICAgIERyb3Bkb3duTGlzdFN0cm9rZSA9IENvbG9yMy5mcm9tUkdCKDQ5LCA0NywgNjgpCiAg",
+"ICB9LAogICAgWydNaW5pbWFsIFdoaXRlJ10gPSB7CiAgICAgICAgTWFpbkJHID0gQ29sb3IzLmZyb21SR0IoMTUsIDE1LCAxNSks",
+"CiAgICAgICAgU2lkZWJhckJHID0gQ29sb3IzLmZyb21SR0IoMjAsIDIwLCAyMCksCiAgICAgICAgVG9wYmFyQkcgPSBDb2xvcjMu",
+"ZnJvbVJHQigxMCwgMTAsIDEwKSwKICAgICAgICBFbGVtZW50QkcgPSBDb2xvcjMuZnJvbVJHQigyNiwgMjYsIDI2KSwKICAgICAg",
+"ICBBY2NlbnQgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KSwKICAgICAgICBUZXh0TWFpbiA9IENvbG9yMy5mcm9tUkdC",
+"KDI1NSwgMjU1LCAyNTUpLAogICAgICAgIFRleHRTdWIgPSBDb2xvcjMuZnJvbVJHQigxNzAsIDE3MCwgMTcwKSwKICAgICAgICBC",
+"b3JkZXIgPSBDb2xvcjMuZnJvbVJHQig0MCwgNDAsIDQwKSwKICAgICAgICBEcm9wZG93bkxpc3RCRyA9IENvbG9yMy5mcm9tUkdC",
+"KDI2LCAyNiwgMjYpLAogICAgICAgIERyb3Bkb3duTGlzdFN0cm9rZSA9IENvbG9yMy5mcm9tUkdCKDQwLCA0MCwgNDApCiAgICB9",
+"Cn0KCmxvY2FsIFRoZW1lID0ge30KZm9yIGssIHYgaW4gcGFpcnMoVGhlbWVzWydNaW5pbWFsIFdoaXRlJ10pIGRvIFRoZW1lW2td",
+"ID0gdiBlbmQKCmxvY2FsIEFlcm9MaWIgPSB7fQpBZXJvTGliLkZsYWdzID0ge30KQWVyb0xpYi5UaGVtZUNvbm5lY3Rpb25zID0g",
+"e30KQWVyb0xpYi5SYWluYm93QWNjZW50ID0gZmFsc2UKQWVyb0xpYi5SYWluYm93U3BlZWQgPSA1CkFlcm9MaWIuU2hvd05vdGlm",
+"aWNhdGlvbnMgPSB0cnVlCkFlcm9MaWIuU2hvd1Rvb2x0aXBzID0gdHJ1ZQoKbG9jYWwgU2V0dXBEaXJlY3RvcmllcyA9IGZ1bmN0",
+"aW9uKCkKICAgIGlmIGRlbGZvbGRlciBhbmQgbWFrZWZvbGRlciBhbmQgaXNmb2xkZXIgdGhlbgogICAgICAgIGlmIGlzZm9sZGVy",
+"KCdhZXJvJykgdGhlbgogICAgICAgICAgICBwY2FsbChkZWxmb2xkZXIsICdhZXJvJykKICAgICAgICBlbmQKICAgICAgICBpZiBp",
+"c2ZvbGRlcignYWVybycpIHRoZW4KICAgICAgICAgICAgaWYgaXNmaWxlIGFuZCBub3QgaXNmaWxlKCdhZXJvL3YyX21hcmtlci50",
+"eHQnKSB0aGVuCiAgICAgICAgICAgICAgICBwY2FsbChkZWxmb2xkZXIsICdhZXJvJykKICAgICAgICAgICAgICAgIHBjYWxsKG1h",
+"a2Vmb2xkZXIsICdhZXJvJykKICAgICAgICAgICAgICAgIGlmIHdyaXRlZmlsZSB0aGVuCiAgICAgICAgICAgICAgICAgICAgcGNh",
+"bGwod3JpdGVmaWxlLCAnYWVyby92Ml9tYXJrZXIudHh0JywgJ3YyJykKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBl",
+"bmQKICAgICAgICBlbHNlCiAgICAgICAgICAgIHBjYWxsKG1ha2Vmb2xkZXIsICdhZXJvJykKICAgICAgICAgICAgaWYgd3JpdGVm",
+"aWxlIHRoZW4KICAgICAgICAgICAgICAgIHBjYWxsKHdyaXRlZmlsZSwgJ2Flcm8vdjJfbWFya2VyLnR4dCcsICd2MicpCiAgICAg",
+"ICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCmVuZApTZXR1cERpcmVjdG9yaWVzKCkKCmxvY2FsIGNyZWF0ZUluc3RhbmNl",
+"ID0gZnVuY3Rpb24oY2xhc3NOYW1lLCBwcm9wZXJ0aWVzKQogICAgbG9jYWwgaW5zdCA9IEluc3RhbmNlLm5ldyhjbGFzc05hbWUp",
+"CiAgICBmb3IgaywgdiBpbiBwYWlycyhwcm9wZXJ0aWVzIG9yIHt9KSBkbwogICAgICAgIGluc3Rba10gPSB2CiAgICBlbmQKICAg",
+"IHJldHVybiBpbnN0CmVuZAoKbG9jYWwgZ2V0U3RyaW5nVmFsdWUgPSBmdW5jdGlvbih2YWwpCiAgICBpZiB0eXBlKHZhbCkgPT0g",
+"J3RhYmxlJyB0aGVuCiAgICAgICAgaWYgdmFsLlR5cGUgPT0gJ0NvbG9yMycgdGhlbgogICAgICAgICAgICByZXR1cm4gc3RyaW5n",
+"LmZvcm1hdCgnUkdCOiAlZCwgJWQsICVkJywgbWF0aC5mbG9vcih2YWwuUiAqIDI1NSksIG1hdGguZmxvb3IodmFsLkcgKiAyNTUp",
+"LCBtYXRoLmZsb29yKHZhbC5CICogMjU1KSkKICAgICAgICBlbHNlaWYgdmFsLlR5cGUgPT0gJ0VudW1JdGVtJyB0aGVuCiAgICAg",
+"ICAgICAgIHJldHVybiB0b3N0cmluZyh2YWwuTmFtZSkKICAgICAgICBlbmQKICAgICAgICBmb3IgXywgdiBpbiBwYWlycyh2YWwp",
+"IGRvCiAgICAgICAgICAgIGlmIHR5cGUodikgPT0gJ3N0cmluZycgb3IgdHlwZSh2KSA9PSAnbnVtYmVyJyB0aGVuCiAgICAgICAg",
+"ICAgICAgICByZXR1cm4gdG9zdHJpbmcodikKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICAgICAgcmV0dXJuICdOb25l",
+"JwogICAgZW5kCiAgICByZXR1cm4gdmFsIH49IG5pbCBhbmQgdG9zdHJpbmcodmFsKSBvciAnTm9uZScKZW5kCgpsb2NhbCByZWdU",
+"aGVtZSA9IGZ1bmN0aW9uKGluc3RhbmNlLCBjYWxsYmFjaykKICAgIHRhYmxlLmluc2VydChBZXJvTGliLlRoZW1lQ29ubmVjdGlv",
+"bnMsIGZ1bmN0aW9uKCkKICAgICAgICBsb2NhbCBzdWNjZXNzLCBoYXNQYXJlbnQgPSBwY2FsbChmdW5jdGlvbigpIHJldHVybiBp",
+"bnN0YW5jZSBhbmQgaW5zdGFuY2UuUGFyZW50IGVuZCkKICAgICAgICBpZiBzdWNjZXNzIGFuZCBoYXNQYXJlbnQgdGhlbgogICAg",
+"ICAgICAgICBjYWxsYmFjaygpCiAgICAgICAgICAgIHJldHVybiB0cnVlCiAgICAgICAgZW5kCiAgICAgICAgcmV0dXJuIGZhbHNl",
+"CiAgICBlbmQpCiAgICBjYWxsYmFjaygpCmVuZAoKbG9jYWwgVXBkYXRlVGhlbWVBY2NlbnQgPSBmdW5jdGlvbihuZXdDb2xvcikK",
+"ICAgIFRoZW1lLkFjY2VudCA9IG5ld0NvbG9yCiAgICBsb2NhbCBhbGl2ZSA9IHt9CiAgICBmb3IgaSA9IDEsICNBZXJvTGliLlRo",
+"ZW1lQ29ubmVjdGlvbnMgZG8KICAgICAgICBsb2NhbCBmdW5jID0gQWVyb0xpYi5UaGVtZUNvbm5lY3Rpb25zW2ldCiAgICAgICAg",
+"aWYgdHlwZShmdW5jKSA9PSAnZnVuY3Rpb24nIHRoZW4KICAgICAgICAgICAgbG9jYWwgcywgcmVzID0gcGNhbGwoZnVuYykKICAg",
+"ICAgICAgICAgaWYgcyBhbmQgcmVzIH49IGZhbHNlIHRoZW4gCiAgICAgICAgICAgICAgICB0YWJsZS5pbnNlcnQoYWxpdmUsIGZ1",
+"bmMpIAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZAogICAgQWVyb0xpYi5UaGVtZUNvbm5lY3Rpb25zID0gYWxp",
+"dmUKZW5kCgpsb2NhbCBBcHBseVNlbGVjdGVkVGhlbWUgPSBmdW5jdGlvbih0aGVtZU5hbWUpCiAgICBsb2NhbCB0YXJnZXRUaGVt",
+"ZSA9IFRoZW1lc1t0aGVtZU5hbWVdCiAgICBpZiBub3QgdGFyZ2V0VGhlbWUgdGhlbiByZXR1cm4gZW5kCiAgICBmb3IgaywgdiBp",
+"biBwYWlycyh0YXJnZXRUaGVtZSkgZG8KICAgICAgICBUaGVtZVtrXSA9IHYKICAgIGVuZAogICAgbG9jYWwgYWxpdmUgPSB7fQog",
+"ICAgZm9yIGkgPSAxLCAjQWVyb0xpYi5UaGVtZUNvbm5lY3Rpb25zIGRvCiAgICAgICAgbG9jYWwgZnVuYyA9IEFlcm9MaWIuVGhl",
+"bWVDb25uZWN0aW9uc1tpXQogICAgICAgIGlmIHR5cGUoZnVuYykgPT0gJ2Z1bmN0aW9uJyB0aGVuCiAgICAgICAgICAgIGxvY2Fs",
+"IHMsIHJlcyA9IHBjYWxsKGZ1bmMpCiAgICAgICAgICAgIGlmIHMgYW5kIHJlcyB+PSBmYWxzZSB0aGVuIAogICAgICAgICAgICAg",
+"ICAgdGFibGUuaW5zZXJ0KGFsaXZlLCBmdW5jKSAKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKICAgIEFlcm9M",
+"aWIuVGhlbWVDb25uZWN0aW9ucyA9IGFsaXZlCmVuZAoKUnVuU2VydmljZS5SZW5kZXJTdGVwcGVkOkNvbm5lY3QoZnVuY3Rpb24o",
+"KQogICAgaWYgQWVyb0xpYi5SYWluYm93QWNjZW50IHRoZW4KICAgICAgICBsb2NhbCBodWUgPSB0aWNrKCkgKiAoQWVyb0xpYi5S",
+"YWluYm93U3BlZWQgLyAxMDApICUgMQogICAgICAgIFVwZGF0ZVRoZW1lQWNjZW50KENvbG9yMy5mcm9tSFNWKGh1ZSwgMSwgMSkp",
+"CiAgICBlbmQKZW5kKQoKbG9jYWwgR2V0RGFya2VyQ29sb3IgPSBmdW5jdGlvbihjb2xvciwgZmFjdG9yKQogICAgbG9jYWwgaCwg",
+"cywgdiA9IENvbG9yMy50b0hTVihjb2xvcikKICAgIHJldHVybiBDb2xvcjMuZnJvbUhTVihoLCBzLCBtYXRoLmNsYW1wKHYgKiBm",
+"YWN0b3IsIDAsIDEpKQplbmQKCmxvY2FsIFNlcmlhbGl6ZVZhbHVlID0gZnVuY3Rpb24odmFsKQogICAgaWYgdHlwZW9mKHZhbCkg",
+"PT0gJ0NvbG9yMycgdGhlbgogICAgICAgIHJldHVybiB7VHlwZSA9ICdDb2xvcjMnLCBSID0gdmFsLlIsIEcgPSB2YWwuRywgQiA9",
+"IHZhbC5CfQogICAgZWxzZWlmIHR5cGVvZih2YWwpID09ICdFbnVtSXRlbScgdGhlbgogICAgICAgIHJldHVybiB7VHlwZSA9ICdF",
+"bnVtSXRlbScsIEVudW1UeXBlID0gdG9zdHJpbmcodmFsLkVudW1UeXBlKSwgTmFtZSA9IHZhbC5OYW1lfQogICAgZWxzZWlmIHR5",
+"cGVvZih2YWwpID09ICd0YWJsZScgdGhlbgogICAgICAgIGxvY2FsIHRibCA9IHt9CiAgICAgICAgZm9yIGssIHYgaW4gcGFpcnMo",
+"dmFsKSBkbwogICAgICAgICAgICB0Ymxba10gPSBTZXJpYWxpemVWYWx1ZSh2KQogICAgICAgIGVuZAogICAgICAgIHJldHVybiB0",
+"YmwKICAgIGVuZAogICAgcmV0dXJuIHZhbAplbmQKCmxvY2FsIERlc2VyaWFsaXplVmFsdWUgPSBmdW5jdGlvbih2YWwpCiAgICBp",
+"ZiB0eXBlKHZhbCkgPT0gJ3RhYmxlJyB0aGVuCiAgICAgICAgaWYgdmFsLlR5cGUgPT0gJ0NvbG9yMycgdGhlbgogICAgICAgICAg",
+"ICByZXR1cm4gQ29sb3IzLm5ldyh2YWwuUiwgdmFsLkcsIHZhbC5CKQogICAgICAgIGVsc2VpZiB2YWwuVHlwZSA9PSAnRW51bUl0",
+"ZW0nIHRoZW4KICAgICAgICAgICAgbG9jYWwgc3VjY2VzcywgZW51bSA9IHBjYWxsKGZ1bmN0aW9uKCkgcmV0dXJuIEVudW1bdmFs",
+"LkVudW1UeXBlXVt2YWwuTmFtZV0gZW5kKQogICAgICAgICAgICByZXR1cm4gc3VjY2VzcyBhbmQgZW51bSBvciBuaWwKICAgICAg",
+"ICBlbHNlCiAgICAgICAgICAgIGxvY2FsIHRibCA9IHt9CiAgICAgICAgICAgIGZvciBrLCB2IGluIHBhaXJzKHZhbCkgZG8KICAg",
+"ICAgICAgICAgICAgIHRibFtrXSA9IERlc2VyaWFsaXplVmFsdWUodikKICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIHJldHVy",
+"biB0YmwKICAgICAgICBlbmQKICAgIGVuZAogICAgcmV0dXJuIHZhbAplbmQKCkFlcm9MaWIuTm90aWZ5ID0gZnVuY3Rpb24oc2Vs",
+"Ziwgb3B0aW9ucykKICAgIGlmIG5vdCBBZXJvTGliLlNob3dOb3RpZmljYXRpb25zIHRoZW4gcmV0dXJuIGVuZAogICAgbG9jYWwg",
+"VGl0bGUgPSBvcHRpb25zLlRpdGxlIG9yICdOb3RpZmljYXRpb24nCiAgICBsb2NhbCBDb250ZW50ID0gb3B0aW9ucy5Db250ZW50",
+"IG9yICdOb3RpZmljYXRpb24gY29udGVudCBnb2VzIGhlcmUuJwogICAgbG9jYWwgRHVyYXRpb24gPSBvcHRpb25zLkR1cmF0aW9u",
+"IG9yIDMKCiAgICBsb2NhbCBTY3JlZW5HdWkgPSB1aVBhcmVudDpGaW5kRmlyc3RDaGlsZCgnQWVyb1VJJykKICAgIGlmIG5vdCBT",
+"Y3JlZW5HdWkgdGhlbiByZXR1cm4gZW5kCiAgICAKICAgIGxvY2FsIE5vdGlmQ29udGFpbmVyID0gU2NyZWVuR3VpOkZpbmRGaXJz",
+"dENoaWxkKCdOb3RpZnlDb250YWluZXInKQogICAgaWYgbm90IE5vdGlmQ29udGFpbmVyIHRoZW4gcmV0dXJuIGVuZAoKICAgIGxv",
+"Y2FsIFdyYXBwZXIgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgUGFyZW50ID0gTm90aWZDb250YWluZXIsCiAg",
+"ICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCAyNjAsIDAsIDApLAog",
+"ICAgICAgIENsaXBzRGVzY2VuZGFudHMgPSB0cnVlLAogICAgICAgIFpJbmRleCA9IDIwMAogICAgfSkKCiAgICBsb2NhbCBOb3Rp",
+"ZkNhcmQgPSBjcmVhdGVJbnN0YW5jZSgnQ2FudmFzR3JvdXAnLCB7CiAgICAgICAgUGFyZW50ID0gV3JhcHBlciwKICAgICAgICBC",
+"YWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuTWFpbkJHLAogICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAwLjM1LAogICAg",
+"ICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMCwgNzUpLAogICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDEsIDMwMCwgMCwg",
+"MCksCiAgICAgICAgR3JvdXBUcmFuc3BhcmVuY3kgPSAxLAogICAgICAgIFpJbmRleCA9IDIwMAogICAgfSkKICAgIGNyZWF0ZUlu",
+"c3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBOb3RpZkNhcmQsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDYpfSkKICAg",
+"IHJlZ1RoZW1lKE5vdGlmQ2FyZCwgZnVuY3Rpb24oKSBOb3RpZkNhcmQuQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRyBl",
+"bmQpCgogICAgbG9jYWwgVGl0bGVMYmwgPSBjcmVhdGVJbnN0YW5jZSgnVGV4dExhYmVsJywgewogICAgICAgIFBhcmVudCA9IE5v",
+"dGlmQ2FyZCwKICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygw",
+"LCAwLCAwLCAxMCksCiAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAwLCAxNiksCiAgICAgICAgRm9udCA9IEVudW0uRm9u",
+"dC5Hb3RoYW1Cb2xkLAogICAgICAgIFRleHQgPSBUaXRsZSwKICAgICAgICBUZXh0Q29sb3IzID0gVGhlbWUuQWNjZW50LAogICAg",
+"ICAgIFRleHRTaXplID0gMTQsCiAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRYQWxpZ25tZW50LkNlbnRlciwKICAg",
+"ICAgICBaSW5kZXggPSAyMDEKICAgIH0pCiAgICByZWdUaGVtZShUaXRsZUxibCwgZnVuY3Rpb24oKSBUaXRsZUxibC5UZXh0Q29s",
+"b3IzID0gVGhlbWUuQWNjZW50IGVuZCkKCiAgICBsb2NhbCBJbmZvTGJsID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRMYWJlbCcsIHsK",
+"ICAgICAgICBQYXJlbnQgPSBOb3RpZkNhcmQsCiAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgUG9z",
+"aXRpb24gPSBVRGltMi5uZXcoMCwgMTUsIDAsIDMwKSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIC0zMCwgMCwgMzUpLAog",
+"ICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtLAogICAgICAgIFRleHQgPSBDb250ZW50LAogICAgICAgIFRleHRDb2xvcjMg",
+"PSBUaGVtZS5UZXh0U3ViLAogICAgICAgIFRleHRTaXplID0gMTIsCiAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRY",
+"QWxpZ25tZW50LkNlbnRlciwKICAgICAgICBUZXh0V3JhcHBlZCA9IHRydWUsCiAgICAgICAgWkluZGV4ID0gMjAxCiAgICB9KQog",
+"ICAgcmVnVGhlbWUoSW5mb0xibCwgZnVuY3Rpb24oKSBJbmZvTGJsLlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0U3ViIGVuZCkKCiAg",
+"ICBsb2NhbCBMaW5lRnJhbWUgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgUGFyZW50ID0gTm90aWZDYXJkLAog",
+"ICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5BY2NlbnQsCiAgICAgICAgQm9yZGVyU2l6ZVBpeGVsID0gMCwKICAgICAg",
+"ICBBbmNob3JQb2ludCA9IFZlY3RvcjIubmV3KDAuNSwgMSksCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMC41LCAwLCAx",
+"LCAwKSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIDAsIDAsIDIpLAogICAgICAgIFpJbmRleCA9IDIwMQogICAgfSkKICAg",
+"IGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBMaW5lRnJhbWUsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDEs",
+"IDApfSkKICAgIHJlZ1RoZW1lKExpbmVGcmFtZSwgZnVuY3Rpb24oKSBMaW5lRnJhbWUuQmFja2dyb3VuZENvbG9yMyA9IFRoZW1l",
+"LkFjY2VudCBlbmQpCgogICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShXcmFwcGVyLCBUd2VlbkluZm8ubmV3KDAuMywgRW51bS5FYXNp",
+"bmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge1NpemUgPSBVRGltMi5uZXcoMCwgMjYwLCAwLCA4NSl9",
+"KTpQbGF5KCkKICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoTm90aWZDYXJkLCBUd2VlbkluZm8ubmV3KDAuNCwgRW51bS5FYXNpbmdT",
+"dHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwgewogICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAsIDAs",
+"IDAsIDApLAogICAgICAgIEdyb3VwVHJhbnNwYXJlbmN5ID0gMAogICAgfSk6UGxheSgpCiAgICBUd2VlblNlcnZpY2U6Q3JlYXRl",
+"KExpbmVGcmFtZSwgVHdlZW5JbmZvLm5ldyhEdXJhdGlvbiwgRW51bS5FYXNpbmdTdHlsZS5MaW5lYXIpLCB7U2l6ZSA9IFVEaW0y",
+"Lm5ldygwLCAwLCAwLCAyKX0pOlBsYXkoKQoKICAgIHRhc2suZGVsYXkoRHVyYXRpb24sIGZ1bmN0aW9uKCkKICAgICAgICBsb2Nh",
+"bCBvdXRUd2VlbiA9IFR3ZWVuU2VydmljZTpDcmVhdGUoTm90aWZDYXJkLCBUd2VlbkluZm8ubmV3KDAuNCwgRW51bS5FYXNpbmdT",
+"dHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uSW4pLCB7CiAgICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDEs",
+"IDMwMCwgMCwgMCksCiAgICAgICAgICAgIEdyb3VwVHJhbnNwYXJlbmN5ID0gMQogICAgICAgIH0pCiAgICAgICAgb3V0VHdlZW46",
+"UGxheSgpCiAgICAgICAgb3V0VHdlZW4uQ29tcGxldGVkOldhaXQoKQogICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoV3JhcHBl",
+"ciwgVHdlZW5JbmZvLm5ldygwLjMsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLkluKSwge1Np",
+"emUgPSBVRGltMi5uZXcoMCwgMjYwLCAwLCAwKX0pOlBsYXkoKQogICAgICAgIHRhc2suZGVsYXkoMC4zLCBmdW5jdGlvbigpIFdy",
+"YXBwZXI6RGVzdHJveSgpIGVuZCkKICAgIGVuZCkKZW5kCgpBZXJvTGliLkNyZWF0ZVdpbmRvdyA9IGZ1bmN0aW9uKHNlbGYsIG9w",
+"dGlvbnMpCiAgICBsb2NhbCBXaW5kb3dUaXRsZSA9IG9wdGlvbnMuVGl0bGUgb3IgJ3JvJwogICAgbG9jYWwgVGl0bGVQcmVmaXgg",
+"PSBvcHRpb25zLlByZWZpeCBvciAnQWUnCiAgICBsb2NhbCBkZWZhdWx0VGhlbWUgPSBvcHRpb25zLlRoZW1lIG9yICdNaW5pbWFs",
+"IFdoaXRlJwogICAgCiAgICBsb2NhbCBTY3JlZW5HdWkgPSBjcmVhdGVJbnN0YW5jZSgnU2NyZWVuR3VpJywgewogICAgICAgIE5h",
+"bWUgPSAnQWVyb1VJJywKICAgICAgICBSZXNldE9uU3Bhd24gPSBmYWxzZSwKICAgICAgICBaSW5kZXhCZWhhdmlvciA9IEVudW0u",
+"WkluZGV4QmVoYXZpb3IuU2libGluZywKICAgICAgICBQYXJlbnQgPSB1aVBhcmVudAogICAgfSkKICAgIAogICAgaWYgdWlQYXJl",
+"bnQ6RmluZEZpcnN0Q2hpbGQoJ0Flcm9VSScpIGFuZCB1aVBhcmVudDpGaW5kRmlyc3RDaGlsZCgnQWVyb1VJJykgfj0gU2NyZWVu",
+"R3VpIHRoZW4KICAgICAgICB1aVBhcmVudDpGaW5kRmlyc3RDaGlsZCgnQWVyb1VJJyk6RGVzdHJveSgpCiAgICBlbmQKCiAgICBs",
+"b2NhbCBpc01vYmlsZSA9IFVzZXJJbnB1dFNlcnZpY2UuVG91Y2hFbmFibGVkIGFuZCBub3QgVXNlcklucHV0U2VydmljZS5LZXli",
+"b2FyZEVuYWJsZWQKCiAgICBsb2NhbCBNYWluR3JvdXAgPSBjcmVhdGVJbnN0YW5jZSgnQ2FudmFzR3JvdXAnLCB7CiAgICAgICAg",
+"TmFtZSA9ICdNYWluR3JvdXAnLAogICAgICAgIFBhcmVudCA9IFNjcmVlbkd1aSwKICAgICAgICBCYWNrZ3JvdW5kQ29sb3IzID0g",
+"VGhlbWUuTWFpbkJHLAogICAgICAgIEFuY2hvclBvaW50ID0gVmVjdG9yMi5uZXcoMC41LCAwLjUpLAogICAgICAgIFBvc2l0aW9u",
+"ID0gVURpbTIubmV3KDAuNSwgMCwgMC41LCAwKSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDU4MCwgMCwgMzYwKSwKICAg",
+"ICAgICBCb3JkZXJTaXplUGl4ZWwgPSAwCiAgICB9KQogICAgcmVnVGhlbWUoTWFpbkdyb3VwLCBmdW5jdGlvbigpIE1haW5Hcm91",
+"cC5CYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuTWFpbkJHIGVuZCkKICAgIAogICAgbG9jYWwgQ3VycmVudFNjYWxlID0gMQogICAg",
+"bG9jYWwgTWFpblNjYWxlID0gY3JlYXRlSW5zdGFuY2UoJ1VJU2NhbGUnLCB7UGFyZW50ID0gTWFpbkdyb3VwLCBTY2FsZSA9IEN1",
+"cnJlbnRTY2FsZX0pCiAgICBsb2NhbCBTY2FsZXNUb1VwZGF0ZSA9IHtNYWluU2NhbGV9CgogICAgbG9jYWwgV2luZG93T2JqID0g",
+"eyBUYWJzID0ge30sIEN1cnJlbnRUYWIgPSBuaWwsIEVsZW1lbnRzTGlzdCA9IHt9IH0KICAgIAogICAgbG9jYWwgTWVudVZpc2li",
+"bGUgPSB0cnVlCiAgICAKICAgIGxvY2FsIFVwZGF0ZVNjYWxlID0gZnVuY3Rpb24obmV3U2NhbGUpCiAgICAgICAgQ3VycmVudFNj",
+"YWxlID0gbmV3U2NhbGUKICAgICAgICBpZiBNZW51VmlzaWJsZSB0aGVuCiAgICAgICAgICAgIGZvciBpID0gMSwgI1NjYWxlc1Rv",
+"VXBkYXRlIGRvCiAgICAgICAgICAgICAgICBsb2NhbCBzY2FsZU9iaiA9IFNjYWxlc1RvVXBkYXRlW2ldCiAgICAgICAgICAgICAg",
+"ICBUd2VlblNlcnZpY2U6Q3JlYXRlKHNjYWxlT2JqLCBUd2VlbkluZm8ubmV3KDAuMiwgRW51bS5FYXNpbmdTdHlsZS5RdWFkKSwg",
+"e1NjYWxlID0gQ3VycmVudFNjYWxlfSk6UGxheSgpCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCiAgICAKICAg",
+"IFdpbmRvd09iai5VcGRhdGVTY2FsZSA9IGZ1bmN0aW9uKHNlbGYsIG5ld1NjYWxlKQogICAgICAgIGxvY2FsIHNjYWxlID0gdHlw",
+"ZShzZWxmKSA9PSAnbnVtYmVyJyBhbmQgc2VsZiBvciBuZXdTY2FsZQogICAgICAgIFVwZGF0ZVNjYWxlKHNjYWxlKQogICAgZW5k",
+"CgogICAgY3JlYXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IE1haW5Hcm91cCwgQ29ybmVyUmFkaXVzID0gVURpbS5u",
+"ZXcoMCwgNil9KQoKICAgIGxvY2FsIE1haW5TdHJva2VGcmFtZSA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICBO",
+"YW1lID0gJ1N0cm9rZUZyYW1lJywKICAgICAgICBQYXJlbnQgPSBNYWluR3JvdXAsCiAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFy",
+"ZW5jeSA9IDEsCiAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAxLCAwKQogICAgfSkKICAgIGNyZWF0ZUluc3RhbmNlKCdV",
+"SUNvcm5lcicsIHtQYXJlbnQgPSBNYWluU3Ryb2tlRnJhbWUsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDYpfSkKICAgIGxv",
+"Y2FsIE1haW5TdHJva2UgPSBjcmVhdGVJbnN0YW5jZSgnVUlTdHJva2UnLCB7UGFyZW50ID0gTWFpblN0cm9rZUZyYW1lLCBDb2xv",
+"ciA9IFRoZW1lLkJvcmRlcn0pCiAgICByZWdUaGVtZShNYWluU3Ryb2tlLCBmdW5jdGlvbigpIE1haW5TdHJva2UuQ29sb3IgPSBU",
+"aGVtZS5Cb3JkZXIgZW5kKQoKICAgIGxvY2FsIE5vdGlmeUNvbnRhaW5lciA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAg",
+"ICAgICBOYW1lID0gJ05vdGlmeUNvbnRhaW5lcicsCiAgICAgICAgUGFyZW50ID0gU2NyZWVuR3VpLAogICAgICAgIEJhY2tncm91",
+"bmRUcmFuc3BhcmVuY3kgPSAxLAogICAgICAgIEFuY2hvclBvaW50ID0gVmVjdG9yMi5uZXcoMSwgMSksCiAgICAgICAgUG9zaXRp",
+"b24gPSBVRGltMi5uZXcoMSwgLTIwLCAxLCAtMjApLAogICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgMzAwLCAxLCAwKSwKICAg",
+"ICAgICBaSW5kZXggPSAxMDAKICAgIH0pCgogICAgY3JlYXRlSW5zdGFuY2UoJ1VJTGlzdExheW91dCcsIHsKICAgICAgICBQYXJl",
+"bnQgPSBOb3RpZnlDb250YWluZXIsCiAgICAgICAgU29ydE9yZGVyID0gRW51bS5Tb3J0T3JkZXIuTGF5b3V0T3JkZXIsCiAgICAg",
+"ICAgVmVydGljYWxBbGlnbm1lbnQgPSBFbnVtLlZlcnRpY2FsQWxpZ25tZW50LkJvdHRvbSwKICAgICAgICBIb3Jpem9udGFsQWxp",
+"Z25tZW50ID0gRW51bS5Ib3Jpem9udGFsQWxpZ25tZW50LlJpZ2h0LAogICAgICAgIFBhZGRpbmcgPSBVRGltLm5ldygwLCAxMCkK",
+"ICAgIH0pCgogICAgbG9jYWwgVG9vbHRpcENhcmQgPSBjcmVhdGVJbnN0YW5jZSgnQ2FudmFzR3JvdXAnLCB7CiAgICAgICAgTmFt",
+"ZSA9ICdUb29sdGlwQ2FyZCcsCiAgICAgICAgUGFyZW50ID0gU2NyZWVuR3VpLAogICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBU",
+"aGVtZS5NYWluQkcsCiAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDAuMSwKICAgICAgICBTaXplID0gVURpbTIubmV3",
+"KDAsIDAsIDAsIDI0KSwKICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAwLCAwKSwKICAgICAgICBCb3JkZXJTaXpl",
+"UGl4ZWwgPSAwLAogICAgICAgIFZpc2libGUgPSBmYWxzZSwKICAgICAgICBHcm91cFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAg",
+"WkluZGV4ID0gMzAwCiAgICB9KQogICAgcmVnVGhlbWUoVG9vbHRpcENhcmQsIGZ1bmN0aW9uKCkgVG9vbHRpcENhcmQuQmFja2dy",
+"b3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRyBlbmQpCiAgICBjcmVhdGVJbnN0YW5jZSgnVUlDb3JuZXInLCB7UGFyZW50ID0gVG9v",
+"bHRpcENhcmQsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDIpfSkKICAgIGNyZWF0ZUluc3RhbmNlKCdVSVBhZGRpbmcnLCB7",
+"UGFyZW50ID0gVG9vbHRpcENhcmQsIFBhZGRpbmdMZWZ0ID0gVURpbS5uZXcoMCwgMTApLCBQYWRkaW5nUmlnaHQgPSBVRGltLm5l",
+"dygwLCAxMCl9KQogICAgCiAgICBsb2NhbCBUb29sdGlwTGluZSA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICBQ",
+"YXJlbnQgPSBUb29sdGlwQ2FyZCwKICAgICAgICBCYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuQWNjZW50LAogICAgICAgIEJvcmRl",
+"clNpemVQaXhlbCA9IDAsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgLTEwLCAwLCAwKSwKICAgICAgICBTaXplID0g",
+"VURpbTIubmV3KDAsIDMsIDEsIDApLAogICAgICAgIFpJbmRleCA9IDMwMQogICAgfSkKICAgIHJlZ1RoZW1lKFRvb2x0aXBMaW5l",
+"LCBmdW5jdGlvbigpIFRvb2x0aXBMaW5lLkJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5BY2NlbnQgZW5kKQogICAgCiAgICBsb2Nh",
+"bCBUb29sdGlwVGV4dCA9IGNyZWF0ZUluc3RhbmNlKCdUZXh0TGFiZWwnLCB7CiAgICAgICAgUGFyZW50ID0gVG9vbHRpcENhcmQs",
+"CiAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMCwg",
+"MCksCiAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCAwLCAxLCAwKSwKICAgICAgICBGb250ID0gRW51bS5Gb250LkdvdGhhbU1l",
+"ZGl1bSwKICAgICAgICBUZXh0ID0gJycsCiAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWluLAogICAgICAgIFRleHRT",
+"aXplID0gMTEsCiAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRYQWxpZ25tZW50LkxlZnQsCiAgICAgICAgQXV0b21h",
+"dGljU2l6ZSA9IEVudW0uQXV0b21hdGljU2l6ZS5YLAogICAgICAgIFpJbmRleCA9IDMwMQogICAgfSkKICAgIHJlZ1RoZW1lKFRv",
+"b2x0aXBUZXh0LCBmdW5jdGlvbigpIFRvb2x0aXBUZXh0LlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0TWFpbiBlbmQpCgogICAgbG9j",
+"YWwgdG9vbHRpcEFjdGl2ZSA9IGZhbHNlCiAgICBsb2NhbCBhY3RpdmVIb3ZlcmVkRWxlbWVudCA9IG5pbAogICAgbG9jYWwgdG9v",
+"bHRpcEN1cnJlbnRPZmZzZXQgPSAyMAogICAgbG9jYWwgdGFyZ2V0VG9vbHRpcE9mZnNldCA9IDIwCgogICAgbG9jYWwgU2hvd1Rv",
+"b2x0aXAgPSBmdW5jdGlvbih0ZXh0LCB0YXJnZXRZKQogICAgICAgIGlmIG5vdCBBZXJvTGliLlNob3dUb29sdGlwcyB0aGVuIHJl",
+"dHVybiBlbmQKICAgICAgICBpZiBub3QgdGV4dCBvciB0ZXh0ID09ICcnIHRoZW4gcmV0dXJuIGVuZAogICAgICAgIFRvb2x0aXBU",
+"ZXh0LlRleHQgPSB0ZXh0CiAgICAgICAgVG9vbHRpcENhcmQuQXV0b21hdGljU2l6ZSA9IEVudW0uQXV0b21hdGljU2l6ZS5YCiAg",
+"ICAgICAgVG9vbHRpcENhcmQuVmlzaWJsZSA9IHRydWUKICAgICAgICB0b29sdGlwQWN0aXZlID0gdHJ1ZQogICAgICAgIHRhcmdl",
+"dFRvb2x0aXBPZmZzZXQgPSAwCiAgICAgICAgCiAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShUb29sdGlwQ2FyZCwgVHdlZW5J",
+"bmZvLm5ldygwLjI1LCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7CiAgICAgICAg",
+"ICAgIEdyb3VwVHJhbnNwYXJlbmN5ID0gMAogICAgICAgIH0pOlBsYXkoKQogICAgZW5kCiAgICAKICAgIGxvY2FsIEhpZGVUb29s",
+"dGlwID0gZnVuY3Rpb24oKQogICAgICAgIHRvb2x0aXBBY3RpdmUgPSBmYWxzZQogICAgICAgIHRhcmdldFRvb2x0aXBPZmZzZXQg",
+"PSAyMAogICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoVG9vbHRpcENhcmQsIFR3ZWVuSW5mby5uZXcoMC4yLCBFbnVtLkVhc2lu",
+"Z1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5JbiksIHsKICAgICAgICAgICAgR3JvdXBUcmFuc3BhcmVuY3kgPSAx",
+"CiAgICAgICAgfSk6UGxheSgpCiAgICAgICAgdGFzay5kZWxheSgwLjIsIGZ1bmN0aW9uKCkgCiAgICAgICAgICAgIGlmIG5vdCB0",
+"b29sdGlwQWN0aXZlIHRoZW4KICAgICAgICAgICAgICAgIFRvb2x0aXBDYXJkLlZpc2libGUgPSBmYWxzZQogICAgICAgICAgICBl",
+"bmQKICAgICAgICBlbmQpCiAgICBlbmQKCiAgICBSdW5TZXJ2aWNlLlJlbmRlclN0ZXBwZWQ6Q29ubmVjdChmdW5jdGlvbihkdCkK",
+"ICAgICAgICBpZiBUb29sdGlwQ2FyZC5WaXNpYmxlIGFuZCBhY3RpdmVIb3ZlcmVkRWxlbWVudCB0aGVuCiAgICAgICAgICAgIHRv",
+"b2x0aXBDdXJyZW50T2Zmc2V0ID0gdG9vbHRpcEN1cnJlbnRPZmZzZXQgKyAodGFyZ2V0VG9vbHRpcE9mZnNldCAtIHRvb2x0aXBD",
+"dXJyZW50T2Zmc2V0KSAqIG1hdGguY2xhbXAoZHQgKiAxNSwgMCwgMSkKICAgICAgICAgICAgbG9jYWwgdGFyZ2V0WSA9IGFjdGl2",
+"ZUhvdmVyZWRFbGVtZW50LkFic29sdXRlUG9zaXRpb24uWSArIChhY3RpdmVIb3ZlcmVkRWxlbWVudC5BYnNvbHV0ZVNpemUuWSAv",
+"IDIpIC0gKFRvb2x0aXBDYXJkLkFic29sdXRlU2l6ZS5ZIC8gMikKICAgICAgICAgICAgbG9jYWwgbWFpblggPSBNYWluR3JvdXAu",
+"QWJzb2x1dGVQb3NpdGlvbi5YICsgTWFpbkdyb3VwLkFic29sdXRlU2l6ZS5YICsgMTUgKyB0b29sdGlwQ3VycmVudE9mZnNldAog",
+"ICAgICAgICAgICBUb29sdGlwQ2FyZC5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLCBtYWluWCwgMCwgdGFyZ2V0WSkKICAgICAgICBl",
+"bmQKICAgIGVuZCkKCiAgICBsb2NhbCBTZXR1cFRvb2x0aXAgPSBmdW5jdGlvbihlbGVtZW50RnJhbWUsIHRpcFRleHQpCiAgICAg",
+"ICAgaWYgbm90IHRpcFRleHQgb3IgdGlwVGV4dCA9PSAnJyB0aGVuIHJldHVybiBlbmQKICAgICAgICBlbGVtZW50RnJhbWUuTW91",
+"c2VFbnRlcjpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgYWN0aXZlSG92ZXJlZEVsZW1lbnQgPSBlbGVtZW50RnJhbWUK",
+"ICAgICAgICAgICAgU2hvd1Rvb2x0aXAodGlwVGV4dCwgZWxlbWVudEZyYW1lLkFic29sdXRlUG9zaXRpb24uWSkKICAgICAgICBl",
+"bmQpCiAgICAgICAgZWxlbWVudEZyYW1lLk1vdXNlTGVhdmU6Q29ubmVjdChmdW5jdGlvbigpCiAgICAgICAgICAgIGlmIGFjdGl2",
+"ZUhvdmVyZWRFbGVtZW50ID09IGVsZW1lbnRGcmFtZSB0aGVuCiAgICAgICAgICAgICAgICBhY3RpdmVIb3ZlcmVkRWxlbWVudCA9",
+"IG5pbAogICAgICAgICAgICAgICAgSGlkZVRvb2x0aXAoKQogICAgICAgICAgICBlbmQKICAgICAgICBlbmQpCiAgICBlbmQKCiAg",
+"ICBsb2NhbCBNZW51S2V5YmluZCA9IEVudW0uS2V5Q29kZS5SaWdodENvbnRyb2wKCiAgICBsb2NhbCBUb2dnbGVNZW51VmlzaWJs",
+"ZSA9IGZ1bmN0aW9uKHN0YXRlKQogICAgICAgIGlmIHN0YXRlIH49IG5pbCB0aGVuIE1lbnVWaXNpYmxlID0gc3RhdGUgZWxzZSBN",
+"ZW51VmlzaWJsZSA9IG5vdCBNZW51VmlzaWJsZSBlbmQKICAgICAgICBNYWluR3JvdXAuSW50ZXJhY3RhYmxlID0gTWVudVZpc2li",
+"bGUKICAgICAgICAKICAgICAgICBpZiBNZW51VmlzaWJsZSB0aGVuCiAgICAgICAgICAgIE1haW5Hcm91cC5WaXNpYmxlID0gdHJ1",
+"ZQogICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKE1haW5Hcm91cCwgVHdlZW5JbmZvLm5ldygwLjMsIEVudW0uRWFzaW5n",
+"U3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLk91dCksIHtHcm91cFRyYW5zcGFyZW5jeSA9IDB9KTpQbGF5KCkKICAg",
+"ICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShNYWluU3Ryb2tlLCBUd2VlbkluZm8ubmV3KDAuMywgRW51bS5FYXNpbmdTdHls",
+"ZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge1RyYW5zcGFyZW5jeSA9IDB9KTpQbGF5KCkKICAgICAgICAgICAg",
+"Zm9yIGkgPSAxLCAjU2NhbGVzVG9VcGRhdGUgZG8KICAgICAgICAgICAgICAgIGxvY2FsIHNjYWxlT2JqID0gU2NhbGVzVG9VcGRh",
+"dGVbaV0KICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoc2NhbGVPYmosIFR3ZWVuSW5mby5uZXcoMC4zLCBFbnVt",
+"LkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7U2NhbGUgPSBDdXJyZW50U2NhbGV9KTpQbGF5",
+"KCkKICAgICAgICAgICAgZW5kCiAgICAgICAgZWxzZQogICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKE1haW5Hcm91cCwg",
+"VHdlZW5JbmZvLm5ldygwLjMsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLk91dCksIHtHcm91",
+"cFRyYW5zcGFyZW5jeSA9IDF9KTpQbGF5KCkKICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShNYWluU3Ryb2tlLCBUd2Vl",
+"bkluZm8ubmV3KDAuMywgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge1RyYW5zcGFy",
+"ZW5jeSA9IDF9KTpQbGF5KCkKICAgICAgICAgICAgZm9yIGkgPSAxLCAjU2NhbGVzVG9VcGRhdGUgZG8KICAgICAgICAgICAgICAg",
+"IGxvY2FsIHNjYWxlT2JqID0gU2NhbGVzVG9VcGRhdGVbaV0KICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoc2Nh",
+"bGVPYmosIFR3ZWVuSW5mby5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQp",
+"LCB7U2NhbGUgPSBDdXJyZW50U2NhbGUgKiAwLjk1fSk6UGxheSgpCiAgICAgICAgICAgIGVuZAogICAgICAgICAgICB0YXNrLmRl",
+"bGF5KDAuMywgZnVuY3Rpb24oKSBpZiBub3QgTWVudVZpc2libGUgdGhlbiBNYWluR3JvdXAuVmlzaWJsZSA9IGZhbHNlIGVuZCBl",
+"bmQpCiAgICAgICAgZW5kCiAgICBlbmQKCiAgICBVc2VySW5wdXRTZXJ2aWNlLklucHV0QmVnYW46Q29ubmVjdChmdW5jdGlvbihp",
+"bnB1dCwgZ3BlKQogICAgICAgIGlmIG5vdCBncGUgYW5kIGlucHV0LktleUNvZGUgPT0gTWVudUtleWJpbmQgdGhlbiBUb2dnbGVN",
+"ZW51VmlzaWJsZSgpIGVuZAogICAgZW5kKQoKICAgIGlmIGlzTW9iaWxlIHRoZW4KICAgICAgICBsb2NhbCBUb2dnbGVCdG4gPSBj",
+"cmVhdGVJbnN0YW5jZSgnSW1hZ2VCdXR0b24nLCB7CiAgICAgICAgICAgIFBhcmVudCA9IFNjcmVlbkd1aSwKICAgICAgICAgICAg",
+"QmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRywKICAgICAgICAgICAgQW5jaG9yUG9pbnQgPSBWZWN0b3IyLm5ldygwLjUs",
+"IDApLAogICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLjUsIDAsIDAsIDIwKSwKICAgICAgICAgICAgU2l6ZSA9IFVE",
+"aW0yLm5ldygwLCA0OCwgMCwgNDApLAogICAgICAgICAgICBBdXRvQnV0dG9uQ29sb3IgPSBmYWxzZSwKICAgICAgICAgICAgSW1h",
+"Z2UgPSAnJwogICAgICAgIH0pCiAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IFRvZ2dsZUJ0biwg",
+"Q29ybmVyUmFkaXVzID0gVURpbS5uZXcoMCwgOCl9KQogICAgICAgIGxvY2FsIGJ0blN0cm9rZSA9IGNyZWF0ZUluc3RhbmNlKCdV",
+"SVN0cm9rZScsIHtQYXJlbnQgPSBUb2dnbGVCdG4sIENvbG9yID0gVGhlbWUuQm9yZGVyLCBBcHBseVN0cm9rZU1vZGUgPSBFbnVt",
+"LkFwcGx5U3Ryb2tlTW9kZS5Cb3JkZXJ9KQogICAgICAgIHJlZ1RoZW1lKFRvZ2dsZUJ0biwgZnVuY3Rpb24oKSAKICAgICAgICAg",
+"ICAgVG9nZ2xlQnRuLkJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5NYWluQkcKICAgICAgICAgICAgYnRuU3Ryb2tlLkNvbG9yID0g",
+"VGhlbWUuQm9yZGVyCiAgICAgICAgZW5kKQoKICAgICAgICBsb2NhbCBUb2dUZXh0RnJhbWUgPSBjcmVhdGVJbnN0YW5jZSgnRnJh",
+"bWUnLCB7CiAgICAgICAgICAgIFBhcmVudCA9IFRvZ2dsZUJ0biwKICAgICAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9",
+"IDEsCiAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMSwgMCkKICAgICAgICB9KQoKICAgICAgICBsb2NhbCBUb2dU",
+"ZXh0ID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRMYWJlbCcsIHsKICAgICAgICAgICAgUGFyZW50ID0gVG9nVGV4dEZyYW1lLAogICAg",
+"ICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAxLCAw",
+"KSwKICAgICAgICAgICAgUmljaFRleHQgPSB0cnVlLAogICAgICAgICAgICBGb250ID0gRW51bS5Gb250LkdvdGhhbUJvbGQsCiAg",
+"ICAgICAgICAgIFRleHRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KSwKICAgICAgICAgICAgVGV4dFNpemUg",
+"PSAxNCwKICAgICAgICAgICAgVGV4dCA9ICc8aT7imIU8L2k+JwogICAgICAgIH0pCiAgICAgICAgcmVnVGhlbWUoVG9nVGV4dCwg",
+"ZnVuY3Rpb24oKSBUb2dUZXh0LlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0TWFpbiBlbmQpCgogICAgICAgIGxvY2FsIGRyYWdnaW5n",
+"VG9nLCBkcmFnSW5wdXRUb2csIGRyYWdTdGFydFRvZywgc3RhcnRQb3NUb2cKICAgICAgICBUb2dnbGVCdG4uSW5wdXRCZWdhbjpD",
+"b25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgICAgICBpZiBpbnB1dC5Vc2VySW5wdXRUeXBlID09IEVudW0uVXNlcklucHV0",
+"VHlwZS5Ub3VjaCBvciBpbnB1dC5Vc2VySW5wdXRUeXBlID09IEVudW0uVXNlcklucHV0VHlwZS5Nb3VzZUJ1dHRvbjEgdGhlbgog",
+"ICAgICAgICAgICAgICAgZHJhZ2dpbmdUb2cgPSB0cnVlCiAgICAgICAgICAgICAgICBkcmFnU3RhcnRUb2cgPSBpbnB1dC5Qb3Np",
+"dGlvbgogICAgICAgICAgICAgICAgc3RhcnRQb3NUb2cgPSBUb2dnbGVCdG4uUG9zaXRpb24KICAgICAgICAgICAgZW5kCiAgICAg",
+"ICAgZW5kKQogICAgICAgIFRvZ2dsZUJ0bi5JbnB1dENoYW5nZWQ6Q29ubmVjdChmdW5jdGlvbihpbnB1dCkKICAgICAgICAgICAg",
+"aWYgaW5wdXQuVXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuVG91Y2ggb3IgaW5wdXQuVXNlcklucHV0VHlwZSA9",
+"PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VNb3ZlbWVudCB0aGVuCiAgICAgICAgICAgICAgICBkcmFnSW5wdXRUb2cgPSBpbnB1",
+"dAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQpCiAgICAgICAgVXNlcklucHV0U2VydmljZS5JbnB1dENoYW5nZWQ6Q29ubmVj",
+"dChmdW5jdGlvbihpbnB1dCkKICAgICAgICAgICAgaWYgaW5wdXQgPT0gZHJhZ0lucHV0VG9nIGFuZCBkcmFnZ2luZ1RvZyB0aGVu",
+"CiAgICAgICAgICAgICAgICBsb2NhbCBkZWx0YSA9IGlucHV0LlBvc2l0aW9uIC0gZHJhZ1N0YXJ0VG9nCiAgICAgICAgICAgICAg",
+"ICBUb2dnbGVCdG4uUG9zaXRpb24gPSBVRGltMi5uZXcoc3RhcnRQb3NUb2cuWC5TY2FsZSwgc3RhcnRQb3NUb2cuWC5PZmZzZXQg",
+"KyBkZWx0YS5YLCBzdGFydFBvc1RvZy5ZLlNjYWxlLCBzdGFydFBvc1RvZy5ZLk9mZnNldCArIGRlbHRhLlkpCiAgICAgICAgICAg",
+"IGVuZAogICAgICAgIGVuZCkKICAgICAgICBVc2VySW5wdXRTZXJ2aWNlLklucHV0RW5kZWQ6Q29ubmVjdChmdW5jdGlvbihpbnB1",
+"dCkKICAgICAgICAgICAgaWYgaW5wdXQuVXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuVG91Y2ggb3IgaW5wdXQu",
+"VXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VCdXR0b24xIHRoZW4KICAgICAgICAgICAgICAgIGRyYWdn",
+"aW5nVG9nID0gZmFsc2UKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kKQogICAgICAgIFRvZ2dsZUJ0bi5Nb3VzZUJ1dHRvbjFD",
+"bGljazpDb25uZWN0KGZ1bmN0aW9uKCkgVG9nZ2xlTWVudVZpc2libGUoKSBlbmQpCiAgICBlbmQKCiAgICBsb2NhbCBUb3BiYXIg",
+"PSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgTmFtZSA9ICdUb3BiYXInLAogICAgICAgIFBhcmVudCA9IE1haW5H",
+"cm91cCwKICAgICAgICBCYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuVG9wYmFyQkcsCiAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygx",
+"LCAwLCAwLCA0OCksCiAgICAgICAgQm9yZGVyU2l6ZVBpeGVsID0gMCwKICAgICAgICBaSW5kZXggPSAyCiAgICB9KQogICAgcmVn",
+"VGhlbWUoVG9wYmFyLCBmdW5jdGlvbigpIFRvcGJhci5CYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuVG9wYmFyQkcgZW5kKQoKICAg",
+"IGxvY2FsIFRvcGJhckJvcmRlciA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICBQYXJlbnQgPSBUb3BiYXIsCiAg",
+"ICAgICAgQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkJvcmRlciwKICAgICAgICBCb3JkZXJTaXplUGl4ZWwgPSAwLAogICAgICAg",
+"IFBvc2l0aW9uID0gVURpbTIubmV3KDAsIDAsIDEsIC0xKSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIDAsIDAsIDEpCiAg",
+"ICB9KQogICAgcmVnVGhlbWUoVG9wYmFyQm9yZGVyLCBmdW5jdGlvbigpIFRvcGJhckJvcmRlci5CYWNrZ3JvdW5kQ29sb3IzID0g",
+"VGhlbWUuQm9yZGVyIGVuZCkKCiAgICBsb2NhbCBkcmFnZ2luZywgZHJhZ0lucHV0LCBkcmFnU3RhcnQsIHN0YXJ0UG9zCiAgICBU",
+"b3BiYXIuSW5wdXRCZWdhbjpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgIGlmIGlucHV0LlVzZXJJbnB1dFR5cGUgPT0g",
+"RW51bS5Vc2VySW5wdXRUeXBlLk1vdXNlQnV0dG9uMSBvciBpbnB1dC5Vc2VySW5wdXRUeXBlID09IEVudW0uVXNlcklucHV0VHlw",
+"ZS5Ub3VjaCB0aGVuCiAgICAgICAgICAgIGRyYWdnaW5nID0gdHJ1ZQogICAgICAgICAgICBkcmFnU3RhcnQgPSBpbnB1dC5Qb3Np",
+"dGlvbgogICAgICAgICAgICBzdGFydFBvcyA9IE1haW5Hcm91cC5Qb3NpdGlvbgogICAgICAgICAgICBpbnB1dC5DaGFuZ2VkOkNv",
+"bm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgaWYgaW5wdXQuVXNlcklucHV0U3RhdGUgPT0gRW51bS5Vc2VySW5wdXRT",
+"dGF0ZS5FbmQgdGhlbiBkcmFnZ2luZyA9IGZhbHNlIGVuZAogICAgICAgICAgICBlbmQpCiAgICAgICAgZW5kCiAgICBlbmQpCiAg",
+"ICBUb3BiYXIuSW5wdXRDaGFuZ2VkOkNvbm5lY3QoZnVuY3Rpb24oaW5wdXQpCiAgICAgICAgaWYgaW5wdXQuVXNlcklucHV0VHlw",
+"ZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VNb3ZlbWVudCBvciBpbnB1dC5Vc2VySW5wdXRUeXBlID09IEVudW0uVXNlcklu",
+"cHV0VHlwZS5Ub3VjaCB0aGVuCiAgICAgICAgICAgIGRyYWdJbnB1dCA9IGlucHV0CiAgICAgICAgZW5kCiAgICBlbmQpCiAgICBV",
+"c2VySW5wdXRTZXJ2aWNlLklucHV0Q2hhbmdlZDpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgIGlmIGlucHV0ID09IGRy",
+"YWdJbnB1dCBhbmQgZHJhZ2dpbmcgdGhlbgogICAgICAgICAgICBsb2NhbCBkZWx0YSA9IGlucHV0LlBvc2l0aW9uIC0gZHJhZ1N0",
+"YXJ0CiAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoTWFpbkdyb3VwLCBUd2VlbkluZm8ubmV3KDAuMSwgRW51bS5FYXNp",
+"bmdTdHlsZS5MaW5lYXIpLCB7CiAgICAgICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldyhzdGFydFBvcy5YLlNjYWxlLCBz",
+"dGFydFBvcy5YLk9mZnNldCArIGRlbHRhLlgsIHN0YXJ0UG9zLlkuU2NhbGUsIHN0YXJ0UG9zLlkuT2Zmc2V0ICsgZGVsdGEuWSkK",
+"ICAgICAgICAgICAgfSk6UGxheSgpCiAgICAgICAgZW5kCiAgICBlbmQpCgogICAgLS0gQ3VzdG9tIEFlcm8gbG9nbzogc3RhciB3",
+"aXRoIHZlcnRpY2FsIHRyYWlsIGxlYWRpbmcgaW50byAiQWVybyIKICAgIGxvY2FsIExvZ29Db250YWluZXIgPSBjcmVhdGVJbnN0",
+"YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgUGFyZW50ID0gVG9wYmFyLAogICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAx",
+"LAogICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAsIDE0LCAwLCAwKSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDEx",
+"MCwgMSwgMCkKICAgIH0pCgogICAgbG9jYWwgU3RhckxhYmVsID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRMYWJlbCcsIHsKICAgICAg",
+"ICBQYXJlbnQgPSBMb2dvQ29udGFpbmVyLAogICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxLAogICAgICAgIFBvc2l0",
+"aW9uID0gVURpbTIubmV3KDAsIDAsIDAsIDIpLAogICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgMjIsIDAsIDIwKSwKICAgICAg",
+"ICBGb250ID0gRW51bS5Gb250LkdvdGhhbUJvbGQsCiAgICAgICAgVGV4dCA9ICfimIUnLAogICAgICAgIFRleHRDb2xvcjMgPSBU",
+"aGVtZS5BY2NlbnQsCiAgICAgICAgVGV4dFNpemUgPSAyMCwKICAgICAgICBUZXh0WEFsaWdubWVudCA9IEVudW0uVGV4dFhBbGln",
+"bm1lbnQuQ2VudGVyLAogICAgICAgIFRleHRZQWxpZ25tZW50ID0gRW51bS5UZXh0WUFsaWdubWVudC5DZW50ZXIKICAgIH0pCiAg",
+"ICByZWdUaGVtZShTdGFyTGFiZWwsIGZ1bmN0aW9uKCkgU3RhckxhYmVsLlRleHRDb2xvcjMgPSBUaGVtZS5BY2NlbnQgZW5kKQoK",
+"ICAgIC0tIFZlcnRpY2FsIHRyYWlsIGZyb20gc3RhciBkb3duIHRvd2FyZCB0aGUgdGV4dAogICAgbG9jYWwgVHJhaWwgPSBjcmVh",
+"dGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgUGFyZW50ID0gTG9nb0NvbnRhaW5lciwKICAgICAgICBCYWNrZ3JvdW5kQ29s",
+"b3IzID0gVGhlbWUuQWNjZW50LAogICAgICAgIEJvcmRlclNpemVQaXhlbCA9IDAsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5u",
+"ZXcoMCwgMTAsIDAsIDIwKSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDIsIDAsIDE0KSwKICAgICAgICBaSW5kZXggPSAy",
+"CiAgICB9KQogICAgY3JlYXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IFRyYWlsLCBDb3JuZXJSYWRpdXMgPSBVRGlt",
+"Lm5ldygxLCAwKX0pCiAgICBsb2NhbCBUcmFpbEdyYWQgPSBjcmVhdGVJbnN0YW5jZSgnVUlHcmFkaWVudCcsIHsKICAgICAgICBQ",
+"YXJlbnQgPSBUcmFpbCwKICAgICAgICBSb3RhdGlvbiA9IDkwLAogICAgICAgIFRyYW5zcGFyZW5jeSA9IE51bWJlclNlcXVlbmNl",
+"Lm5ldyh7CiAgICAgICAgICAgIE51bWJlclNlcXVlbmNlS2V5cG9pbnQubmV3KDAsIDApLAogICAgICAgICAgICBOdW1iZXJTZXF1",
+"ZW5jZUtleXBvaW50Lm5ldygwLjU1LCAwLjM1KSwKICAgICAgICAgICAgTnVtYmVyU2VxdWVuY2VLZXlwb2ludC5uZXcoMSwgMSkK",
+"ICAgICAgICB9KQogICAgfSkKICAgIHJlZ1RoZW1lKFRyYWlsLCBmdW5jdGlvbigpIFRyYWlsLkJhY2tncm91bmRDb2xvcjMgPSBU",
+"aGVtZS5BY2NlbnQgZW5kKQoKICAgIC0tIFNtYWxsIHRyYWlsaW5nIGRvdHMgZm9yIGV4dHJhIHRyYWlsIGZlZWwKICAgIGZvciBp",
+"ID0gMSwgMyBkbwogICAgICAgIGxvY2FsIGRvdCA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICAgICAgUGFyZW50",
+"ID0gTG9nb0NvbnRhaW5lciwKICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkFjY2VudCwKICAgICAgICAgICAg",
+"Qm9yZGVyU2l6ZVBpeGVsID0gMCwKICAgICAgICAgICAgQW5jaG9yUG9pbnQgPSBWZWN0b3IyLm5ldygwLjUsIDAuNSksCiAgICAg",
+"ICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAsIDExLCAwLCAyMCArIChpICogNCkpLAogICAgICAgICAgICBTaXplID0gVURp",
+"bTIubmV3KDAsIDMgLSAoaSAqIDAuNCksIDAsIDMgLSAoaSAqIDAuNCkpLAogICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJl",
+"bmN5ID0gMC4yNSAqIGksCiAgICAgICAgICAgIFpJbmRleCA9IDMKICAgICAgICB9KQogICAgICAgIGNyZWF0ZUluc3RhbmNlKCdV",
+"SUNvcm5lcicsIHtQYXJlbnQgPSBkb3QsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDEsIDApfSkKICAgICAgICByZWdUaGVtZShk",
+"b3QsIGZ1bmN0aW9uKCkKICAgICAgICAgICAgaWYgZG90IGFuZCBkb3QuUGFyZW50IHRoZW4KICAgICAgICAgICAgICAgIGRvdC5C",
+"YWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuQWNjZW50CiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZCkKICAgIGVuZAoKICAgIGxv",
+"Y2FsIFRpdGxlTGFiZWwgPSBjcmVhdGVJbnN0YW5jZSgnVGV4dExhYmVsJywgewogICAgICAgIFBhcmVudCA9IExvZ29Db250YWlu",
+"ZXIsCiAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMjIs",
+"IDAsIDApLAogICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgNTIsIDEsIDApLAogICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290",
+"aGFtQm9sZCwKICAgICAgICBUZXh0ID0gJ0Flcm8nLAogICAgICAgIFRleHRDb2xvcjMgPSBUaGVtZS5UZXh0TWFpbiwKICAgICAg",
+"ICBUZXh0U2l6ZSA9IDIyLAogICAgICAgIFRleHRYQWxpZ25tZW50ID0gRW51bS5UZXh0WEFsaWdubWVudC5MZWZ0LAogICAgICAg",
+"IFRleHRZQWxpZ25tZW50ID0gRW51bS5UZXh0WUFsaWdubWVudC5DZW50ZXIKICAgIH0pCiAgICByZWdUaGVtZShUaXRsZUxhYmVs",
+"LCBmdW5jdGlvbigpIFRpdGxlTGFiZWwuVGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWluIGVuZCkKCiAgICAtLSBMaXZlIGtleSB0",
+"aW1lIHJlbWFpbmluZyBuZXh0IHRvIEFlcm8KICAgIGxvY2FsIFRpbWVMYWJlbCA9IGNyZWF0ZUluc3RhbmNlKCdUZXh0TGFiZWwn",
+"LCB7CiAgICAgICAgUGFyZW50ID0gTG9nb0NvbnRhaW5lciwKICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAg",
+"ICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCA3NCwgMCwgMCksCiAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCAxMjAsIDEs",
+"IDApLAogICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAgICAgIFRleHQgPSAnJywKICAgICAgICBUZXh0",
+"Q29sb3IzID0gVGhlbWUuVGV4dFN1YiwKICAgICAgICBUZXh0U2l6ZSA9IDExLAogICAgICAgIFRleHRYQWxpZ25tZW50ID0gRW51",
+"bS5UZXh0WEFsaWdubWVudC5MZWZ0LAogICAgICAgIFRleHRZQWxpZ25tZW50ID0gRW51bS5UZXh0WUFsaWdubWVudC5DZW50ZXIK",
+"ICAgIH0pCiAgICByZWdUaGVtZShUaW1lTGFiZWwsIGZ1bmN0aW9uKCkgVGltZUxhYmVsLlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0",
+"U3ViIGVuZCkKCiAgICBMb2dvQ29udGFpbmVyLlNpemUgPSBVRGltMi5uZXcoMCwgMjAwLCAxLCAwKQoKICAgIHRhc2suc3Bhd24o",
+"ZnVuY3Rpb24oKQogICAgICAgIHdoaWxlIFRpbWVMYWJlbCBhbmQgVGltZUxhYmVsLlBhcmVudCBkbwogICAgICAgICAgICBsb2Nh",
+"bCByZW1haW5pbmcsIGtleVR5cGUgPSBBZXJvR2V0UmVtYWluaW5nKCkKICAgICAgICAgICAgaWYgcmVtYWluaW5nID09IG5pbCB0",
+"aGVuCiAgICAgICAgICAgICAgICBUaW1lTGFiZWwuVGV4dCA9ICLCtyBMaWZldGltZSIKICAgICAgICAgICAgICAgIFRpbWVMYWJl",
+"bC5UZXh0Q29sb3IzID0gVGhlbWUuQWNjZW50CiAgICAgICAgICAgIGVsc2UKICAgICAgICAgICAgICAgIFRpbWVMYWJlbC5UZXh0",
+"ID0gIsK3ICIgLi4gQWVyb0Zvcm1hdFJlbWFpbmluZyhyZW1haW5pbmcpCiAgICAgICAgICAgICAgICBpZiByZW1haW5pbmcgPD0g",
+"MzYwMCB0aGVuCiAgICAgICAgICAgICAgICAgICAgVGltZUxhYmVsLlRleHRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyMzksIDY4",
+"LCA2OCkgLS0gcmVkIHdoZW4gPCAxIGhvdXIKICAgICAgICAgICAgICAgIGVsc2VpZiByZW1haW5pbmcgPD0gODY0MDAgdGhlbgog",
+"ICAgICAgICAgICAgICAgICAgIFRpbWVMYWJlbC5UZXh0Q29sb3IzID0gQ29sb3IzLmZyb21SR0IoMjUxLCAxOTEsIDM2KSAtLSB5",
+"ZWxsb3cgd2hlbiA8IDEgZGF5CiAgICAgICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICAgICAgVGltZUxhYmVsLlRleHRD",
+"b2xvcjMgPSBUaGVtZS5UZXh0U3ViCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIHRhc2su",
+"d2FpdCgzMCkgLS0gdXBkYXRlIGV2ZXJ5IDMwcwogICAgICAgIGVuZAogICAgZW5kKQoKICAgIGxvY2FsIHRpdGxlQm91bmRzID0g",
+"VmVjdG9yMi5uZXcoMjAwLCA0OCkKICAgIGxvY2FsIGNsZWFuVGl0bGUgPSAnQWVybycgCgogICAgbG9jYWwgcHJvZmlsZVRleHQg",
+"PSAnV2VsY29tZSwgJyAuLiBMb2NhbFBsYXllci5OYW1lCiAgICBsb2NhbCBwcm9maWxlQm91bmRzID0gVGV4dFNlcnZpY2U6R2V0",
+"VGV4dFNpemUocHJvZmlsZVRleHQsIDEyLCBFbnVtLkZvbnQuR290aGFtLCBWZWN0b3IyLm5ldygxMDAwLCA0OCkpCgogICAgbG9j",
+"YWwgUHJvZmlsZUJveCA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICBQYXJlbnQgPSBUb3BiYXIsCiAgICAgICAg",
+"QmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRywKICAgICAgICBBbmNob3JQb2ludCA9IFZlY3RvcjIubmV3KDEsIDAuNSks",
+"CiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMSwgLTUwLCAwLjUsIDApLAogICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwg",
+"cHJvZmlsZUJvdW5kcy5YICsgNDIsIDAsIDMwKQogICAgfSkKICAgIGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQg",
+"PSBQcm9maWxlQm94LCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA0KX0pCiAgICBsb2NhbCBQcm9maWxlU3Ryb2tlID0gY3Jl",
+"YXRlSW5zdGFuY2UoJ1VJU3Ryb2tlJywge1BhcmVudCA9IFByb2ZpbGVCb3gsIENvbG9yID0gVGhlbWUuQm9yZGVyfSkKICAgIHJl",
+"Z1RoZW1lKFByb2ZpbGVCb3gsIGZ1bmN0aW9uKCkgCiAgICAgICAgUHJvZmlsZUJveC5CYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUu",
+"TWFpbkJHCiAgICAgICAgUHJvZmlsZVN0cm9rZS5Db2xvciA9IFRoZW1lLkJvcmRlcgogICAgZW5kKQoKICAgIGxvY2FsIEF2YXRh",
+"ckltZyA9IGNyZWF0ZUluc3RhbmNlKCdJbWFnZUxhYmVsJywgewogICAgICAgIFBhcmVudCA9IFByb2ZpbGVCb3gsCiAgICAgICAg",
+"QmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgNCwgMC41LCAtMTEpLAog",
+"ICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgMjIsIDAsIDIyKQogICAgfSkKICAgIGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcics",
+"IHtQYXJlbnQgPSBBdmF0YXJJbWcsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDEsIDApfSkKCiAgICB0YXNrLnNwYXduKGZ1bmN0",
+"aW9uKCkKICAgICAgICBsb2NhbCBjb250ZW50LCBpc1JlYWR5ID0gUGxheWVyczpHZXRVc2VyVGh1bWJuYWlsQXN5bmMoTG9jYWxQ",
+"bGF5ZXIuVXNlcklkLCBFbnVtLlRodW1ibmFpbFR5cGUuSGVhZFNob3QsIEVudW0uVGh1bWJuYWlsU2l6ZS5TaXplNDh4NDgpCiAg",
+"ICAgICAgaWYgaXNSZWFkeSB0aGVuIEF2YXRhckltZy5JbWFnZSA9IGNvbnRlbnQgZW5kCiAgICBlbmQpCgogICAgbG9jYWwgUHJv",
+"ZmlsZU5hbWUgPSBjcmVhdGVJbnN0YW5jZSgnVGV4dExhYmVsJywgewogICAgICAgIFBhcmVudCA9IFByb2ZpbGVCb3gsCiAgICAg",
+"ICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMzIsIDAsIDApLAog",
+"ICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgLTM2LCAxLCAwKSwKICAgICAgICBGb250ID0gRW51bS5Gb250LkdvdGhhbSwKICAg",
+"ICAgICBUZXh0ID0gcHJvZmlsZVRleHQsCiAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWluLAogICAgICAgIFRleHRT",
+"aXplID0gMTIsCiAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRYQWxpZ25tZW50LkxlZnQKICAgIH0pCiAgICByZWdU",
+"aGVtZShQcm9maWxlTmFtZSwgZnVuY3Rpb24oKSBQcm9maWxlTmFtZS5UZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW4gZW5kKQoK",
+"ICAgIGxvY2FsIFNlYXJjaE92ZXJsYXkgPSBjcmVhdGVJbnN0YW5jZSgnQ2FudmFzR3JvdXAnLCB7CiAgICAgICAgUGFyZW50ID0g",
+"U2NyZWVuR3VpLAogICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigwLCAwLCAwKSwKICAgICAgICBCYWNr",
+"Z3JvdW5kVHJhbnNwYXJlbmN5ID0gMC41LAogICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMSwgMCksCiAgICAgICAgWklu",
+"ZGV4ID0gNTAwLAogICAgICAgIEdyb3VwVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICBWaXNpYmxlID0gZmFsc2UKICAgIH0pCgog",
+"ICAgbG9jYWwgU2VhcmNoUGFuZWwgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgUGFyZW50ID0gU2VhcmNoT3Zl",
+"cmxheSwKICAgICAgICBCYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuTWFpbkJHLAogICAgICAgIEFuY2hvclBvaW50ID0gVmVjdG9y",
+"Mi5uZXcoMC41LCAwLjUpLAogICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAuNSwgMCwgMC41LCAtMjApLAogICAgICAgIFNp",
+"emUgPSBVRGltMi5uZXcoMCwgNDAwLCAwLCAzMDApLAogICAgICAgIENsaXBzRGVzY2VuZGFudHMgPSB0cnVlCiAgICB9KQogICAg",
+"Y3JlYXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IFNlYXJjaFBhbmVsLCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygw",
+"LCA2KX0pCiAgICBsb2NhbCBTZWFyY2hQYW5lbFN0cm9rZSA9IGNyZWF0ZUluc3RhbmNlKCdVSVN0cm9rZScsIHtQYXJlbnQgPSBT",
+"ZWFyY2hQYW5lbCwgQ29sb3IgPSBUaGVtZS5Cb3JkZXJ9KQogICAgcmVnVGhlbWUoU2VhcmNoUGFuZWwsIGZ1bmN0aW9uKCkgCiAg",
+"ICAgICAgU2VhcmNoUGFuZWwuQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRwogICAgICAgIFNlYXJjaFBhbmVsU3Ryb2tl",
+"LkNvbG9yID0gVGhlbWUuQm9yZGVyIAogICAgZW5kKQoKICAgIGxvY2FsIFNlYXJjaElucHV0Qm94ID0gY3JlYXRlSW5zdGFuY2Uo",
+"J1RleHRCb3gnLCB7CiAgICAgICAgUGFyZW50ID0gU2VhcmNoUGFuZWwsCiAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9",
+"IDEsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMjAsIDAsIDEwKSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDEs",
+"IC00MCwgMCwgNDApLAogICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAgICAgIFBsYWNlaG9sZGVyVGV4",
+"dCA9ICdTZWFyY2ggZWxlbWVudHMuLi4nLAogICAgICAgIFBsYWNlaG9sZGVyQ29sb3IzID0gVGhlbWUuVGV4dFN1YiwKICAgICAg",
+"ICBUZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW4sCiAgICAgICAgVGV4dFNpemUgPSAxNCwKICAgICAgICBUZXh0WEFsaWdubWVu",
+"dCA9IEVudW0uVGV4dFhBbGlnbm1lbnQuTGVmdCwKICAgICAgICBDbGVhclRleHRPbkZvY3VzID0gZmFsc2UsCiAgICAgICAgVGV4",
+"dCA9ICcnCiAgICB9KQogICAgcmVnVGhlbWUoU2VhcmNoSW5wdXRCb3gsIGZ1bmN0aW9uKCkgCiAgICAgICAgU2VhcmNoSW5wdXRC",
+"b3guVGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWluIAogICAgICAgIFNlYXJjaElucHV0Qm94LlBsYWNlaG9sZGVyQ29sb3IzID0g",
+"VGhlbWUuVGV4dFN1YgogICAgZW5kKQogICAgCiAgICBsb2NhbCBTZWFyY2hMaW5lID0gY3JlYXRlSW5zdGFuY2UoJ0ZyYW1lJywg",
+"ewogICAgICAgIFBhcmVudCA9IFNlYXJjaFBhbmVsLAogICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5Cb3JkZXIsCiAg",
+"ICAgICAgQm9yZGVyU2l6ZVBpeGVsID0gMCwKICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAwLCA1NSksCiAgICAg",
+"ICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAwLCAxKQogICAgfSkKICAgIHJlZ1RoZW1lKFNlYXJjaExpbmUsIGZ1bmN0aW9uKCkg",
+"U2VhcmNoTGluZS5CYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuQm9yZGVyIGVuZCkKCiAgICBsb2NhbCBTZWFyY2hTY3JvbGwgPSBj",
+"cmVhdGVJbnN0YW5jZSgnU2Nyb2xsaW5nRnJhbWUnLCB7CiAgICAgICAgUGFyZW50ID0gU2VhcmNoUGFuZWwsCiAgICAgICAgQmFj",
+"a2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMTAsIDAsIDY1KSwKICAgICAg",
+"ICBTaXplID0gVURpbTIubmV3KDEsIC0yMCwgMSwgLTc1KSwKICAgICAgICBTY3JvbGxCYXJUaGlja25lc3MgPSAyLAogICAgICAg",
+"IFNjcm9sbEJhckltYWdlQ29sb3IzID0gVGhlbWUuQm9yZGVyLAogICAgICAgIEJvcmRlclNpemVQaXhlbCA9IDAsCiAgICAgICAg",
+"QXV0b21hdGljQ2FudmFzU2l6ZSA9IEVudW0uQXV0b21hdGljU2l6ZS5ZLAogICAgICAgIENhbnZhc1NpemUgPSBVRGltMi5uZXco",
+"MCwgMCwgMCwgMCkKICAgIH0pCiAgICByZWdUaGVtZShTZWFyY2hTY3JvbGwsIGZ1bmN0aW9uKCkgU2VhcmNoU2Nyb2xsLlNjcm9s",
+"bEJhckltYWdlQ29sb3IzID0gVGhlbWUuQm9yZGVyIGVuZCkKCiAgICBjcmVhdGVJbnN0YW5jZSgnVUlMaXN0TGF5b3V0Jywgewog",
+"ICAgICAgIFBhcmVudCA9IFNlYXJjaFNjcm9sbCwKICAgICAgICBTb3J0T3JkZXIgPSBFbnVtLlNvcnRPcmRlci5MYXlvdXRPcmRl",
+"ciwKICAgICAgICBQYWRkaW5nID0gVURpbS5uZXcoMCwgNSkKICAgIH0pCgogICAgbG9jYWwgU2VhcmNoQnRuID0gY3JlYXRlSW5z",
+"dGFuY2UoJ0ltYWdlQnV0dG9uJywgewogICAgICAgIFBhcmVudCA9IFRvcGJhciwKICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJl",
+"bmN5ID0gMSwKICAgICAgICBBbmNob3JQb2ludCA9IFZlY3RvcjIubmV3KDEsIDAuNSksCiAgICAgICAgUG9zaXRpb24gPSBVRGlt",
+"Mi5uZXcoMSwgLTE1LCAwLjUsIDApLAogICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgMjQsIDAsIDI0KSwKICAgICAgICBJbWFn",
+"ZSA9ICdyYnhhc3NldGlkOi8vNjAzMTE1NDg3MScsCiAgICAgICAgSW1hZ2VDb2xvcjMgPSBUaGVtZS5UZXh0U3ViCiAgICB9KQog",
+"ICAgcmVnVGhlbWUoU2VhcmNoQnRuLCBmdW5jdGlvbigpIFNlYXJjaEJ0bi5JbWFnZUNvbG9yMyA9IFRoZW1lLlRleHRTdWIgZW5k",
+"KQoKICAgIFNlYXJjaEJ0bi5Nb3VzZUJ1dHRvbjFDbGljazpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICBTZWFyY2hPdmVybGF5",
+"LlZpc2libGUgPSB0cnVlCiAgICAgICAgU2VhcmNoSW5wdXRCb3guVGV4dCA9ICcnCiAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0",
+"ZShTZWFyY2hPdmVybGF5LCBUd2VlbkluZm8ubmV3KDAuMywgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJl",
+"Y3Rpb24uT3V0KSwge0dyb3VwVHJhbnNwYXJlbmN5ID0gMH0pOlBsYXkoKQogICAgICAgIFNlYXJjaElucHV0Qm94OkNhcHR1cmVG",
+"b2N1cygpCiAgICBlbmQpCgogICAgU2VhcmNoT3ZlcmxheS5JbnB1dEJlZ2FuOkNvbm5lY3QoZnVuY3Rpb24oaW5wdXQpCiAgICAg",
+"ICAgaWYgaW5wdXQuVXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VCdXR0b24xIHRoZW4KICAgICAgICAg",
+"ICAgbG9jYWwgcG9zID0gaW5wdXQuUG9zaXRpb24KICAgICAgICAgICAgbG9jYWwgY3gxLCBjeTEgPSBTZWFyY2hQYW5lbC5BYnNv",
+"bHV0ZVBvc2l0aW9uLlgsIFNlYXJjaFBhbmVsLkFic29sdXRlUG9zaXRpb24uWQogICAgICAgICAgICBsb2NhbCBjeDIsIGN5MiA9",
+"IGN4MSArIFNlYXJjaFBhbmVsLkFic29sdXRlU2l6ZS5YLCBjeTEgKyBTZWFyY2hQYW5lbC5BYnNvbHV0ZVNpemUuWQogICAgICAg",
+"ICAgICBpZiBub3QgKHBvcy5YID49IGN4MSBhbmQgcG9zLlggPD0gY3gyIGFuZCBwb3MuWSA+PSBjeTEgYW5kIHBvcy5ZIDw9IGN5",
+"MikgdGhlbgogICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShTZWFyY2hPdmVybGF5LCBUd2VlbkluZm8ubmV3KDAu",
+"MywgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge0dyb3VwVHJhbnNwYXJlbmN5ID0g",
+"MX0pOlBsYXkoKQogICAgICAgICAgICAgICAgdGFzay5kZWxheSgwLjMsIGZ1bmN0aW9uKCkgU2VhcmNoT3ZlcmxheS5WaXNpYmxl",
+"ID0gZmFsc2UgZW5kKQogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZCkKCiAgICBsb2NhbCBQb3B1bGF0ZVNlYXJj",
+"aCA9IGZ1bmN0aW9uKHF1ZXJ5KQogICAgICAgIGxvY2FsIGNMaXN0ID0gU2VhcmNoU2Nyb2xsOkdldENoaWxkcmVuKCkKICAgICAg",
+"ICBmb3IgaSA9IDEsICNjTGlzdCBkbwogICAgICAgICAgICBsb2NhbCB2ID0gY0xpc3RbaV0KICAgICAgICAgICAgaWYgdjpJc0Eo",
+"J1RleHRCdXR0b24nKSB0aGVuIHY6RGVzdHJveSgpIGVuZAogICAgICAgIGVuZAogICAgICAgIGlmIHF1ZXJ5ID09ICcnIHRoZW4g",
+"cmV0dXJuIGVuZAogICAgICAgIAogICAgICAgIHF1ZXJ5ID0gcXVlcnk6bG93ZXIoKQogICAgICAgIGZvciBpID0gMSwgI1dpbmRv",
+"d09iai5FbGVtZW50c0xpc3QgZG8KICAgICAgICAgICAgbG9jYWwgZWxlbWVudERhdGEgPSBXaW5kb3dPYmouRWxlbWVudHNMaXN0",
+"W2ldCiAgICAgICAgICAgIGlmIHN0cmluZy5maW5kKGVsZW1lbnREYXRhLk5hbWU6bG93ZXIoKSwgcXVlcnkpIHRoZW4KICAgICAg",
+"ICAgICAgICAgIGxvY2FsIHNCdG4gPSBjcmVhdGVJbnN0YW5jZSgnVGV4dEJ1dHRvbicsIHsKICAgICAgICAgICAgICAgICAgICBQ",
+"YXJlbnQgPSBTZWFyY2hTY3JvbGwsCiAgICAgICAgICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkVsZW1lbnRC",
+"RywKICAgICAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIDAsIDAsIDM0KSwKICAgICAgICAgICAgICAgICAgICBU",
+"ZXh0ID0gJycsCiAgICAgICAgICAgICAgICAgICAgQXV0b0J1dHRvbkNvbG9yID0gZmFsc2UKICAgICAgICAgICAgICAgIH0pCiAg",
+"ICAgICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlDb3JuZXInLCB7UGFyZW50ID0gc0J0biwgQ29ybmVyUmFkaXVzID0gVURp",
+"bS5uZXcoMCwgNCl9KQogICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICBsb2NhbCBzVGV4dCA9IGNyZWF0ZUluc3RhbmNl",
+"KCdUZXh0TGFiZWwnLCB7CiAgICAgICAgICAgICAgICAgICAgUGFyZW50ID0gc0J0biwKICAgICAgICAgICAgICAgICAgICBCYWNr",
+"Z3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAxMCwgMCwg",
+"MCksCiAgICAgICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAtMjAsIDEsIDApLAogICAgICAgICAgICAgICAgICAg",
+"IEZvbnQgPSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAgICAgICAgICAgICAgICAgIFRleHQgPSBlbGVtZW50RGF0YS5OYW1l",
+"IC4uICIgIDxmb250IGNvbG9yPSdyZ2IoMTIwLDEyMCwxMjApJz5bIiAuLiBlbGVtZW50RGF0YS5UYWIuTmFtZSAuLiAiXTwvZm9u",
+"dD4iLAogICAgICAgICAgICAgICAgICAgIFJpY2hUZXh0ID0gdHJ1ZSwKICAgICAgICAgICAgICAgICAgICBUZXh0Q29sb3IzID0g",
+"VGhlbWUuVGV4dE1haW4sCiAgICAgICAgICAgICAgICAgICAgVGV4dFNpemUgPSAxMywKICAgICAgICAgICAgICAgICAgICBUZXh0",
+"WEFsaWdubWVudCA9IEVudW0uVGV4dFhBbGlnbm1lbnQuTGVmdAogICAgICAgICAgICAgICAgfSkKCiAgICAgICAgICAgICAgICBy",
+"ZWdUaGVtZShzQnRuLCBmdW5jdGlvbigpIHNCdG4uQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkVsZW1lbnRCRyBlbmQpCiAgICAg",
+"ICAgICAgICAgICByZWdUaGVtZShzVGV4dCwgZnVuY3Rpb24oKSBzVGV4dC5UZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW4gZW5k",
+"KQoKICAgICAgICAgICAgICAgIHNCdG4uTW91c2VFbnRlcjpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgICAgICBU",
+"d2VlblNlcnZpY2U6Q3JlYXRlKHNCdG4sIFR3ZWVuSW5mby5uZXcoMC4yKSwge0JhY2tncm91bmRDb2xvcjMgPSBHZXREYXJrZXJD",
+"b2xvcihUaGVtZS5FbGVtZW50QkcsIDAuOCl9KTpQbGF5KCkKICAgICAgICAgICAgICAgIGVuZCkKICAgICAgICAgICAgICAgIHNC",
+"dG4uTW91c2VMZWF2ZTpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKHNC",
+"dG4sIFR3ZWVuSW5mby5uZXcoMC4yKSwge0JhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5FbGVtZW50Qkd9KTpQbGF5KCkKICAgICAg",
+"ICAgICAgICAgIGVuZCkKCiAgICAgICAgICAgICAgICBzQnRuLk1vdXNlQnV0dG9uMUNsaWNrOkNvbm5lY3QoZnVuY3Rpb24oKQog",
+"ICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoU2VhcmNoT3ZlcmxheSwgVHdlZW5JbmZvLm5ldygwLjMsIEVu",
+"dW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLk91dCksIHtHcm91cFRyYW5zcGFyZW5jeSA9IDF9KTpQ",
+"bGF5KCkKICAgICAgICAgICAgICAgICAgICB0YXNrLmRlbGF5KDAuMywgZnVuY3Rpb24oKSBTZWFyY2hPdmVybGF5LlZpc2libGUg",
+"PSBmYWxzZSBlbmQpCiAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgZWxlbWVudERhdGEuVGFiLlNlbGVj",
+"dCgpCiAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgdGFzay53YWl0KDAuMSkgCiAgICAgICAgICAgICAg",
+"ICAgICAgbG9jYWwgdGFyZ2V0WSA9IGVsZW1lbnREYXRhLkZyYW1lLkFic29sdXRlUG9zaXRpb24uWSAtIGVsZW1lbnREYXRhLlRh",
+"Yi5QYWdlLkFic29sdXRlUG9zaXRpb24uWSArIGVsZW1lbnREYXRhLlRhYi5QYWdlLkNhbnZhc1Bvc2l0aW9uLlkgLSAoZWxlbWVu",
+"dERhdGEuVGFiLlBhZ2UuQWJzb2x1dGVXaW5kb3dTaXplLlkgLyAyKSArIChlbGVtZW50RGF0YS5GcmFtZS5BYnNvbHV0ZVNpemUu",
+"WSAvIDIpCiAgICAgICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShlbGVtZW50RGF0YS5UYWIuUGFnZSwgVHdlZW5J",
+"bmZvLm5ldygwLjUsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLk91dCksIHsKICAgICAgICAg",
+"ICAgICAgICAgICAgICAgQ2FudmFzUG9zaXRpb24gPSBWZWN0b3IyLm5ldygwLCBtYXRoLm1heCgwLCB0YXJnZXRZKSkKICAgICAg",
+"ICAgICAgICAgICAgICB9KTpQbGF5KCkKCiAgICAgICAgICAgICAgICAgICAgbG9jYWwgb3JpZ0NvbG9yID0gZWxlbWVudERhdGEu",
+"RnJhbWUuQmFja2dyb3VuZENvbG9yMwogICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoZWxlbWVudERhdGEu",
+"RnJhbWUsIFR3ZWVuSW5mby5uZXcoMC4zKSwge0JhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5BY2NlbnR9KTpQbGF5KCkKICAgICAg",
+"ICAgICAgICAgICAgICB0YXNrLmRlbGF5KDAuNiwgZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgICAgICAgICBpZiBlbGVtZW50",
+"RGF0YS5GcmFtZSB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKGVsZW1lbnREYXRh",
+"LkZyYW1lLCBUd2VlbkluZm8ubmV3KDAuNSksIHtCYWNrZ3JvdW5kQ29sb3IzID0gb3JpZ0NvbG9yfSk6UGxheSgpCiAgICAgICAg",
+"ICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgICAgIGVuZCkKICAgICAgICAgICAgICAgIGVuZCkKICAgICAgICAg",
+"ICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKCiAgICBTZWFyY2hJbnB1dEJveDpHZXRQcm9wZXJ0eUNoYW5nZWRTaWduYWwoJ1Rl",
+"eHQnKTpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICBQb3B1bGF0ZVNlYXJjaChTZWFyY2hJbnB1dEJveC5UZXh0KQogICAgZW5k",
+"KQoKICAgIGxvY2FsIHN0YXJ0WCA9IDE0ICsgdGl0bGVCb3VuZHMuWCArIDgKICAgIGxvY2FsIGVuZFggPSA1ODAgLSAxNSAtIChw",
+"cm9maWxlQm91bmRzLlggKyA0MikgLSAxNSAtIDMwCiAgICBsb2NhbCBzdWJUYWJzV2lkdGggPSBlbmRYIC0gc3RhcnRYCgogICAg",
+"bG9jYWwgU3ViVGFicyA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICBQYXJlbnQgPSBUb3BiYXIsCiAgICAgICAg",
+"QmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgc3RhcnRYLCAwLCAwKSwK",
+"ICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIHN1YlRhYnNXaWR0aCwgMSwgMCkKICAgIH0pCgogICAgY3JlYXRlSW5zdGFuY2Uo",
+"J1VJTGlzdExheW91dCcsIHsKICAgICAgICBQYXJlbnQgPSBTdWJUYWJzLAogICAgICAgIEZpbGxEaXJlY3Rpb24gPSBFbnVtLkZp",
+"bGxEaXJlY3Rpb24uSG9yaXpvbnRhbCwKICAgICAgICBTb3J0T3JkZXIgPSBFbnVtLlNvcnRPcmRlci5MYXlvdXRPcmRlciwKICAg",
+"ICAgICBQYWRkaW5nID0gVURpbS5uZXcoMCwgMTUpLAogICAgICAgIFZlcnRpY2FsQWxpZ25tZW50ID0gRW51bS5WZXJ0aWNhbEFs",
+"aWdubWVudC5DZW50ZXIKICAgIH0pCgogICAgbG9jYWwgc3ViVGFiSXRlbXMgPSB7J0hvbWUnLCAnVUkgU2V0dGluZ3MnLCAnQ29u",
+"Zmlncyd9CiAgICBsb2NhbCBhY3RpdmVTdWJUYWIgPSAnSG9tZScKICAgIGxvY2FsIE1hc3RlckNvbnRhaW5lcnMgPSB7fQoKICAg",
+"IGxvY2FsIEJvZHlDb250YWluZXIgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgTmFtZSA9ICdCb2R5Q29udGFp",
+"bmVyJywKICAgICAgICBQYXJlbnQgPSBNYWluR3JvdXAsCiAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAg",
+"ICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMCwgNDgpLAogICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMSwgLTQ4",
+"KSwKICAgICAgICBDbGlwc0Rlc2NlbmRhbnRzID0gdHJ1ZQogICAgfSkKCiAgICBsb2NhbCBDcmVhdGVUb3BTdWJUYWIgPSBmdW5j",
+"dGlvbih0ZXh0KQogICAgICAgIGxvY2FsIFN1YkNvbnRhaW5lciA9IGNyZWF0ZUluc3RhbmNlKCdDYW52YXNHcm91cCcsIHsKICAg",
+"ICAgICAgICAgTmFtZSA9IHRleHQgLi4gJ0NvbnRhaW5lcicsCiAgICAgICAgICAgIFBhcmVudCA9IEJvZHlDb250YWluZXIsCiAg",
+"ICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxLAogICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAw",
+"LCAwLCAwKSwKICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAxLCAwKSwKICAgICAgICAgICAgVmlzaWJsZSA9ICh0",
+"ZXh0ID09IGFjdGl2ZVN1YlRhYiksCiAgICAgICAgICAgIEdyb3VwVHJhbnNwYXJlbmN5ID0gKHRleHQgPT0gYWN0aXZlU3ViVGFi",
+"KSBhbmQgMCBvciAxCiAgICAgICAgfSkKICAgICAgICBNYXN0ZXJDb250YWluZXJzW3RleHRdID0gU3ViQ29udGFpbmVyCgogICAg",
+"ICAgIGxvY2FsIHRhYkJ0biA9IGNyZWF0ZUluc3RhbmNlKCdJbWFnZUJ1dHRvbicsIHsKICAgICAgICAgICAgTmFtZSA9IHRleHQg",
+"Li4gJ1RhYicsCiAgICAgICAgICAgIFBhcmVudCA9IFN1YlRhYnMsCiAgICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kg",
+"PSAxLAogICAgICAgICAgICBBdXRvQnV0dG9uQ29sb3IgPSBmYWxzZSwKICAgICAgICAgICAgSW1hZ2UgPSAnJwogICAgICAgIH0p",
+"CgogICAgICAgIGxvY2FsIGxhYmVsQm91bmRzID0gVGV4dFNlcnZpY2U6R2V0VGV4dFNpemUodGV4dCwgMTIsIEVudW0uRm9udC5H",
+"b3RoYW1NZWRpdW0sIFZlY3RvcjIubmV3KDEwMDAsIDQ4KSkKICAgICAgICB0YWJCdG4uU2l6ZSA9IFVEaW0yLm5ldygwLCBsYWJl",
+"bEJvdW5kcy5YICsgMTAsIDEsIDApCgogICAgICAgIGxvY2FsIHRhYkxhYmVsID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRMYWJlbCcs",
+"IHsKICAgICAgICAgICAgUGFyZW50ID0gdGFiQnRuLAogICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAg",
+"ICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAxLCAwKSwKICAgICAgICAgICAgRm9udCA9IEVudW0uRm9udC5Hb3RoYW1N",
+"ZWRpdW0sCiAgICAgICAgICAgIFRleHQgPSB0ZXh0LAogICAgICAgICAgICBUZXh0U2l6ZSA9IDEyLAogICAgICAgICAgICBUZXh0",
+"Q29sb3IzID0gKHRleHQgPT0gYWN0aXZlU3ViVGFiKSBhbmQgVGhlbWUuVGV4dE1haW4gb3IgVGhlbWUuVGV4dFN1YgogICAgICAg",
+"IH0pCiAgICAgICAgCiAgICAgICAgcmVnVGhlbWUodGFiTGFiZWwsIGZ1bmN0aW9uKCkKICAgICAgICAgICAgaWYgYWN0aXZlU3Vi",
+"VGFiID09IHRleHQgdGhlbiB0YWJMYWJlbC5UZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW4gZW5kCiAgICAgICAgZW5kKQoKICAg",
+"ICAgICBsb2NhbCB1bmRlcmxpbmUgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgICAgIFBhcmVudCA9IHRhYkJ0",
+"biwKICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkFjY2VudCwKICAgICAgICAgICAgQm9yZGVyU2l6ZVBpeGVs",
+"ID0gMCwKICAgICAgICAgICAgQW5jaG9yUG9pbnQgPSBWZWN0b3IyLm5ldygwLjUsIDEpLAogICAgICAgICAgICBQb3NpdGlvbiA9",
+"IFVEaW0yLm5ldygwLjUsIDAsIDEsIC0yKSwKICAgICAgICAgICAgU2l6ZSA9ICh0ZXh0ID09IGFjdGl2ZVN1YlRhYikgYW5kIFVE",
+"aW0yLm5ldygxLCAwLCAwLCAyKSBvciBVRGltMi5uZXcoMCwgMCwgMCwgMiksCiAgICAgICAgICAgIEJhY2tncm91bmRUcmFuc3Bh",
+"cmVuY3kgPSAodGV4dCA9PSBhY3RpdmVTdWJUYWIpIGFuZCAwIG9yIDEKICAgICAgICB9KQogICAgICAgIAogICAgICAgIHJlZ1Ro",
+"ZW1lKHVuZGVybGluZSwgZnVuY3Rpb24oKSB1bmRlcmxpbmUuQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkFjY2VudCBlbmQpCgog",
+"ICAgICAgIHRhYkJ0bi5Nb3VzZUVudGVyOkNvbm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICBpZiBhY3RpdmVTdWJUYWIgfj0g",
+"dGV4dCB0aGVuCiAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKHRhYkxhYmVsLCBUd2VlbkluZm8ubmV3KDAuMiks",
+"IHtUZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW59KTpQbGF5KCkKICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUo",
+"dW5kZXJsaW5lLCBUd2VlbkluZm8ubmV3KDAuMjUsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9u",
+"Lk91dCksIHtTaXplID0gVURpbTIubmV3KDAuOCwgMCwgMCwgMiksIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAwLjN9KTpQbGF5",
+"KCkKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kKQoKICAgICAgICB0YWJCdG4uTW91c2VMZWF2ZTpDb25uZWN0KGZ1bmN0aW9u",
+"KCkKICAgICAgICAgICAgaWYgYWN0aXZlU3ViVGFiIH49IHRleHQgdGhlbgogICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNy",
+"ZWF0ZSh0YWJMYWJlbCwgVHdlZW5JbmZvLm5ldygwLjIpLCB7VGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWJ9KTpQbGF5KCkKICAg",
+"ICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUodW5kZXJsaW5lLCBUd2VlbkluZm8ubmV3KDAuMjUsIEVudW0uRWFzaW5n",
+"U3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLk91dCksIHtTaXplID0gVURpbTIubmV3KDAsIDAsIDAsIDIpLCBCYWNr",
+"Z3JvdW5kVHJhbnNwYXJlbmN5ID0gMX0pOlBsYXkoKQogICAgICAgICAgICBlbmQKICAgICAgICBlbmQpCgogICAgICAgIHRhYkJ0",
+"bi5Nb3VzZUJ1dHRvbjFDbGljazpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgaWYgYWN0aXZlU3ViVGFiIH49IHRleHQg",
+"dGhlbgogICAgICAgICAgICAgICAgbG9jYWwgcHJldkFjdGl2ZSA9IGFjdGl2ZVN1YlRhYgogICAgICAgICAgICAgICAgYWN0aXZl",
+"U3ViVGFiID0gdGV4dAogICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICBsb2NhbCBwcmV2QnRuID0gU3ViVGFiczpGaW5k",
+"Rmlyc3RDaGlsZChwcmV2QWN0aXZlIC4uICdUYWInKQogICAgICAgICAgICAgICAgaWYgcHJldkJ0biB0aGVuCiAgICAgICAgICAg",
+"ICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShwcmV2QnRuLlRleHRMYWJlbCwgVHdlZW5JbmZvLm5ldygwLjIpLCB7VGV4dENv",
+"bG9yMyA9IFRoZW1lLlRleHRTdWJ9KTpQbGF5KCkKICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKHByZXZC",
+"dG4uRnJhbWUsIFR3ZWVuSW5mby5uZXcoMC4yKSwge1NpemUgPSBVRGltMi5uZXcoMCwgMCwgMCwgMiksIEJhY2tncm91bmRUcmFu",
+"c3BhcmVuY3kgPSAxfSk6UGxheSgpCiAgICAgICAgICAgICAgICBlbmQKCiAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3Jl",
+"YXRlKHRhYkxhYmVsLCBUd2VlbkluZm8ubmV3KDAuMiksIHtUZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW59KTpQbGF5KCkKICAg",
+"ICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUodW5kZXJsaW5lLCBUd2VlbkluZm8ubmV3KDAuMiksIHtTaXplID0gVURp",
+"bTIubmV3KDEsIDAsIDAsIDIpLCBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMH0pOlBsYXkoKQogICAgICAgICAgICAgICAgCiAg",
+"ICAgICAgICAgICAgICBsb2NhbCBwcmV2Q29udGFpbmVyID0gTWFzdGVyQ29udGFpbmVyc1twcmV2QWN0aXZlXQogICAgICAgICAg",
+"ICAgICAgaWYgcHJldkNvbnRhaW5lciB0aGVuCiAgICAgICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShwcmV2Q29u",
+"dGFpbmVyLCBUd2VlbkluZm8ubmV3KDAuMjUsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLklu",
+"KSwge1Bvc2l0aW9uID0gVURpbTIubmV3KDAsIDAsIDAsIC0xNSksIEdyb3VwVHJhbnNwYXJlbmN5ID0gMX0pOlBsYXkoKQogICAg",
+"ICAgICAgICAgICAgICAgIHRhc2suZGVsYXkoMC4yNSwgZnVuY3Rpb24oKSBpZiBhY3RpdmVTdWJUYWIgfj0gcHJldkFjdGl2ZSB0",
+"aGVuIHByZXZDb250YWluZXIuVmlzaWJsZSA9IGZhbHNlIGVuZCBlbmQpCiAgICAgICAgICAgICAgICBlbmQKCiAgICAgICAgICAg",
+"ICAgICBsb2NhbCBuZXdDb250YWluZXIgPSBNYXN0ZXJDb250YWluZXJzW3RleHRdCiAgICAgICAgICAgICAgICBpZiBuZXdDb250",
+"YWluZXIgdGhlbgogICAgICAgICAgICAgICAgICAgIG5ld0NvbnRhaW5lci5WaXNpYmxlID0gdHJ1ZQogICAgICAgICAgICAgICAg",
+"ICAgIG5ld0NvbnRhaW5lci5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAwLCAxNSkKICAgICAgICAgICAgICAgICAgICBuZXdD",
+"b250YWluZXIuR3JvdXBUcmFuc3BhcmVuY3kgPSAxCiAgICAgICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShuZXdD",
+"b250YWluZXIsIFR3ZWVuSW5mby5uZXcoMC40LCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5P",
+"dXQpLCB7UG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMCwgMCksIEdyb3VwVHJhbnNwYXJlbmN5ID0gMH0pOlBsYXkoKQogICAg",
+"ICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZCkKICAgIGVuZAoKICAgIGZvciBpID0gMSwgI3N1YlRh",
+"Ykl0ZW1zIGRvIENyZWF0ZVRvcFN1YlRhYihzdWJUYWJJdGVtc1tpXSkgZW5kCgogICAgbG9jYWwgQ3JlYXRlRWxlbWVudEJ1aWxk",
+"ZXIgPSBmdW5jdGlvbihQYWdlVGFyZ2V0LCBQYXJlbnRUYWIpCiAgICAgICAgbG9jYWwgQnVpbGRlciA9IHt9CgogICAgICAgIEJ1",
+"aWxkZXIuQ3JlYXRlRGl2aWRlciA9IGZ1bmN0aW9uKHNlbGYpCiAgICAgICAgICAgIGxvY2FsIERpdkNvbnRhaW5lciA9IGNyZWF0",
+"ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IFBhZ2VUYXJnZXQsCiAgICAgICAgICAgICAgICBC",
+"YWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMCwgMTQpCiAg",
+"ICAgICAgICAgIH0pCiAgICAgICAgICAgIGxvY2FsIExpbmUgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgICAg",
+"ICAgICBQYXJlbnQgPSBEaXZDb250YWluZXIsCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuQm9yZGVy",
+"LAogICAgICAgICAgICAgICAgQm9yZGVyU2l6ZVBpeGVsID0gMCwKICAgICAgICAgICAgICAgIEFuY2hvclBvaW50ID0gVmVjdG9y",
+"Mi5uZXcoMC41LCAwLjUpLAogICAgICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMC41LCAwLCAwLjUsIDApLAogICAg",
+"ICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAtMjAsIDAsIDIpCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIGNyZWF0",
+"ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBMaW5lLCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCAxKX0pCiAgICAg",
+"ICAgICAgIHJlZ1RoZW1lKExpbmUsIGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgIGlmIExpbmUgdGhlbiBMaW5lLkJhY2tncm91",
+"bmRDb2xvcjMgPSBUaGVtZS5Cb3JkZXIgZW5kCiAgICAgICAgICAgIGVuZCkKICAgICAgICBlbmQKCiAgICAgICAgQnVpbGRlci5D",
+"cmVhdGVCdXR0b24gPSBmdW5jdGlvbihzZWxmLCBvcHRpb25zKQogICAgICAgICAgICBsb2NhbCBCdG5OYW1lID0gb3B0aW9ucy5O",
+"YW1lIG9yICdCdXR0b24nCiAgICAgICAgICAgIGxvY2FsIENhbGxiYWNrID0gb3B0aW9ucy5DYWxsYmFjayBvciBmdW5jdGlvbigp",
+"IGVuZAoKICAgICAgICAgICAgbG9jYWwgQnRuRnJhbWUgPSBjcmVhdGVJbnN0YW5jZSgnSW1hZ2VCdXR0b24nLCB7CiAgICAgICAg",
+"ICAgICAgICBQYXJlbnQgPSBQYWdlVGFyZ2V0LAogICAgICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkVsZW1l",
+"bnRCRywKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMCwgMzYpLAogICAgICAgICAgICAgICAgQXV0b0J1",
+"dHRvbkNvbG9yID0gZmFsc2UsCiAgICAgICAgICAgICAgICBJbWFnZSA9ICcnCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIGNy",
+"ZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBCdG5GcmFtZSwgQ29ybmVyUmFkaXVzID0gVURpbS5uZXcoMCwgNCl9",
+"KQogICAgICAgICAgICByZWdUaGVtZShCdG5GcmFtZSwgZnVuY3Rpb24oKSBCdG5GcmFtZS5CYWNrZ3JvdW5kQ29sb3IzID0gVGhl",
+"bWUuRWxlbWVudEJHIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIFRleHRMYWJlbCA9IGNyZWF0ZUluc3RhbmNlKCdUZXh0TGFiZWwn",
+"LCB7CiAgICAgICAgICAgICAgICBQYXJlbnQgPSBCdG5GcmFtZSwKICAgICAgICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVu",
+"Y3kgPSAxLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAxLCAwKSwKICAgICAgICAgICAgICAgIEZvbnQg",
+"PSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAgICAgICAgICAgICAgVGV4dCA9IEJ0bk5hbWUsCiAgICAgICAgICAgICAgICBU",
+"ZXh0Q29sb3IzID0gVGhlbWUuVGV4dFN1YiwKICAgICAgICAgICAgICAgIFRleHRTaXplID0gMTMKICAgICAgICAgICAgfSkKICAg",
+"ICAgICAgICAgcmVnVGhlbWUoVGV4dExhYmVsLCBmdW5jdGlvbigpIFRleHRMYWJlbC5UZXh0Q29sb3IzID0gVGhlbWUuVGV4dFN1",
+"YiBlbmQpCgogICAgICAgICAgICBTZXR1cFRvb2x0aXAoQnRuRnJhbWUsIG9wdGlvbnMuVGlwKQogICAgICAgICAgICB0YWJsZS5p",
+"bnNlcnQoV2luZG93T2JqLkVsZW1lbnRzTGlzdCwge05hbWUgPSBCdG5OYW1lLCBGcmFtZSA9IEJ0bkZyYW1lLCBUYWIgPSBQYXJl",
+"bnRUYWJ9KQoKICAgICAgICAgICAgQnRuRnJhbWUuTW91c2VFbnRlcjpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAg",
+"IFR3ZWVuU2VydmljZTpDcmVhdGUoQnRuRnJhbWUsIFR3ZWVuSW5mby5uZXcoMC4yNSwgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwg",
+"RW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge0JhY2tncm91bmRDb2xvcjMgPSBHZXREYXJrZXJDb2xvcihUaGVtZS5FbGVtZW50",
+"QkcsIDAuOCl9KTpQbGF5KCkKICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoVGV4dExhYmVsLCBUd2VlbkluZm8u",
+"bmV3KDAuMjUsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLk91dCksIHtUZXh0Q29sb3IzID0g",
+"VGhlbWUuVGV4dE1haW59KTpQbGF5KCkKICAgICAgICAgICAgZW5kKQogICAgICAgICAgICBCdG5GcmFtZS5Nb3VzZUxlYXZlOkNv",
+"bm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShCdG5GcmFtZSwgVHdlZW5JbmZvLm5l",
+"dygwLjI1LCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7QmFja2dyb3VuZENvbG9y",
+"MyA9IFRoZW1lLkVsZW1lbnRCR30pOlBsYXkoKQogICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShUZXh0TGFiZWws",
+"IFR3ZWVuSW5mby5uZXcoMC4yNSwgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge1Rl",
+"eHRDb2xvcjMgPSBUaGVtZS5UZXh0U3VifSk6UGxheSgpCiAgICAgICAgICAgIGVuZCkKICAgICAgICAgICAgQnRuRnJhbWUuTW91",
+"c2VCdXR0b24xRG93bjpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoQnRuRnJh",
+"bWUsIFR3ZWVuSW5mby5uZXcoMC4xLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7",
+"QmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkFjY2VudH0pOlBsYXkoKQogICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0",
+"ZShUZXh0TGFiZWwsIFR3ZWVuSW5mby5uZXcoMC4xLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlv",
+"bi5PdXQpLCB7VGV4dENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDI1NSwgMjU1LCAyNTUpfSk6UGxheSgpCiAgICAgICAgICAgIGVu",
+"ZCkKICAgICAgICAgICAgQnRuRnJhbWUuTW91c2VCdXR0b24xQ2xpY2s6Q29ubmVjdChmdW5jdGlvbigpCiAgICAgICAgICAgICAg",
+"ICBUd2VlblNlcnZpY2U6Q3JlYXRlKEJ0bkZyYW1lLCBUd2VlbkluZm8ubmV3KDAuMiwgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwg",
+"RW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge0JhY2tncm91bmRDb2xvcjMgPSBHZXREYXJrZXJDb2xvcihUaGVtZS5FbGVtZW50",
+"QkcsIDAuOCl9KTpQbGF5KCkKICAgICAgICAgICAgICAgIENhbGxiYWNrKCkKICAgICAgICAgICAgZW5kKQogICAgICAgIGVuZAoK",
+"ICAgICAgICBCdWlsZGVyLkNyZWF0ZVRleHRib3ggPSBmdW5jdGlvbihzZWxmLCBvcHRpb25zKQogICAgICAgICAgICBsb2NhbCBF",
+"bGVtZW50TmFtZSA9IG9wdGlvbnMuTmFtZSBvciAnVGV4dGJveCcKICAgICAgICAgICAgbG9jYWwgRGVmYXVsdCA9IG9wdGlvbnMu",
+"RGVmYXVsdCBvciAnJwogICAgICAgICAgICBsb2NhbCBVc2VMZXR0ZXIgPSBvcHRpb25zLlVzZUxldHRlcgogICAgICAgICAgICBs",
+"b2NhbCBVc2VOdW1iZXIgPSBvcHRpb25zLlVzZU51bWJlcgogICAgICAgICAgICBsb2NhbCBDYWxsYmFjayA9IG9wdGlvbnMuQ2Fs",
+"bGJhY2sgb3IgZnVuY3Rpb24oKSBlbmQKCiAgICAgICAgICAgIGxvY2FsIEVsZW1lbnQgPSB7IFZhbHVlID0gRGVmYXVsdCB9CiAg",
+"ICAgICAgICAgIEFlcm9MaWIuRmxhZ3NbRWxlbWVudE5hbWVdID0gRWxlbWVudAoKICAgICAgICAgICAgbG9jYWwgQ29udGFpbmVy",
+"ID0gY3JlYXRlSW5zdGFuY2UoJ0ZyYW1lJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gUGFnZVRhcmdldCwKICAgICAgICAg",
+"ICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5FbGVtZW50QkcsCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3",
+"KDEsIDAsIDAsIDM2KQogICAgICAgICAgICB9KQogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlDb3JuZXInLCB7UGFyZW50",
+"ID0gQ29udGFpbmVyLCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA0KX0pCiAgICAgICAgICAgIHJlZ1RoZW1lKENvbnRhaW5l",
+"ciwgZnVuY3Rpb24oKSBDb250YWluZXIuQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkVsZW1lbnRCRyBlbmQpCiAgICAgICAgICAg",
+"IHRhYmxlLmluc2VydChXaW5kb3dPYmouRWxlbWVudHNMaXN0LCB7TmFtZSA9IEVsZW1lbnROYW1lLCBGcmFtZSA9IENvbnRhaW5l",
+"ciwgVGFiID0gUGFyZW50VGFifSkKCiAgICAgICAgICAgIGxvY2FsIGxhYmVsQm91bmRzID0gVGV4dFNlcnZpY2U6R2V0VGV4dFNp",
+"emUoRWxlbWVudE5hbWUsIDEzLCBFbnVtLkZvbnQuR290aGFtTWVkaXVtLCBWZWN0b3IyLm5ldygxMDAwLCAzNikpCgogICAgICAg",
+"ICAgICBsb2NhbCBMYWJlbFRleHQgPSBjcmVhdGVJbnN0YW5jZSgnVGV4dExhYmVsJywgewogICAgICAgICAgICAgICAgUGFyZW50",
+"ID0gQ29udGFpbmVyLAogICAgICAgICAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgICAgICAgICBQ",
+"b3NpdGlvbiA9IFVEaW0yLm5ldygwLCAxMiwgMCwgMCksCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIGxhYmVs",
+"Qm91bmRzLlggKyA1LCAxLCAwKSwKICAgICAgICAgICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAgICAg",
+"ICAgICAgICAgVGV4dCA9IEVsZW1lbnROYW1lLAogICAgICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWIsCiAg",
+"ICAgICAgICAgICAgICBUZXh0U2l6ZSA9IDEzLAogICAgICAgICAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRYQWxp",
+"Z25tZW50LkxlZnQKICAgICAgICAgICAgfSkKICAgICAgICAgICAgcmVnVGhlbWUoTGFiZWxUZXh0LCBmdW5jdGlvbigpIExhYmVs",
+"VGV4dC5UZXh0Q29sb3IzID0gVGhlbWUuVGV4dFN1YiBlbmQpCgogICAgICAgICAgICBsb2NhbCBWYWxCb3ggPSBjcmVhdGVJbnN0",
+"YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgICAgICAgICBQYXJlbnQgPSBDb250YWluZXIsCiAgICAgICAgICAgICAgICBCYWNrZ3Jv",
+"dW5kQ29sb3IzID0gQ29sb3IzLmZyb21SR0IoMzUsIDM1LCAzNSksCiAgICAgICAgICAgICAgICBBbmNob3JQb2ludCA9IFZlY3Rv",
+"cjIubmV3KDEsIDAuNSksCiAgICAgICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygxLCAtNiwgMC41LCAwKSwKICAgICAg",
+"ICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgMTIwLCAwLCAyNCkKICAgICAgICAgICAgfSkKICAgICAgICAgICAgY3JlYXRl",
+"SW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IFZhbEJveCwgQ29ybmVyUmFkaXVzID0gVURpbS5uZXcoMCwgNCl9KQogICAg",
+"ICAgICAgICByZWdUaGVtZShWYWxCb3gsIGZ1bmN0aW9uKCkgVmFsQm94LkJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5NYWluQkcg",
+"ZW5kKQogICAgICAgICAgICAKICAgICAgICAgICAgbG9jYWwgVmFsQm94U3Ryb2tlID0gY3JlYXRlSW5zdGFuY2UoJ1VJU3Ryb2tl",
+"Jywge1BhcmVudCA9IFZhbEJveCwgQ29sb3IgPSBUaGVtZS5Cb3JkZXJ9KQogICAgICAgICAgICByZWdUaGVtZShWYWxCb3hTdHJv",
+"a2UsIGZ1bmN0aW9uKCkgVmFsQm94U3Ryb2tlLkNvbG9yID0gVGhlbWUuQm9yZGVyIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIFRl",
+"eHRCb3ggPSBjcmVhdGVJbnN0YW5jZSgnVGV4dEJveCcsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IFZhbEJveCwKICAgICAg",
+"ICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxLAogICAgICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXco",
+"MCwgMCwgMCwgMCksCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIC02LCAxLCAwKSwKICAgICAgICAgICAgICAg",
+"IEZvbnQgPSBFbnVtLkZvbnQuR290aGFtLAogICAgICAgICAgICAgICAgVGV4dCA9IERlZmF1bHQsCiAgICAgICAgICAgICAgICBQ",
+"bGFjZWhvbGRlclRleHQgPSAnVHlwZS4uLicsCiAgICAgICAgICAgICAgICBQbGFjZWhvbGRlckNvbG9yMyA9IENvbG9yMy5mcm9t",
+"UkdCKDE1MCwgMTUwLCAxNTApLAogICAgICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWluLAogICAgICAgICAg",
+"ICAgICAgVGV4dFNpemUgPSAxMiwKICAgICAgICAgICAgICAgIFRleHRYQWxpZ25tZW50ID0gRW51bS5UZXh0WEFsaWdubWVudC5S",
+"aWdodCwKICAgICAgICAgICAgICAgIENsZWFyVGV4dE9uRm9jdXMgPSBmYWxzZQogICAgICAgICAgICB9KQogICAgICAgICAgICBy",
+"ZWdUaGVtZShUZXh0Qm94LCBmdW5jdGlvbigpIFRleHRCb3guVGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWluIGVuZCkKCiAgICAg",
+"ICAgICAgIFNldHVwVG9vbHRpcChDb250YWluZXIsIG9wdGlvbnMuVGlwKQoKICAgICAgICAgICAgVGV4dEJveDpHZXRQcm9wZXJ0",
+"eUNoYW5nZWRTaWduYWwoJ1RleHQnKTpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgIGxvY2FsIG9yaWdpbmFsID0g",
+"VGV4dEJveC5UZXh0CiAgICAgICAgICAgICAgICBsb2NhbCBjbGVhbmVkID0gb3JpZ2luYWwKICAgICAgICAgICAgICAgIGlmIFVz",
+"ZUxldHRlciBhbmQgbm90IFVzZU51bWJlciB0aGVuCiAgICAgICAgICAgICAgICAgICAgY2xlYW5lZCA9IG9yaWdpbmFsOmdzdWIo",
+"J1teJWElc10nLCAnJykKICAgICAgICAgICAgICAgIGVsc2VpZiBVc2VOdW1iZXIgYW5kIG5vdCBVc2VMZXR0ZXIgdGhlbgogICAg",
+"ICAgICAgICAgICAgICAgIGNsZWFuZWQgPSBvcmlnaW5hbDpnc3ViKCdbXiVkJS4lLV0nLCAnJykKICAgICAgICAgICAgICAgIGVs",
+"c2VpZiBVc2VMZXR0ZXIgYW5kIFVzZU51bWJlciB0aGVuCiAgICAgICAgICAgICAgICAgICAgY2xlYW5lZCA9IG9yaWdpbmFsOmdz",
+"dWIoJ1teJXclcyVfJS1dJywgJycpCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIGlmIG9yaWdpbmFsIH49IGNs",
+"ZWFuZWQgdGhlbiBUZXh0Qm94LlRleHQgPSBjbGVhbmVkIGVuZAogICAgICAgICAgICBlbmQpCgogICAgICAgICAgICBUZXh0Qm94",
+"LkZvY3VzTG9zdDpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgIEVsZW1lbnQuVmFsdWUgPSBUZXh0Qm94LlRleHQK",
+"ICAgICAgICAgICAgICAgIEFlcm9MaWIuRmxhZ3NbRWxlbWVudE5hbWVdLlZhbHVlID0gRWxlbWVudC5WYWx1ZQogICAgICAgICAg",
+"ICAgICAgQ2FsbGJhY2soRWxlbWVudC5WYWx1ZSkKICAgICAgICAgICAgZW5kKQogICAgICAgICAgICAKICAgICAgICAgICAgZnVu",
+"Y3Rpb24gRWxlbWVudDpTZXQodmFsKQogICAgICAgICAgICAgICAgVGV4dEJveC5UZXh0ID0gdmFsCiAgICAgICAgICAgICAgICBF",
+"bGVtZW50LlZhbHVlID0gdmFsCiAgICAgICAgICAgICAgICBBZXJvTGliLkZsYWdzW0VsZW1lbnROYW1lXS5WYWx1ZSA9IHZhbAog",
+"ICAgICAgICAgICAgICAgQ2FsbGJhY2sodmFsKQogICAgICAgICAgICBlbmQKCiAgICAgICAgICAgIHJldHVybiBFbGVtZW50CiAg",
+"ICAgICAgZW5kCgogICAgICAgIEJ1aWxkZXIuQ3JlYXRlU2xpZGVyID0gZnVuY3Rpb24oc2VsZiwgb3B0aW9ucykKICAgICAgICAg",
+"ICAgbG9jYWwgRWxlbWVudE5hbWUgPSBvcHRpb25zLk5hbWUgb3IgJ1NsaWRlcicKICAgICAgICAgICAgbG9jYWwgTWluID0gb3B0",
+"aW9ucy5NaW4gb3IgMAogICAgICAgICAgICBsb2NhbCBNYXggPSBvcHRpb25zLk1heCBvciAxMDAKICAgICAgICAgICAgbG9jYWwg",
+"RGVmYXVsdCA9IG9wdGlvbnMuRGVmYXVsdCBvciAzNQogICAgICAgICAgICBsb2NhbCBJbmNyZW1lbnQgPSBvcHRpb25zLkluY3Jl",
+"bWVudCBvciAxCiAgICAgICAgICAgIGxvY2FsIFN1ZmZpeCA9IG9wdGlvbnMuU3VmZml4IG9yICcnCiAgICAgICAgICAgIGxvY2Fs",
+"IENhbGxiYWNrID0gb3B0aW9ucy5DYWxsYmFjayBvciBmdW5jdGlvbigpIGVuZAoKICAgICAgICAgICAgbG9jYWwgRWxlbWVudCA9",
+"IHsgVmFsdWUgPSBEZWZhdWx0IH0KICAgICAgICAgICAgQWVyb0xpYi5GbGFnc1tFbGVtZW50TmFtZV0gPSBFbGVtZW50CgogICAg",
+"ICAgICAgICBsb2NhbCBDb250YWluZXIgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgICAgICAgICBQYXJlbnQg",
+"PSBQYWdlVGFyZ2V0LAogICAgICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkVsZW1lbnRCRywKICAgICAgICAg",
+"ICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMCwgMzYpCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIGNyZWF0ZUluc3Rh",
+"bmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBDb250YWluZXIsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDQpfSkKICAgICAg",
+"ICAgICAgcmVnVGhlbWUoQ29udGFpbmVyLCBmdW5jdGlvbigpIENvbnRhaW5lci5CYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuRWxl",
+"bWVudEJHIGVuZCkKICAgICAgICAgICAgdGFibGUuaW5zZXJ0KFdpbmRvd09iai5FbGVtZW50c0xpc3QsIHtOYW1lID0gRWxlbWVu",
+"dE5hbWUsIEZyYW1lID0gQ29udGFpbmVyLCBUYWIgPSBQYXJlbnRUYWJ9KQoKICAgICAgICAgICAgbG9jYWwgbGFiZWxCb3VuZHMg",
+"PSBUZXh0U2VydmljZTpHZXRUZXh0U2l6ZShFbGVtZW50TmFtZSwgMTMsIEVudW0uRm9udC5Hb3RoYW1NZWRpdW0sIFZlY3RvcjIu",
+"bmV3KDEwMDAsIDM2KSkKCiAgICAgICAgICAgIGxvY2FsIExhYmVsVGV4dCA9IGNyZWF0ZUluc3RhbmNlKCdUZXh0TGFiZWwnLCB7",
+"CiAgICAgICAgICAgICAgICBQYXJlbnQgPSBDb250YWluZXIsCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5",
+"ID0gMSwKICAgICAgICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAsIDEyLCAwLCAwKSwKICAgICAgICAgICAgICAgIFNp",
+"emUgPSBVRGltMi5uZXcoMCwgbGFiZWxCb3VuZHMuWCArIDUsIDEsIDApLAogICAgICAgICAgICAgICAgRm9udCA9IEVudW0uRm9u",
+"dC5Hb3RoYW1NZWRpdW0sCiAgICAgICAgICAgICAgICBUZXh0ID0gRWxlbWVudE5hbWUsCiAgICAgICAgICAgICAgICBUZXh0Q29s",
+"b3IzID0gVGhlbWUuVGV4dFN1YiwKICAgICAgICAgICAgICAgIFRleHRTaXplID0gMTMsCiAgICAgICAgICAgICAgICBUZXh0WEFs",
+"aWdubWVudCA9IEVudW0uVGV4dFhBbGlnbm1lbnQuTGVmdAogICAgICAgICAgICB9KQogICAgICAgICAgICByZWdUaGVtZShMYWJl",
+"bFRleHQsIGZ1bmN0aW9uKCkgTGFiZWxUZXh0LlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0U3ViIGVuZCkKCiAgICAgICAgICAgIGxv",
+"Y2FsIFZhbEJveCA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IENvbnRhaW5lciwK",
+"ICAgICAgICAgICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigzNSwgMzUsIDM1KSwKICAgICAgICAgICAg",
+"ICAgIEFuY2hvclBvaW50ID0gVmVjdG9yMi5uZXcoMSwgMC41KSwKICAgICAgICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3",
+"KDEsIC02LCAwLjUsIDApLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCA0MCwgMCwgMjIpCiAgICAgICAgICAg",
+"IH0pCiAgICAgICAgICAgIGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBWYWxCb3gsIENvcm5lclJhZGl1cyA9",
+"IFVEaW0ubmV3KDAsIDQpfSkKICAgICAgICAgICAgcmVnVGhlbWUoVmFsQm94LCBmdW5jdGlvbigpIFZhbEJveC5CYWNrZ3JvdW5k",
+"Q29sb3IzID0gVGhlbWUuTWFpbkJHIGVuZCkKICAgICAgICAgICAgCiAgICAgICAgICAgIGxvY2FsIFZhbEJveFN0cm9rZSA9IGNy",
+"ZWF0ZUluc3RhbmNlKCdVSVN0cm9rZScsIHtQYXJlbnQgPSBWYWxCb3gsIENvbG9yID0gVGhlbWUuQm9yZGVyfSkKICAgICAgICAg",
+"ICAgcmVnVGhlbWUoVmFsQm94U3Ryb2tlLCBmdW5jdGlvbigpIFZhbEJveFN0cm9rZS5Db2xvciA9IFRoZW1lLkJvcmRlciBlbmQp",
+"CgogICAgICAgICAgICBsb2NhbCBWYWxUZXh0Qm94ID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRCb3gnLCB7CiAgICAgICAgICAgICAg",
+"ICBQYXJlbnQgPSBWYWxCb3gsCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAg",
+"ICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMSwgMCksCiAgICAgICAgICAgICAgICBGb250ID0gRW51bS5Gb250LkdvdGhhbSwK",
+"ICAgICAgICAgICAgICAgIFRleHQgPSB0b3N0cmluZyhEZWZhdWx0KSAuLiBTdWZmaXgsCiAgICAgICAgICAgICAgICBUZXh0Q29s",
+"b3IzID0gVGhlbWUuVGV4dFN1YiwKICAgICAgICAgICAgICAgIFRleHRTaXplID0gMTEsCiAgICAgICAgICAgICAgICBDbGVhclRl",
+"eHRPbkZvY3VzID0gZmFsc2UKICAgICAgICAgICAgfSkKICAgICAgICAgICAgcmVnVGhlbWUoVmFsVGV4dEJveCwgZnVuY3Rpb24o",
+"KSBWYWxUZXh0Qm94LlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0U3ViIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIHNsaWRlclN0YXJ0",
+"T2Zmc2V0ID0gMTIgKyBsYWJlbEJvdW5kcy5YICsgMTUKICAgICAgICAgICAgbG9jYWwgc2xpZGVyRW5kUGFkZGluZyA9IDYgKyA0",
+"MCArIDE1CgogICAgICAgICAgICBsb2NhbCBUcmFja0JveCA9IGNyZWF0ZUluc3RhbmNlKCdJbWFnZUJ1dHRvbicsIHsKICAgICAg",
+"ICAgICAgICAgIFBhcmVudCA9IENvbnRhaW5lciwKICAgICAgICAgICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJv",
+"bVJHQig0NSwgNDUsIDQ1KSwKICAgICAgICAgICAgICAgIEFuY2hvclBvaW50ID0gVmVjdG9yMi5uZXcoMCwgMC41KSwKICAgICAg",
+"ICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAsIHNsaWRlclN0YXJ0T2Zmc2V0LCAwLjUsIDApLAogICAgICAgICAgICAg",
+"ICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAtKHNsaWRlclN0YXJ0T2Zmc2V0ICsgc2xpZGVyRW5kUGFkZGluZyksIDAsIDYpLAogICAg",
+"ICAgICAgICAgICAgQXV0b0J1dHRvbkNvbG9yID0gZmFsc2UsCiAgICAgICAgICAgICAgICBJbWFnZSA9ICcnCiAgICAgICAgICAg",
+"IH0pCiAgICAgICAgICAgIGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBUcmFja0JveCwgQ29ybmVyUmFkaXVz",
+"ID0gVURpbS5uZXcoMSwgMCl9KQogICAgICAgICAgICByZWdUaGVtZShUcmFja0JveCwgZnVuY3Rpb24oKSBUcmFja0JveC5CYWNr",
+"Z3JvdW5kQ29sb3IzID0gVGhlbWUuRHJvcGRvd25MaXN0U3Ryb2tlIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIEZpbGxCb3ggPSBj",
+"cmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgICAgICAgICBQYXJlbnQgPSBUcmFja0JveCwKICAgICAgICAgICAgICAg",
+"IEJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5BY2NlbnQsCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KChEZWZhdWx0",
+"IC0gTWluKSAvIChNYXggLSBNaW4pLCAwLCAxLCAwKQogICAgICAgICAgICB9KQogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgn",
+"VUlDb3JuZXInLCB7UGFyZW50ID0gRmlsbEJveCwgQ29ybmVyUmFkaXVzID0gVURpbS5uZXcoMSwgMCl9KQogICAgICAgICAgICAK",
+"ICAgICAgICAgICAgcmVnVGhlbWUoRmlsbEJveCwgZnVuY3Rpb24oKSBGaWxsQm94LkJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5B",
+"Y2NlbnQgZW5kKQoKICAgICAgICAgICAgU2V0dXBUb29sdGlwKENvbnRhaW5lciwgb3B0aW9ucy5UaXApCgogICAgICAgICAgICBs",
+"b2NhbCBTZXRWYWx1ZSA9IGZ1bmN0aW9uKHZhbCkKICAgICAgICAgICAgICAgIHZhbCA9IG1hdGguY2xhbXAodmFsLCBNaW4sIE1h",
+"eCkKICAgICAgICAgICAgICAgIHZhbCA9IG1hdGguZmxvb3IoKHZhbCAvIEluY3JlbWVudCkgKyAwLjUpICogSW5jcmVtZW50CiAg",
+"ICAgICAgICAgICAgICBsb2NhbCBwZXJjZW50ID0gKHZhbCAtIE1pbikgLyAoTWF4IC0gTWluKQogICAgICAgICAgICAgICAgVHdl",
+"ZW5TZXJ2aWNlOkNyZWF0ZShGaWxsQm94LCBUd2VlbkluZm8ubmV3KDAuMTUsIEVudW0uRWFzaW5nU3R5bGUuUXVhZCksIHtTaXpl",
+"ID0gVURpbTIubmV3KHBlcmNlbnQsIDAsIDEsIDApfSk6UGxheSgpCiAgICAgICAgICAgICAgICBWYWxUZXh0Qm94LlRleHQgPSB0",
+"b3N0cmluZyh2YWwpIC4uIFN1ZmZpeAogICAgICAgICAgICAgICAgRWxlbWVudC5WYWx1ZSA9IHZhbAogICAgICAgICAgICAgICAg",
+"QWVyb0xpYi5GbGFnc1tFbGVtZW50TmFtZV0uVmFsdWUgPSB2YWwKICAgICAgICAgICAgICAgIENhbGxiYWNrKHZhbCkKICAgICAg",
+"ICAgICAgZW5kCgogICAgICAgICAgICBsb2NhbCBVcGRhdGVTbGlkZXIgPSBmdW5jdGlvbihpbnB1dCkKICAgICAgICAgICAgICAg",
+"IGxvY2FsIHBlcmNlbnQgPSBtYXRoLmNsYW1wKChpbnB1dC5Qb3NpdGlvbi5YIC0gVHJhY2tCb3guQWJzb2x1dGVQb3NpdGlvbi5Y",
+"KSAvIFRyYWNrQm94LkFic29sdXRlU2l6ZS5YLCAwLCAxKQogICAgICAgICAgICAgICAgbG9jYWwgdmFsdWUgPSBNaW4gKyAoKE1h",
+"eCAtIE1pbikgKiBwZXJjZW50KQogICAgICAgICAgICAgICAgU2V0VmFsdWUodmFsdWUpCiAgICAgICAgICAgIGVuZAoKICAgICAg",
+"ICAgICAgbG9jYWwgZHJhZ2dpbmcgPSBmYWxzZQogICAgICAgICAgICBUcmFja0JveC5JbnB1dEJlZ2FuOkNvbm5lY3QoZnVuY3Rp",
+"b24oaW5wdXQpCiAgICAgICAgICAgICAgICBpZiBpbnB1dC5Vc2VySW5wdXRUeXBlID09IEVudW0uVXNlcklucHV0VHlwZS5Nb3Vz",
+"ZUJ1dHRvbjEgb3IgaW5wdXQuVXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuVG91Y2ggdGhlbgogICAgICAgICAg",
+"ICAgICAgICAgIGRyYWdnaW5nID0gdHJ1ZQogICAgICAgICAgICAgICAgICAgIFVwZGF0ZVNsaWRlcihpbnB1dCkKICAgICAgICAg",
+"ICAgICAgIGVuZAogICAgICAgICAgICBlbmQpCiAgICAgICAgICAgIFVzZXJJbnB1dFNlcnZpY2UuSW5wdXRFbmRlZDpDb25uZWN0",
+"KGZ1bmN0aW9uKGlucHV0KQogICAgICAgICAgICAgICAgaWYgaW5wdXQuVXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5",
+"cGUuTW91c2VCdXR0b24xIG9yIGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2VySW5wdXRUeXBlLlRvdWNoIHRoZW4gZHJh",
+"Z2dpbmcgPSBmYWxzZSBlbmQKICAgICAgICAgICAgZW5kKQogICAgICAgICAgICBVc2VySW5wdXRTZXJ2aWNlLklucHV0Q2hhbmdl",
+"ZDpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgICAgICAgICAgaWYgZHJhZ2dpbmcgYW5kIChpbnB1dC5Vc2VySW5wdXRU",
+"eXBlID09IEVudW0uVXNlcklucHV0VHlwZS5Nb3VzZU1vdmVtZW50IG9yIGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2Vy",
+"SW5wdXRUeXBlLlRvdWNoKSB0aGVuIFVwZGF0ZVNsaWRlcihpbnB1dCkgZW5kCiAgICAgICAgICAgIGVuZCkKCiAgICAgICAgICAg",
+"IFZhbFRleHRCb3guRm9jdXNMb3N0OkNvbm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgbG9jYWwgbnVtU3RyID0gc3Ry",
+"aW5nLm1hdGNoKFZhbFRleHRCb3guVGV4dCwgJ14lLT8lZCslLj8lZConKQogICAgICAgICAgICAgICAgbG9jYWwgbnVtID0gdG9u",
+"dW1iZXIobnVtU3RyKSBvciBEZWZhdWx0CiAgICAgICAgICAgICAgICBTZXRWYWx1ZShudW0pCiAgICAgICAgICAgIGVuZCkKICAg",
+"ICAgICAgICAgCiAgICAgICAgICAgIGZ1bmN0aW9uIEVsZW1lbnQ6U2V0KHZhbCkgU2V0VmFsdWUodmFsKSBlbmQKICAgICAgICAg",
+"ICAgcmV0dXJuIEVsZW1lbnQKICAgICAgICBlbmQKCiAgICAgICAgQnVpbGRlci5DcmVhdGVUb2dnbGUgPSBmdW5jdGlvbihzZWxm",
+"LCBvcHRpb25zKQogICAgICAgICAgICBsb2NhbCBFbGVtZW50TmFtZSA9IG9wdGlvbnMuTmFtZSBvciAnVG9nZ2xlJwogICAgICAg",
+"ICAgICBsb2NhbCBEZWZhdWx0ID0gb3B0aW9ucy5EZWZhdWx0IG9yIGZhbHNlCiAgICAgICAgICAgIGxvY2FsIEtleWJpbmQgPSBv",
+"cHRpb25zLktleWJpbmQKICAgICAgICAgICAgbG9jYWwgQ2FsbGJhY2sgPSBvcHRpb25zLkNhbGxiYWNrIG9yIGZ1bmN0aW9uKCkg",
+"ZW5kCiAgICAgICAgICAgIAogICAgICAgICAgICBsb2NhbCBzdGF0ZSA9IERlZmF1bHQKICAgICAgICAgICAgbG9jYWwgY3VycmVu",
+"dEJpbmQgPSBLZXliaW5kCgogICAgICAgICAgICBsb2NhbCBFbGVtZW50ID0geyBWYWx1ZSA9IERlZmF1bHQgfQogICAgICAgICAg",
+"ICBBZXJvTGliLkZsYWdzW0VsZW1lbnROYW1lXSA9IEVsZW1lbnQKCiAgICAgICAgICAgIGxvY2FsIFRvZ0ZyYW1lID0gY3JlYXRl",
+"SW5zdGFuY2UoJ0ltYWdlQnV0dG9uJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gUGFnZVRhcmdldCwKICAgICAgICAgICAg",
+"ICAgIEJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5FbGVtZW50QkcsCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEs",
+"IDAsIDAsIDM2KSwKICAgICAgICAgICAgICAgIEF1dG9CdXR0b25Db2xvciA9IGZhbHNlLAogICAgICAgICAgICAgICAgSW1hZ2Ug",
+"PSAnJwogICAgICAgICAgICB9KQogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlDb3JuZXInLCB7UGFyZW50ID0gVG9nRnJh",
+"bWUsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDQpfSkKICAgICAgICAgICAgcmVnVGhlbWUoVG9nRnJhbWUsIGZ1bmN0aW9u",
+"KCkgVG9nRnJhbWUuQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkVsZW1lbnRCRyBlbmQpCiAgICAgICAgICAgIHRhYmxlLmluc2Vy",
+"dChXaW5kb3dPYmouRWxlbWVudHNMaXN0LCB7TmFtZSA9IEVsZW1lbnROYW1lLCBGcmFtZSA9IFRvZ0ZyYW1lLCBUYWIgPSBQYXJl",
+"bnRUYWJ9KQoKICAgICAgICAgICAgbG9jYWwgVGl0bGVMYWJlbCA9IGNyZWF0ZUluc3RhbmNlKCdUZXh0TGFiZWwnLCB7CiAgICAg",
+"ICAgICAgICAgICBQYXJlbnQgPSBUb2dGcmFtZSwKICAgICAgICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxLAog",
+"ICAgICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMTIsIDAsIDApLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVE",
+"aW0yLm5ldygxLCAtMTIwLCAxLCAwKSwKICAgICAgICAgICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAg",
+"ICAgICAgICAgICAgVGV4dCA9IEVsZW1lbnROYW1lLAogICAgICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWIs",
+"CiAgICAgICAgICAgICAgICBUZXh0U2l6ZSA9IDEzLAogICAgICAgICAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRY",
+"QWxpZ25tZW50LkxlZnQKICAgICAgICAgICAgfSkKICAgICAgICAgICAgcmVnVGhlbWUoVGl0bGVMYWJlbCwgZnVuY3Rpb24oKQog",
+"ICAgICAgICAgICAgICAgVGl0bGVMYWJlbC5UZXh0Q29sb3IzID0gc3RhdGUgYW5kIFRoZW1lLlRleHRNYWluIG9yIFRoZW1lLlRl",
+"eHRTdWIKICAgICAgICAgICAgZW5kKQoKICAgICAgICAgICAgbG9jYWwgU3dpdGNoID0gY3JlYXRlSW5zdGFuY2UoJ0ZyYW1lJywg",
+"ewogICAgICAgICAgICAgICAgUGFyZW50ID0gVG9nRnJhbWUsCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kQ29sb3IzID0gQ29s",
+"b3IzLmZyb21SR0IoMjAsIDIwLCAyMCksCiAgICAgICAgICAgICAgICBBbmNob3JQb2ludCA9IFZlY3RvcjIubmV3KDEsIDAuNSks",
+"CiAgICAgICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygxLCAtMTIsIDAuNSwgMCksCiAgICAgICAgICAgICAgICBTaXpl",
+"ID0gVURpbTIubmV3KDAsIDI4LCAwLCAxMCkKICAgICAgICAgICAgfSkKICAgICAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJQ29y",
+"bmVyJywge1BhcmVudCA9IFN3aXRjaCwgQ29ybmVyUmFkaXVzID0gVURpbS5uZXcoMSwgMCl9KQoKICAgICAgICAgICAgbG9jYWwg",
+"S25vYiA9IGNyZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IFN3aXRjaCwKICAgICAgICAg",
+"ICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBzdGF0ZSBhbmQgR2V0RGFya2VyQ29sb3IoVGhlbWUuQWNjZW50LCAwLjQpIG9yIENv",
+"bG9yMy5mcm9tUkdCKDE1MCwgMTUwLCAxNTApLAogICAgICAgICAgICAgICAgQW5jaG9yUG9pbnQgPSBWZWN0b3IyLm5ldygwLCAw",
+"LjUpLAogICAgICAgICAgICAgICAgUG9zaXRpb24gPSBzdGF0ZSBhbmQgVURpbTIubmV3KDEsIC0xNCwgMC41LCAwKSBvciBVRGlt",
+"Mi5uZXcoMCwgLTIsIDAuNSwgMCksCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDE2LCAwLCAxNikKICAgICAg",
+"ICAgICAgfSkKICAgICAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IEtub2IsIENvcm5lclJhZGl1",
+"cyA9IFVEaW0ubmV3KDEsIDApfSkKICAgICAgICAgICAgCiAgICAgICAgICAgIHJlZ1RoZW1lKFN3aXRjaCwgZnVuY3Rpb24oKQog",
+"ICAgICAgICAgICAgICAgaWYgc3RhdGUgdGhlbgogICAgICAgICAgICAgICAgICAgIFN3aXRjaC5CYWNrZ3JvdW5kQ29sb3IzID0g",
+"R2V0RGFya2VyQ29sb3IoVGhlbWUuQWNjZW50LCAwLjQpCiAgICAgICAgICAgICAgICAgICAgS25vYi5CYWNrZ3JvdW5kQ29sb3Iz",
+"ID0gVGhlbWUuQWNjZW50CiAgICAgICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICAgICAgU3dpdGNoLkJhY2tncm91bmRD",
+"b2xvcjMgPSBUaGVtZS5NYWluQkcKICAgICAgICAgICAgICAgICAgICBLbm9iLkJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJv",
+"bVJHQigxNTAsIDE1MCwgMTUwKQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGVuZCkKCiAgICAgICAgICAgIFNldHVw",
+"VG9vbHRpcChUb2dGcmFtZSwgb3B0aW9ucy5UaXApCgogICAgICAgICAgICBsb2NhbCBGaXJlVG9nZ2xlID0gZnVuY3Rpb24oc2tp",
+"cEFuaW0pCiAgICAgICAgICAgICAgICBsb2NhbCBzcGVlZCA9IHNraXBBbmltIGFuZCAwIG9yIDAuMgogICAgICAgICAgICAgICAg",
+"VHdlZW5TZXJ2aWNlOkNyZWF0ZShTd2l0Y2gsIFR3ZWVuSW5mby5uZXcoc3BlZWQpLCB7QmFja2dyb3VuZENvbG9yMyA9IHN0YXRl",
+"IGFuZCBHZXREYXJrZXJDb2xvcihUaGVtZS5BY2NlbnQsIDAuNCkgb3IgVGhlbWUuTWFpbkJHfSk6UGxheSgpCiAgICAgICAgICAg",
+"ICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKEtub2IsIFR3ZWVuSW5mby5uZXcoc3BlZWQpLCB7UG9zaXRpb24gPSBzdGF0ZSBhbmQg",
+"VURpbTIubmV3KDEsIC0xNCwgMC41LCAwKSBvciBVRGltMi5uZXcoMCwgLTIsIDAuNSwgMCksIEJhY2tncm91bmRDb2xvcjMgPSBz",
+"dGF0ZSBhbmQgVGhlbWUuQWNjZW50IG9yIENvbG9yMy5mcm9tUkdCKDE1MCwgMTUwLCAxNTApfSk6UGxheSgpCiAgICAgICAgICAg",
+"ICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKFRpdGxlTGFiZWwsIFR3ZWVuSW5mby5uZXcoc3BlZWQpLCB7VGV4dENvbG9yMyA9IHN0",
+"YXRlIGFuZCBUaGVtZS5UZXh0TWFpbiBvciBUaGVtZS5UZXh0U3VifSk6UGxheSgpCiAgICAgICAgICAgICAgICBFbGVtZW50LlZh",
+"bHVlID0gc3RhdGUKICAgICAgICAgICAgICAgIEFlcm9MaWIuRmxhZ3NbRWxlbWVudE5hbWVdLlZhbHVlID0gc3RhdGUKICAgICAg",
+"ICAgICAgZW5kCiAgICAgICAgICAgIEZpcmVUb2dnbGUodHJ1ZSkKCiAgICAgICAgICAgIFRvZ0ZyYW1lLk1vdXNlQnV0dG9uMUNs",
+"aWNrOkNvbm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgc3RhdGUgPSBub3Qgc3RhdGUKICAgICAgICAgICAgICAgIENh",
+"bGxiYWNrKHN0YXRlKQogICAgICAgICAgICAgICAgRmlyZVRvZ2dsZShmYWxzZSkKICAgICAgICAgICAgZW5kKQoKICAgICAgICAg",
+"ICAgaWYgS2V5YmluZCB0aGVuCiAgICAgICAgICAgICAgICBsb2NhbCBCaW5kQ29udGFpbmVyID0gY3JlYXRlSW5zdGFuY2UoJ0Zy",
+"YW1lJywgewogICAgICAgICAgICAgICAgICAgIFBhcmVudCA9IFRvZ0ZyYW1lLAogICAgICAgICAgICAgICAgICAgIEFuY2hvclBv",
+"aW50ID0gVmVjdG9yMi5uZXcoMSwgMC41KSwKICAgICAgICAgICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygxLCAtNTUs",
+"IDAuNSwgMCksCiAgICAgICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCA0NSwgMCwgMjIpLAogICAgICAgICAgICAg",
+"ICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigzNSwgMzUsIDM1KQogICAgICAgICAgICAgICAgfSkKICAg",
+"ICAgICAgICAgICAgIGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBCaW5kQ29udGFpbmVyLCBDb3JuZXJSYWRp",
+"dXMgPSBVRGltLm5ldygwLCA0KX0pCiAgICAgICAgICAgICAgICByZWdUaGVtZShCaW5kQ29udGFpbmVyLCBmdW5jdGlvbigpIEJp",
+"bmRDb250YWluZXIuQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRyBlbmQpCiAgICAgICAgICAgICAgICAKICAgICAgICAg",
+"ICAgICAgIGxvY2FsIEJpbmRDb250YWluZXJTdHJva2UgPSBjcmVhdGVJbnN0YW5jZSgnVUlTdHJva2UnLCB7UGFyZW50ID0gQmlu",
+"ZENvbnRhaW5lciwgQ29sb3IgPSBUaGVtZS5Cb3JkZXJ9KQogICAgICAgICAgICAgICAgcmVnVGhlbWUoQmluZENvbnRhaW5lclN0",
+"cm9rZSwgZnVuY3Rpb24oKSBCaW5kQ29udGFpbmVyU3Ryb2tlLkNvbG9yID0gVGhlbWUuQm9yZGVyIGVuZCkKCiAgICAgICAgICAg",
+"ICAgICBsb2NhbCBCaW5kQnRuID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRCdXR0b24nLCB7CiAgICAgICAgICAgICAgICAgICAgUGFy",
+"ZW50ID0gQmluZENvbnRhaW5lciwKICAgICAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAg",
+"ICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIDAsIDEsIDApLAogICAgICAgICAgICAgICAgICAgIFRleHQgPSBjdXJy",
+"ZW50QmluZCBhbmQgY3VycmVudEJpbmQuTmFtZSBvciAnJywKICAgICAgICAgICAgICAgICAgICBGb250ID0gRW51bS5Gb250Lkdv",
+"dGhhbSwKICAgICAgICAgICAgICAgICAgICBUZXh0Q29sb3IzID0gVGhlbWUuVGV4dFN1YiwKICAgICAgICAgICAgICAgICAgICBU",
+"ZXh0U2l6ZSA9IDExCiAgICAgICAgICAgICAgICB9KQoKICAgICAgICAgICAgICAgIGxvY2FsIFVwZGF0ZUJpbmRTaXplID0gZnVu",
+"Y3Rpb24oKQogICAgICAgICAgICAgICAgICAgIGxvY2FsIGJpbmROYW1lID0gY3VycmVudEJpbmQgYW5kIGN1cnJlbnRCaW5kLk5h",
+"bWUgb3IgJ05vbmUnCiAgICAgICAgICAgICAgICAgICAgQmluZEJ0bi5UZXh0ID0gYmluZE5hbWUKICAgICAgICAgICAgICAgICAg",
+"ICBsb2NhbCB0ZXh0Qm91bmRzID0gVGV4dFNlcnZpY2U6R2V0VGV4dFNpemUoYmluZE5hbWUsIDExLCBFbnVtLkZvbnQuR290aGFt",
+"LCBWZWN0b3IyLm5ldygxMDAwLCAyMikpCiAgICAgICAgICAgICAgICAgICAgQmluZENvbnRhaW5lci5TaXplID0gVURpbTIubmV3",
+"KDAsIG1hdGgubWF4KHRleHRCb3VuZHMuWCArIDE2LCA0MCksIDAsIDIyKQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAg",
+"ICAgICBVcGRhdGVCaW5kU2l6ZSgpCgogICAgICAgICAgICAgICAgbG9jYWwgaXNCaW5kaW5nID0gZmFsc2UKICAgICAgICAgICAg",
+"ICAgIEJpbmRCdG4uTW91c2VCdXR0b24xQ2xpY2s6Q29ubmVjdChmdW5jdGlvbigpCiAgICAgICAgICAgICAgICAgICAgaXNCaW5k",
+"aW5nID0gdHJ1ZQogICAgICAgICAgICAgICAgICAgIEJpbmRCdG4uVGV4dCA9ICcuLi4nCiAgICAgICAgICAgICAgICAgICAgQmlu",
+"ZENvbnRhaW5lci5TaXplID0gVURpbTIubmV3KDAsIDQwLCAwLCAyMikKICAgICAgICAgICAgICAgIGVuZCkKCiAgICAgICAgICAg",
+"ICAgICBVc2VySW5wdXRTZXJ2aWNlLklucHV0QmVnYW46Q29ubmVjdChmdW5jdGlvbihpbnB1dCwgZ3BlKQogICAgICAgICAgICAg",
+"ICAgICAgIGlmIGlzQmluZGluZyBhbmQgKGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2VySW5wdXRUeXBlLktleWJvYXJk",
+"IG9yIGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2VySW5wdXRUeXBlLkdhbWVwYWQxKSB0aGVuCiAgICAgICAgICAgICAg",
+"ICAgICAgICAgIGN1cnJlbnRCaW5kID0gaW5wdXQuS2V5Q29kZQogICAgICAgICAgICAgICAgICAgICAgICBpc0JpbmRpbmcgPSBm",
+"YWxzZQogICAgICAgICAgICAgICAgICAgICAgICBVcGRhdGVCaW5kU2l6ZSgpCiAgICAgICAgICAgICAgICAgICAgICAgIENhbGxi",
+"YWNrKHN0YXRlKQogICAgICAgICAgICAgICAgICAgIGVsc2VpZiBub3QgZ3BlIGFuZCBjdXJyZW50QmluZCBhbmQgaW5wdXQuS2V5",
+"Q29kZSA9PSBjdXJyZW50QmluZCB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIHN0YXRlID0gbm90IHN0YXRlCiAgICAgICAg",
+"ICAgICAgICAgICAgICAgIENhbGxiYWNrKHN0YXRlKQogICAgICAgICAgICAgICAgICAgICAgICBGaXJlVG9nZ2xlKGZhbHNlKQog",
+"ICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgZW5kKQogICAgICAgICAgICBlbmQKICAgICAgICAgICAgCiAg",
+"ICAgICAgICAgIGZ1bmN0aW9uIEVsZW1lbnQ6U2V0KHZhbCkKICAgICAgICAgICAgICAgIHN0YXRlID0gdmFsCiAgICAgICAgICAg",
+"ICAgICBDYWxsYmFjayhzdGF0ZSkKICAgICAgICAgICAgICAgIEZpcmVUb2dnbGUodHJ1ZSkKICAgICAgICAgICAgZW5kCgogICAg",
+"ICAgICAgICByZXR1cm4gRWxlbWVudAogICAgICAgIGVuZAoKICAgICAgICBCdWlsZGVyLkNyZWF0ZURyb3Bkb3duID0gZnVuY3Rp",
+"b24oc2VsZiwgb3B0aW9ucykKICAgICAgICAgICAgbG9jYWwgRWxlbWVudE5hbWUgPSBvcHRpb25zLk5hbWUgb3IgJ0Ryb3Bkb3du",
+"JwogICAgICAgICAgICBsb2NhbCBEcm9wT3B0aW9ucyA9IG9wdGlvbnMuT3B0aW9ucyBvciB7fQogICAgICAgICAgICBsb2NhbCBE",
+"ZWZhdWx0ID0gb3B0aW9ucy5EZWZhdWx0CiAgICAgICAgICAgIGxvY2FsIE11bHRpU2VsZWN0ID0gb3B0aW9ucy5NdWx0aVNlbGVj",
+"dCBvciBmYWxzZQogICAgICAgICAgICBsb2NhbCBDYWxsYmFjayA9IG9wdGlvbnMuQ2FsbGJhY2sgb3IgZnVuY3Rpb24oKSBlbmQK",
+"CiAgICAgICAgICAgIGxvY2FsIGN1cnJlbnRTZWxlY3Rpb24KICAgICAgICAgICAgaWYgTXVsdGlTZWxlY3QgdGhlbgogICAgICAg",
+"ICAgICAgICAgY3VycmVudFNlbGVjdGlvbiA9IHt9CiAgICAgICAgICAgICAgICBpZiB0eXBlKERlZmF1bHQpID09ICd0YWJsZScg",
+"dGhlbgogICAgICAgICAgICAgICAgICAgIGZvciBpID0gMSwgI0RlZmF1bHQgZG8KICAgICAgICAgICAgICAgICAgICAgICAgdGFi",
+"bGUuaW5zZXJ0KGN1cnJlbnRTZWxlY3Rpb24sIGdldFN0cmluZ1ZhbHVlKERlZmF1bHRbaV0pKQogICAgICAgICAgICAgICAgICAg",
+"IGVuZAogICAgICAgICAgICAgICAgZWxzZWlmIHR5cGUoRGVmYXVsdCkgPT0gJ3N0cmluZycgYW5kIERlZmF1bHQgfj0gJycgdGhl",
+"bgogICAgICAgICAgICAgICAgICAgIHRhYmxlLmluc2VydChjdXJyZW50U2VsZWN0aW9uLCBEZWZhdWx0KQogICAgICAgICAgICAg",
+"ICAgZW5kCiAgICAgICAgICAgIGVsc2UKICAgICAgICAgICAgICAgIGlmIERlZmF1bHQgfj0gbmlsIHRoZW4KICAgICAgICAgICAg",
+"ICAgICAgICBjdXJyZW50U2VsZWN0aW9uID0gdHlwZShEZWZhdWx0KSA9PSAndGFibGUnIGFuZCB0b3N0cmluZyhEZWZhdWx0IG9y",
+"ICcnKSBvciB0b3N0cmluZyhEZWZhdWx0KQogICAgICAgICAgICAgICAgZWxzZQogICAgICAgICAgICAgICAgICAgIGN1cnJlbnRT",
+"ZWxlY3Rpb24gPSB0eXBlKERyb3BPcHRpb25zKSA9PSAndGFibGUnIGFuZCB0b3N0cmluZyhEcm9wT3B0aW9ucyBvciAnJykgb3Ig",
+"JycKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgaWYgdHlwZShjdXJyZW50U2VsZWN0aW9uKSA9PSAndGFibGUn",
+"IHRoZW4gY3VycmVudFNlbGVjdGlvbiA9ICdOb25lJyBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIAogICAgICAgICAg",
+"ICBsb2NhbCBFbGVtZW50ID0geyBWYWx1ZSA9IGN1cnJlbnRTZWxlY3Rpb24gfQogICAgICAgICAgICBBZXJvTGliLkZsYWdzW0Vs",
+"ZW1lbnROYW1lXSA9IEVsZW1lbnQKCiAgICAgICAgICAgIGxvY2FsIENvbnRhaW5lciA9IGNyZWF0ZUluc3RhbmNlKCdJbWFnZUJ1",
+"dHRvbicsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IFBhZ2VUYXJnZXQsCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kQ29s",
+"b3IzID0gVGhlbWUuRWxlbWVudEJHLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAwLCAzNiksCiAgICAg",
+"ICAgICAgICAgICBBdXRvQnV0dG9uQ29sb3IgPSBmYWxzZSwKICAgICAgICAgICAgICAgIEltYWdlID0gJycKICAgICAgICAgICAg",
+"fSkKICAgICAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IENvbnRhaW5lciwgQ29ybmVyUmFkaXVz",
+"ID0gVURpbS5uZXcoMCwgNCl9KQogICAgICAgICAgICByZWdUaGVtZShDb250YWluZXIsIGZ1bmN0aW9uKCkgQ29udGFpbmVyLkJh",
+"Y2tncm91bmRDb2xvcjMgPSBUaGVtZS5FbGVtZW50QkcgZW5kKQogICAgICAgICAgICB0YWJsZS5pbnNlcnQoV2luZG93T2JqLkVs",
+"ZW1lbnRzTGlzdCwge05hbWUgPSBFbGVtZW50TmFtZSwgRnJhbWUgPSBDb250YWluZXIsIFRhYiA9IFBhcmVudFRhYn0pCgogICAg",
+"ICAgICAgICBsb2NhbCBUaXRsZUxhYmVsID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRMYWJlbCcsIHsKICAgICAgICAgICAgICAgIFBh",
+"cmVudCA9IENvbnRhaW5lciwKICAgICAgICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxLAogICAgICAgICAgICAg",
+"ICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMTIsIDAsIDApLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAt",
+"MTIwLCAxLCAwKSwKICAgICAgICAgICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAgICAgICAgICAgICAg",
+"VGV4dCA9IEVsZW1lbnROYW1lLAogICAgICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWIsCiAgICAgICAgICAg",
+"ICAgICBUZXh0U2l6ZSA9IDEzLAogICAgICAgICAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRYQWxpZ25tZW50Lkxl",
+"ZnQKICAgICAgICAgICAgfSkKICAgICAgICAgICAgcmVnVGhlbWUoVGl0bGVMYWJlbCwgZnVuY3Rpb24oKSBUaXRsZUxhYmVsLlRl",
+"eHRDb2xvcjMgPSBUaGVtZS5UZXh0U3ViIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIFNlbGVjdGVkQm94ID0gY3JlYXRlSW5zdGFu",
+"Y2UoJ0ZyYW1lJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gQ29udGFpbmVyLAogICAgICAgICAgICAgICAgQmFja2dyb3Vu",
+"ZENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDIyLCAyMiwgMjIpLAogICAgICAgICAgICAgICAgQW5jaG9yUG9pbnQgPSBWZWN0b3Iy",
+"Lm5ldygxLCAwLjUpLAogICAgICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMSwgLTYsIDAuNSwgMCksCiAgICAgICAg",
+"ICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDEwMCwgMCwgMjQpCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIGNyZWF0ZUlu",
+"c3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBTZWxlY3RlZEJveCwgQ29ybmVyUmFkaXVzID0gVURpbS5uZXcoMCwgNCl9KQog",
+"ICAgICAgICAgICByZWdUaGVtZShTZWxlY3RlZEJveCwgZnVuY3Rpb24oKSBTZWxlY3RlZEJveC5CYWNrZ3JvdW5kQ29sb3IzID0g",
+"VGhlbWUuTWFpbkJHIGVuZCkKICAgICAgICAgICAgCiAgICAgICAgICAgIGxvY2FsIFNlbGVjdGVkQm94U3Ryb2tlID0gY3JlYXRl",
+"SW5zdGFuY2UoJ1VJU3Ryb2tlJywge1BhcmVudCA9IFNlbGVjdGVkQm94LCBDb2xvciA9IFRoZW1lLkJvcmRlcn0pCiAgICAgICAg",
+"ICAgIHJlZ1RoZW1lKFNlbGVjdGVkQm94U3Ryb2tlLCBmdW5jdGlvbigpIFNlbGVjdGVkQm94U3Ryb2tlLkNvbG9yID0gVGhlbWUu",
+"Qm9yZGVyIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIFNlbGVjdGVkTGFiZWwgPSBjcmVhdGVJbnN0YW5jZSgnVGV4dExhYmVsJywg",
+"ewogICAgICAgICAgICAgICAgUGFyZW50ID0gU2VsZWN0ZWRCb3gsCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJl",
+"bmN5ID0gMSwKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgLTIwLCAxLCAwKSwKICAgICAgICAgICAgICAgIFBv",
+"c2l0aW9uID0gVURpbTIubmV3KDAsIDgsIDAsIDApLAogICAgICAgICAgICAgICAgRm9udCA9IEVudW0uRm9udC5Hb3RoYW0sCiAg",
+"ICAgICAgICAgICAgICBUZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW4sCiAgICAgICAgICAgICAgICBUZXh0U2l6ZSA9IDExLAog",
+"ICAgICAgICAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRYQWxpZ25tZW50LkxlZnQsCiAgICAgICAgICAgICAgICBU",
+"ZXh0VHJ1bmNhdGUgPSBFbnVtLlRleHRUcnVuY2F0ZS5BdEVuZAogICAgICAgICAgICB9KQogICAgICAgICAgICByZWdUaGVtZShT",
+"ZWxlY3RlZExhYmVsLCBmdW5jdGlvbigpIFNlbGVjdGVkTGFiZWwuVGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWluIGVuZCkKICAg",
+"ICAgICAgICAgCiAgICAgICAgICAgIGxvY2FsIFVwZGF0ZUxhYmVsID0gZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgaWYgTXVs",
+"dGlTZWxlY3QgdGhlbgogICAgICAgICAgICAgICAgICAgIFNlbGVjdGVkTGFiZWwuVGV4dCA9ICNjdXJyZW50U2VsZWN0aW9uID4g",
+"MCBhbmQgdGFibGUuY29uY2F0KGN1cnJlbnRTZWxlY3Rpb24sICcsICcpIG9yICdOb25lJwogICAgICAgICAgICAgICAgZWxzZQog",
+"ICAgICAgICAgICAgICAgICAgIFNlbGVjdGVkTGFiZWwuVGV4dCA9IChjdXJyZW50U2VsZWN0aW9uID09ICcnIG9yIGN1cnJlbnRT",
+"ZWxlY3Rpb24gPT0gbmlsKSBhbmQgJ05vbmUnIG9yIHRvc3RyaW5nKGN1cnJlbnRTZWxlY3Rpb24pCiAgICAgICAgICAgICAgICBl",
+"bmQKICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIFVwZGF0ZUxhYmVsKCkKCiAgICAgICAgICAgIGxvY2FsIEljb24gPSBjcmVh",
+"dGVJbnN0YW5jZSgnVGV4dExhYmVsJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gU2VsZWN0ZWRCb3gsCiAgICAgICAgICAg",
+"ICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgICAgIEFuY2hvclBvaW50ID0gVmVjdG9yMi5uZXco",
+"MSwgMC41KSwKICAgICAgICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDEsIC01LCAwLjUsIDApLAogICAgICAgICAgICAg",
+"ICAgU2l6ZSA9IFVEaW0yLm5ldygwLCAxNiwgMCwgMTYpLAogICAgICAgICAgICAgICAgRm9udCA9IEVudW0uRm9udC5Hb3RoYW0s",
+"CiAgICAgICAgICAgICAgICBUZXh0ID0gJysnLAogICAgICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWIsCiAg",
+"ICAgICAgICAgICAgICBUZXh0U2l6ZSA9IDE2CiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIHJlZ1RoZW1lKEljb24sIGZ1bmN0",
+"aW9uKCkgSWNvbi5UZXh0Q29sb3IzID0gVGhlbWUuVGV4dFN1YiBlbmQpCgogICAgICAgICAgICBsb2NhbCBMaXN0Q2FudmFzID0g",
+"Y3JlYXRlSW5zdGFuY2UoJ0NhbnZhc0dyb3VwJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gU2NyZWVuR3VpLAogICAgICAg",
+"ICAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgICAgICAgICBaSW5kZXggPSAxMDAsCiAgICAgICAg",
+"ICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDAsIDAsIDApLAogICAgICAgICAgICAgICAgR3JvdXBUcmFuc3BhcmVuY3kgPSAx",
+"LAogICAgICAgICAgICAgICAgVmlzaWJsZSA9IGZhbHNlCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIAogICAgICAgICAgICBs",
+"b2NhbCBMQ1NjYWxlID0gY3JlYXRlSW5zdGFuY2UoJ1VJU2NhbGUnLCB7UGFyZW50ID0gTGlzdENhbnZhcywgU2NhbGUgPSBDdXJy",
+"ZW50U2NhbGV9KQogICAgICAgICAgICB0YWJsZS5pbnNlcnQoU2NhbGVzVG9VcGRhdGUsIExDU2NhbGUpCiAgICAgICAgICAgIGNy",
+"ZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBMaXN0Q2FudmFzLCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA0",
+"KX0pCgogICAgICAgICAgICBsb2NhbCBMaXN0RnJhbWUgPSBjcmVhdGVJbnN0YW5jZSgnU2Nyb2xsaW5nRnJhbWUnLCB7CiAgICAg",
+"ICAgICAgICAgICBQYXJlbnQgPSBMaXN0Q2FudmFzLAogICAgICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLkRy",
+"b3Bkb3duTGlzdEJHLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAxLCAwKSwKICAgICAgICAgICAgICAg",
+"IFpJbmRleCA9IDEwMCwKICAgICAgICAgICAgICAgIFNjcm9sbEJhclRoaWNrbmVzcyA9IDIsCiAgICAgICAgICAgICAgICBCb3Jk",
+"ZXJTaXplUGl4ZWwgPSAwLAogICAgICAgICAgICAgICAgQXV0b21hdGljQ2FudmFzU2l6ZSA9IEVudW0uQXV0b21hdGljU2l6ZS5Z",
+"CiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIGxvY2FsIExpc3RGcmFtZVN0cm9rZSA9IGNyZWF0ZUluc3RhbmNlKCdVSVN0cm9r",
+"ZScsIHtQYXJlbnQgPSBMaXN0RnJhbWUsIENvbG9yID0gVGhlbWUuRHJvcGRvd25MaXN0U3Ryb2tlfSkKICAgICAgICAgICAgCiAg",
+"ICAgICAgICAgIHJlZ1RoZW1lKExpc3RGcmFtZSwgZnVuY3Rpb24oKSAKICAgICAgICAgICAgICAgIExpc3RGcmFtZS5CYWNrZ3Jv",
+"dW5kQ29sb3IzID0gVGhlbWUuRHJvcGRvd25MaXN0QkcKICAgICAgICAgICAgICAgIExpc3RGcmFtZVN0cm9rZS5Db2xvciA9IFRo",
+"ZW1lLkRyb3Bkb3duTGlzdFN0cm9rZQogICAgICAgICAgICBlbmQpCiAgICAgICAgICAgIAogICAgICAgICAgICBsb2NhbCBDYW52",
+"YXNMYXlvdXQgPSBjcmVhdGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgICAgICAgICBQYXJlbnQgPSBMaXN0RnJhbWUsCiAg",
+"ICAgICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXco",
+"MSwgMCwgMCwgMCksCiAgICAgICAgICAgICAgICBBdXRvbWF0aWNTaXplID0gRW51bS5BdXRvbWF0aWNTaXplLlkKICAgICAgICAg",
+"ICAgfSkKICAgICAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJTGlzdExheW91dCcsIHtQYXJlbnQgPSBDYW52YXNMYXlvdXQsIFNv",
+"cnRPcmRlciA9IEVudW0uU29ydE9yZGVyLkxheW91dE9yZGVyfSkKCiAgICAgICAgICAgIFNldHVwVG9vbHRpcChDb250YWluZXIs",
+"IG9wdGlvbnMuVGlwKQoKICAgICAgICAgICAgbG9jYWwgZXhwYW5kZWQgPSBmYWxzZQogICAgICAgICAgICBsb2NhbCBPcHRpb25z",
+"UmVuZGVyZWQgPSB7fQoKICAgICAgICAgICAgbG9jYWwgUmVmcmVzaE9wdGlvbnMgPSBmdW5jdGlvbigpCiAgICAgICAgICAgICAg",
+"ICBsb2NhbCBjTGlzdCA9IENhbnZhc0xheW91dDpHZXRDaGlsZHJlbigpCiAgICAgICAgICAgICAgICBmb3IgaSA9IDEsICNjTGlz",
+"dCBkbwogICAgICAgICAgICAgICAgICAgIGxvY2FsIHYgPSBjTGlzdFtpXQogICAgICAgICAgICAgICAgICAgIGlmIHY6SXNBKCdU",
+"ZXh0QnV0dG9uJykgdGhlbiB2OkRlc3Ryb3koKSBlbmQKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgdGFibGUu",
+"Y2xlYXIoT3B0aW9uc1JlbmRlcmVkKQoKICAgICAgICAgICAgICAgIGZvciBpID0gMSwgI0Ryb3BPcHRpb25zIGRvCiAgICAgICAg",
+"ICAgICAgICAgICAgbG9jYWwgc3RyT3B0ID0gdG9zdHJpbmcoRHJvcE9wdGlvbnNbaV0pCiAgICAgICAgICAgICAgICAgICAgCiAg",
+"ICAgICAgICAgICAgICAgICAgbG9jYWwgT3B0aW9uID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRCdXR0b24nLCB7CiAgICAgICAgICAg",
+"ICAgICAgICAgICAgIFBhcmVudCA9IENhbnZhc0xheW91dCwKICAgICAgICAgICAgICAgICAgICAgICAgQmFja2dyb3VuZFRyYW5z",
+"cGFyZW5jeSA9IDEsCiAgICAgICAgICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMCwgMjYpLAogICAgICAg",
+"ICAgICAgICAgICAgICAgICBUZXh0ID0gJycsCiAgICAgICAgICAgICAgICAgICAgICAgIFpJbmRleCA9IDEwMQogICAgICAgICAg",
+"ICAgICAgICAgIH0pCgogICAgICAgICAgICAgICAgICAgIGxvY2FsIGlzU2VsID0gZmFsc2UKICAgICAgICAgICAgICAgICAgICBp",
+"ZiBNdWx0aVNlbGVjdCB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIGlzU2VsID0gdGFibGUuZmluZChjdXJyZW50U2VsZWN0",
+"aW9uLCBzdHJPcHQpIH49IG5pbAogICAgICAgICAgICAgICAgICAgIGVsc2UKICAgICAgICAgICAgICAgICAgICAgICAgaXNTZWwg",
+"PSBjdXJyZW50U2VsZWN0aW9uID09IHN0ck9wdAogICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgICAgIAog",
+"ICAgICAgICAgICAgICAgICAgIGxvY2FsIE9wdENoZWNrID0gY3JlYXRlSW5zdGFuY2UoJ0ltYWdlTGFiZWwnLCB7CiAgICAgICAg",
+"ICAgICAgICAgICAgICAgIFBhcmVudCA9IE9wdGlvbiwKICAgICAgICAgICAgICAgICAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFy",
+"ZW5jeSA9IDEsCiAgICAgICAgICAgICAgICAgICAgICAgIFBvc2l0aW9uID0gaXNTZWwgYW5kIFVEaW0yLm5ldygwLCA4LCAwLjUs",
+"IC03KSBvciBVRGltMi5uZXcoMCwgMCwgMC41LCAtNyksCiAgICAgICAgICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXco",
+"MCwgMTQsIDAsIDE0KSwKICAgICAgICAgICAgICAgICAgICAgICAgSW1hZ2UgPSAncmJ4YXNzZXRpZDovLzYwMzEwOTQ2NjcnLAog",
+"ICAgICAgICAgICAgICAgICAgICAgICBJbWFnZUNvbG9yMyA9IFRoZW1lLlRleHRNYWluLAogICAgICAgICAgICAgICAgICAgICAg",
+"ICBJbWFnZVRyYW5zcGFyZW5jeSA9IGlzU2VsIGFuZCAwIG9yIDEsCiAgICAgICAgICAgICAgICAgICAgICAgIFpJbmRleCA9IDEw",
+"MQogICAgICAgICAgICAgICAgICAgIH0pCiAgICAgICAgICAgICAgICAgICAgcmVnVGhlbWUoT3B0Q2hlY2ssIGZ1bmN0aW9uKCkg",
+"T3B0Q2hlY2suSW1hZ2VDb2xvcjMgPSBUaGVtZS5UZXh0TWFpbiBlbmQpCiAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAg",
+"ICAgICAgICAgbG9jYWwgT3B0VGV4dCA9IGNyZWF0ZUluc3RhbmNlKCdUZXh0TGFiZWwnLCB7CiAgICAgICAgICAgICAgICAgICAg",
+"ICAgIFBhcmVudCA9IE9wdGlvbiwKICAgICAgICAgICAgICAgICAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAg",
+"ICAgICAgICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgLTMwLCAxLCAwKSwKICAgICAgICAgICAgICAgICAgICAg",
+"ICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMjgsIDAsIDApLAogICAgICAgICAgICAgICAgICAgICAgICBGb250ID0gRW51bS5G",
+"b250LkdvdGhhbU1lZGl1bSwKICAgICAgICAgICAgICAgICAgICAgICAgVGV4dCA9IHN0ck9wdCwKICAgICAgICAgICAgICAgICAg",
+"ICAgICAgVGV4dENvbG9yMyA9IGlzU2VsIGFuZCBUaGVtZS5UZXh0TWFpbiBvciBUaGVtZS5UZXh0U3ViLAogICAgICAgICAgICAg",
+"ICAgICAgICAgICBUZXh0U2l6ZSA9IDEzLAogICAgICAgICAgICAgICAgICAgICAgICBUZXh0WEFsaWdubWVudCA9IEVudW0uVGV4",
+"dFhBbGlnbm1lbnQuTGVmdCwKICAgICAgICAgICAgICAgICAgICAgICAgWkluZGV4ID0gMTAxCiAgICAgICAgICAgICAgICAgICAg",
+"fSkKCiAgICAgICAgICAgICAgICAgICAgdGFibGUuaW5zZXJ0KE9wdGlvbnNSZW5kZXJlZCwgewogICAgICAgICAgICAgICAgICAg",
+"ICAgICBWYWx1ZSA9IHN0ck9wdCwKICAgICAgICAgICAgICAgICAgICAgICAgVGV4dCA9IE9wdFRleHQsCiAgICAgICAgICAgICAg",
+"ICAgICAgICAgIENoZWNrID0gT3B0Q2hlY2ssCiAgICAgICAgICAgICAgICAgICAgICAgIEJ1dHRvbiA9IE9wdGlvbgogICAgICAg",
+"ICAgICAgICAgICAgIH0pCiAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgT3B0aW9uLk1vdXNlRW50ZXI6",
+"Q29ubmVjdChmdW5jdGlvbigpCiAgICAgICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoT3B0VGV4dCwgVHdl",
+"ZW5JbmZvLm5ldygwLjIpLCB7VGV4dENvbG9yMyA9IFRoZW1lLlRleHRNYWlufSk6UGxheSgpCiAgICAgICAgICAgICAgICAgICAg",
+"ZW5kKQogICAgICAgICAgICAgICAgICAgIE9wdGlvbi5Nb3VzZUxlYXZlOkNvbm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICAg",
+"ICAgICAgICAgICBsb2NhbCBhY3RpdmUgPSBmYWxzZQogICAgICAgICAgICAgICAgICAgICAgICBpZiBNdWx0aVNlbGVjdCB0aGVu",
+"IGFjdGl2ZSA9IHRhYmxlLmZpbmQoY3VycmVudFNlbGVjdGlvbiwgc3RyT3B0KSB+PSBuaWwgZWxzZSBhY3RpdmUgPSBjdXJyZW50",
+"U2VsZWN0aW9uID09IHN0ck9wdCBlbmQKICAgICAgICAgICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShPcHRUZXh0",
+"LCBUd2VlbkluZm8ubmV3KDAuMiksIHtUZXh0Q29sb3IzID0gYWN0aXZlIGFuZCBUaGVtZS5UZXh0TWFpbiBvciBUaGVtZS5UZXh0",
+"U3VifSk6UGxheSgpCiAgICAgICAgICAgICAgICAgICAgZW5kKQoKICAgICAgICAgICAgICAgICAgICBPcHRpb24uTW91c2VCdXR0",
+"b24xQ2xpY2s6Q29ubmVjdChmdW5jdGlvbigpCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIE11bHRpU2VsZWN0IHRoZW4KICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIGlkeCA9IHRhYmxlLmZpbmQoY3VycmVudFNlbGVjdGlvbiwgc3RyT3B0KQog",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICAgaWYgaWR4IHRoZW4gCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdGFi",
+"bGUucmVtb3ZlKGN1cnJlbnRTZWxlY3Rpb24sIGlkeCkgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgT3B0VGV4dC5U",
+"ZXh0Q29sb3IzID0gVGhlbWUuVGV4dFN1YgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVh",
+"dGUoT3B0Q2hlY2ssIFR3ZWVuSW5mby5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlv",
+"bi5PdXQpLCB7UG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMC41LCAtNyksIEltYWdlVHJhbnNwYXJlbmN5ID0gMX0pOlBsYXko",
+"KQogICAgICAgICAgICAgICAgICAgICAgICAgICAgZWxzZSAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0YWJsZS5p",
+"bnNlcnQoY3VycmVudFNlbGVjdGlvbiwgc3RyT3B0KSAKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBPcHRUZXh0LlRl",
+"eHRDb2xvcjMgPSBUaGVtZS5UZXh0TWFpbgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVh",
+"dGUoT3B0Q2hlY2ssIFR3ZWVuSW5mby5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlv",
+"bi5PdXQpLCB7UG9zaXRpb24gPSBVRGltMi5uZXcoMCwgOCwgMC41LCAtNyksIEltYWdlVHJhbnNwYXJlbmN5ID0gMH0pOlBsYXko",
+"KQogICAgICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgICAgIGVsc2UKICAgICAgICAgICAg",
+"ICAgICAgICAgICAgICAgIGN1cnJlbnRTZWxlY3Rpb24gPSBzdHJPcHQKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGV4cGFu",
+"ZGVkID0gZmFsc2UKICAgICAgICAgICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoSWNvbiwgVHdlZW5JbmZv",
+"Lm5ldygwLjMpLCB7Um90YXRpb24gPSAwfSk6UGxheSgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6",
+"Q3JlYXRlKExpc3RDYW52YXMsIFR3ZWVuSW5mby5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0Rp",
+"cmVjdGlvbi5PdXQpLCB7U2l6ZSA9IFVEaW0yLm5ldygwLCBTZWxlY3RlZEJveC5BYnNvbHV0ZVNpemUuWCwgMCwgMCksIEdyb3Vw",
+"VHJhbnNwYXJlbmN5ID0gMX0pOlBsYXkoKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgdGFzay5kZWxheSgwLjMsIGZ1bmN0",
+"aW9uKCkgaWYgbm90IGV4cGFuZGVkIHRoZW4gTGlzdENhbnZhcy5WaXNpYmxlID0gZmFsc2UgZW5kIGVuZCkKICAgICAgICAgICAg",
+"ICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgZm9yIGsgPSAxLCAjT3B0aW9uc1JlbmRlcmVkIGRv",
+"CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgcmVuZGVyRGF0YSA9IE9wdGlvbnNSZW5kZXJlZFtrXQogICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIHJlbmRlckRhdGEuVmFsdWUgPT0gc3RyT3B0IHRoZW4KICAgICAgICAgICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgcmVuZGVyRGF0YS5UZXh0LlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0TWFpbgogICAgICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKHJlbmRlckRhdGEuQ2hlY2ssIFR3ZWVuSW5m",
+"by5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7UG9zaXRpb24gPSBV",
+"RGltMi5uZXcoMCwgOCwgMC41LCAtNyksIEltYWdlVHJhbnNwYXJlbmN5ID0gMH0pOlBsYXkoKQogICAgICAgICAgICAgICAgICAg",
+"ICAgICAgICAgICAgIGVsc2UKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgcmVuZGVyRGF0YS5UZXh0LlRleHRD",
+"b2xvcjMgPSBUaGVtZS5UZXh0U3ViCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVh",
+"dGUocmVuZGVyRGF0YS5DaGVjaywgVHdlZW5JbmZvLm5ldygwLjMsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5n",
+"RGlyZWN0aW9uLk91dCksIHtQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAwLjUsIC03KSwgSW1hZ2VUcmFuc3BhcmVuY3kgPSAx",
+"fSk6UGxheSgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBl",
+"bmQKICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgICAgIFVwZGF0ZUxhYmVsKCkKICAgICAg",
+"ICAgICAgICAgICAgICAgICAgRWxlbWVudC5WYWx1ZSA9IGN1cnJlbnRTZWxlY3Rpb24KICAgICAgICAgICAgICAgICAgICAgICAg",
+"QWVyb0xpYi5GbGFnc1tFbGVtZW50TmFtZV0uVmFsdWUgPSBjdXJyZW50U2VsZWN0aW9uCiAgICAgICAgICAgICAgICAgICAgICAg",
+"IENhbGxiYWNrKGN1cnJlbnRTZWxlY3Rpb24pCiAgICAgICAgICAgICAgICAgICAgZW5kKQogICAgICAgICAgICAgICAgZW5kCiAg",
+"ICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgIExpc3RGcmFtZS5DYW52YXNTaXplID0gVURpbTIubmV3KDAsIDAsIDAsICNE",
+"cm9wT3B0aW9ucyAqIDI2KQogICAgICAgICAgICBlbmQKCiAgICAgICAgICAgIFJlZnJlc2hPcHRpb25zKCkKCiAgICAgICAgICAg",
+"IENvbnRhaW5lci5Nb3VzZUJ1dHRvbjFDbGljazpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgIGV4cGFuZGVkID0g",
+"bm90IGV4cGFuZGVkCiAgICAgICAgICAgICAgICBpZiBleHBhbmRlZCB0aGVuCiAgICAgICAgICAgICAgICAgICAgUmVmcmVzaE9w",
+"dGlvbnMoKQogICAgICAgICAgICAgICAgICAgIExpc3RDYW52YXMuUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgU2VsZWN0ZWRCb3gu",
+"QWJzb2x1dGVQb3NpdGlvbi5YLCAwLCBTZWxlY3RlZEJveC5BYnNvbHV0ZVBvc2l0aW9uLlkgKyAoMjggKiBDdXJyZW50U2NhbGUp",
+"KQogICAgICAgICAgICAgICAgICAgIGxvY2FsIGRyb3BIZWlnaHQgPSBtYXRoLm1pbigjRHJvcE9wdGlvbnMgKiAyNiwgMTUwKQog",
+"ICAgICAgICAgICAgICAgICAgIExpc3RDYW52YXMuU2l6ZSA9IFVEaW0yLm5ldygwLCBTZWxlY3RlZEJveC5BYnNvbHV0ZVNpemUu",
+"WCwgMCwgMCkKICAgICAgICAgICAgICAgICAgICBMaXN0Q2FudmFzLkdyb3VwVHJhbnNwYXJlbmN5ID0gMQogICAgICAgICAgICAg",
+"ICAgICAgIExpc3RDYW52YXMuVmlzaWJsZSA9IHRydWUKICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKExp",
+"c3RDYW52YXMsIFR3ZWVuSW5mby5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5P",
+"dXQpLCB7U2l6ZSA9IFVEaW0yLm5ldygwLCBTZWxlY3RlZEJveC5BYnNvbHV0ZVNpemUuWCwgMCwgZHJvcEhlaWdodCksIEdyb3Vw",
+"VHJhbnNwYXJlbmN5ID0gMH0pOlBsYXkoKQogICAgICAgICAgICAgICAgZWxzZQogICAgICAgICAgICAgICAgICAgIFR3ZWVuU2Vy",
+"dmljZTpDcmVhdGUoTGlzdENhbnZhcywgVHdlZW5JbmZvLm5ldygwLjMsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFz",
+"aW5nRGlyZWN0aW9uLk91dCksIHtTaXplID0gVURpbTIubmV3KDAsIFNlbGVjdGVkQm94LkFic29sdXRlU2l6ZS5YLCAwLCAwKSwg",
+"R3JvdXBUcmFuc3BhcmVuY3kgPSAxfSk6UGxheSgpCiAgICAgICAgICAgICAgICAgICAgdGFzay5kZWxheSgwLjMsIGZ1bmN0aW9u",
+"KCkgaWYgbm90IGV4cGFuZGVkIHRoZW4gTGlzdENhbnZhcy5WaXNpYmxlID0gZmFsc2UgZW5kIGVuZCkKICAgICAgICAgICAgICAg",
+"IGVuZAogICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShJY29uLCBUd2VlbkluZm8ubmV3KDAuMyksIHtSb3RhdGlv",
+"biA9IGV4cGFuZGVkIGFuZCA0NSBvciAwfSk6UGxheSgpCiAgICAgICAgICAgIGVuZCkKCiAgICAgICAgICAgIFVzZXJJbnB1dFNl",
+"cnZpY2UuSW5wdXRCZWdhbjpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgICAgICAgICAgaWYgaW5wdXQuVXNlcklucHV0",
+"VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VCdXR0b24xIG9yIGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2Vy",
+"SW5wdXRUeXBlLlRvdWNoIHRoZW4KICAgICAgICAgICAgICAgICAgICBsb2NhbCBwb3MgPSBpbnB1dC5Qb3NpdGlvbgogICAgICAg",
+"ICAgICAgICAgICAgIGlmIGV4cGFuZGVkIGFuZCBMaXN0Q2FudmFzLlZpc2libGUgdGhlbgogICAgICAgICAgICAgICAgICAgICAg",
+"ICBsb2NhbCB4MSA9IExpc3RDYW52YXMuQWJzb2x1dGVQb3NpdGlvbi5YCiAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIHkx",
+"ID0gTGlzdENhbnZhcy5BYnNvbHV0ZVBvc2l0aW9uLlkKICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgeDIgPSB4MSArIExp",
+"c3RDYW52YXMuQWJzb2x1dGVTaXplLlgKICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgeTIgPSB5MSArIExpc3RDYW52YXMu",
+"QWJzb2x1dGVTaXplLlkKICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgY3gxID0gQ29udGFpbmVyLkFic29sdXRlUG9zaXRp",
+"b24uWAogICAgICAgICAgICAgICAgICAgICAgICBsb2NhbCBjeTEgPSBDb250YWluZXIuQWJzb2x1dGVQb3NpdGlvbi5ZCiAgICAg",
+"ICAgICAgICAgICAgICAgICAgIGxvY2FsIGN4MiA9IGN4MSArIENvbnRhaW5lci5BYnNvbHV0ZVNpemUuWAogICAgICAgICAgICAg",
+"ICAgICAgICAgICBsb2NhbCBjeTIgPSBjeTEgKyBDb250YWluZXIuQWJzb2x1dGVTaXplLlkKICAgICAgICAgICAgICAgICAgICAg",
+"ICAgCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIG5vdCAocG9zLlggPj0geDEgYW5kIHBvcy5YIDw9IHgyIGFuZCBwb3MuWSA+",
+"PSB5MSBhbmQgcG9zLlkgPD0geTIpIGFuZCBub3QgKHBvcy5YID49IGN4MSBhbmQgcG9zLlggPD0gY3gyIGFuZCBwb3MuWSA+PSBj",
+"eTEgYW5kIHBvcy5ZIDw9IGN5MikgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICAgICAgZXhwYW5kZWQgPSBmYWxzZQogICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShMaXN0Q2FudmFzLCBUd2VlbkluZm8ubmV3KDAuMywg",
+"RW51bS5FYXNpbmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge1NpemUgPSBVRGltMi5uZXcoMCwgU2Vs",
+"ZWN0ZWRCb3guQWJzb2x1dGVTaXplLlgsIDAsIDApLCBHcm91cFRyYW5zcGFyZW5jeSA9IDF9KTpQbGF5KCkKICAgICAgICAgICAg",
+"ICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoSWNvbiwgVHdlZW5JbmZvLm5ldygwLjMpLCB7Um90YXRpb24gPSAw",
+"fSk6UGxheSgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB0YXNrLmRlbGF5KDAuMywgZnVuY3Rpb24oKSBpZiBub3QgZXhw",
+"YW5kZWQgdGhlbiBMaXN0Q2FudmFzLlZpc2libGUgPSBmYWxzZSBlbmQgZW5kKQogICAgICAgICAgICAgICAgICAgICAgICBlbmQK",
+"ICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQpCiAgICAgICAgICAgIAog",
+"ICAgICAgICAgICBmdW5jdGlvbiBFbGVtZW50OlNldCh2YWwpCiAgICAgICAgICAgICAgICBpZiBNdWx0aVNlbGVjdCB0aGVuCiAg",
+"ICAgICAgICAgICAgICAgICAgY3VycmVudFNlbGVjdGlvbiA9IHR5cGUodmFsKSA9PSAndGFibGUnIGFuZCB2YWwgb3Ige30KICAg",
+"ICAgICAgICAgICAgIGVsc2UKICAgICAgICAgICAgICAgICAgICBjdXJyZW50U2VsZWN0aW9uID0gZ2V0U3RyaW5nVmFsdWUodmFs",
+"KQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICBpZiB0eXBlKGN1cnJlbnRTZWxlY3Rpb24pID09ICd0YWJsZScg",
+"dGhlbiBjdXJyZW50U2VsZWN0aW9uID0gJ05vbmUnIGVuZAogICAgICAgICAgICAgICAgVXBkYXRlTGFiZWwoKQogICAgICAgICAg",
+"ICAgICAgRWxlbWVudC5WYWx1ZSA9IGN1cnJlbnRTZWxlY3Rpb24KICAgICAgICAgICAgICAgIEFlcm9MaWIuRmxhZ3NbRWxlbWVu",
+"dE5hbWVdLlZhbHVlID0gY3VycmVudFNlbGVjdGlvbgogICAgICAgICAgICAgICAgUmVmcmVzaE9wdGlvbnMoKQogICAgICAgICAg",
+"ICAgICAgQ2FsbGJhY2soY3VycmVudFNlbGVjdGlvbikKICAgICAgICAgICAgZW5kCgogICAgICAgICAgICBmdW5jdGlvbiBFbGVt",
+"ZW50OlJlZnJlc2gobmV3T3B0aW9ucykKICAgICAgICAgICAgICAgIERyb3BPcHRpb25zID0gdHlwZShuZXdPcHRpb25zKSA9PSAn",
+"dGFibGUnIGFuZCBuZXdPcHRpb25zIG9yIHt9CiAgICAgICAgICAgICAgICBpZiBNdWx0aVNlbGVjdCB0aGVuCiAgICAgICAgICAg",
+"ICAgICAgICAgbG9jYWwgbmV3U2VsID0ge30KICAgICAgICAgICAgICAgICAgICBmb3IgaSA9IDEsICNjdXJyZW50U2VsZWN0aW9u",
+"IGRvCiAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIHYgPSBjdXJyZW50U2VsZWN0aW9uW2ldCiAgICAgICAgICAgICAgICAg",
+"ICAgICAgIGlmIHRhYmxlLmZpbmQoRHJvcE9wdGlvbnMsIHYpIHRoZW4gdGFibGUuaW5zZXJ0KG5ld1NlbCwgdikgZW5kCiAgICAg",
+"ICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgY3VycmVudFNlbGVjdGlvbiA9IG5ld1NlbAogICAgICAgICAg",
+"ICAgICAgZWxzZQogICAgICAgICAgICAgICAgICAgIGlmIG5vdCB0YWJsZS5maW5kKERyb3BPcHRpb25zLCBjdXJyZW50U2VsZWN0",
+"aW9uKSB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIGN1cnJlbnRTZWxlY3Rpb24gPSBnZXRTdHJpbmdWYWx1ZShEcm9wT3B0",
+"aW9ucykKICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgaWYgdHlwZShj",
+"dXJyZW50U2VsZWN0aW9uKSA9PSAndGFibGUnIHRoZW4gY3VycmVudFNlbGVjdGlvbiA9ICdOb25lJyBlbmQKICAgICAgICAgICAg",
+"ICAgIFVwZGF0ZUxhYmVsKCkKICAgICAgICAgICAgICAgIEVsZW1lbnQuVmFsdWUgPSBjdXJyZW50U2VsZWN0aW9uCiAgICAgICAg",
+"ICAgICAgICBBZXJvTGliLkZsYWdzW0VsZW1lbnROYW1lXS5WYWx1ZSA9IGN1cnJlbnRTZWxlY3Rpb24KICAgICAgICAgICAgICAg",
+"IFJlZnJlc2hPcHRpb25zKCkKICAgICAgICAgICAgZW5kCgogICAgICAgICAgICByZXR1cm4gRWxlbWVudAogICAgICAgIGVuZAoK",
+"ICAgICAgICBCdWlsZGVyLkNyZWF0ZUNvbG9ycGlja2VyID0gZnVuY3Rpb24oc2VsZiwgb3B0aW9ucykKICAgICAgICAgICAgbG9j",
+"YWwgRWxlbWVudE5hbWUgPSBvcHRpb25zLk5hbWUgb3IgJ0NvbG9ycGlja2VyJwogICAgICAgICAgICBsb2NhbCBEZWZhdWx0ID0g",
+"b3B0aW9ucy5EZWZhdWx0IG9yIENvbG9yMy5mcm9tUkdCKDI1NSwgMjU1LCAyNTUpCiAgICAgICAgICAgIGxvY2FsIENhbGxiYWNr",
+"ID0gb3B0aW9ucy5DYWxsYmFjayBvciBmdW5jdGlvbigpIGVuZAoKICAgICAgICAgICAgbG9jYWwgRWxlbWVudCA9IHsgVmFsdWUg",
+"PSBEZWZhdWx0IH0KICAgICAgICAgICAgQWVyb0xpYi5GbGFnc1tFbGVtZW50TmFtZV0gPSBFbGVtZW50CiAgICAgICAgICAgIAog",
+"ICAgICAgICAgICBsb2NhbCBjdXJyZW50Q29sb3IgPSBEZWZhdWx0CiAgICAgICAgICAgIGxvY2FsIGgsIHMsIHYgPSBDb2xvcjMu",
+"dG9IU1YoY3VycmVudENvbG9yKQoKICAgICAgICAgICAgbG9jYWwgQ29udGFpbmVyID0gY3JlYXRlSW5zdGFuY2UoJ0ltYWdlQnV0",
+"dG9uJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gUGFnZVRhcmdldCwKICAgICAgICAgICAgICAgIEJhY2tncm91bmRDb2xv",
+"cjMgPSBUaGVtZS5FbGVtZW50QkcsCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIDAsIDAsIDM2KSwKICAgICAg",
+"ICAgICAgICAgIEF1dG9CdXR0b25Db2xvciA9IGZhbHNlLAogICAgICAgICAgICAgICAgSW1hZ2UgPSAnJwogICAgICAgICAgICB9",
+"KQogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlDb3JuZXInLCB7UGFyZW50ID0gQ29udGFpbmVyLCBDb3JuZXJSYWRpdXMg",
+"PSBVRGltLm5ldygwLCA0KX0pCiAgICAgICAgICAgIHJlZ1RoZW1lKENvbnRhaW5lciwgZnVuY3Rpb24oKSBDb250YWluZXIuQmFj",
+"a2dyb3VuZENvbG9yMyA9IFRoZW1lLkVsZW1lbnRCRyBlbmQpCiAgICAgICAgICAgIHRhYmxlLmluc2VydChXaW5kb3dPYmouRWxl",
+"bWVudHNMaXN0LCB7TmFtZSA9IEVsZW1lbnROYW1lLCBGcmFtZSA9IENvbnRhaW5lciwgVGFiID0gUGFyZW50VGFifSkKCiAgICAg",
+"ICAgICAgIGxvY2FsIFRpdGxlTGFiZWwgPSBjcmVhdGVJbnN0YW5jZSgnVGV4dExhYmVsJywgewogICAgICAgICAgICAgICAgUGFy",
+"ZW50ID0gQ29udGFpbmVyLAogICAgICAgICAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgICAgICAg",
+"ICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAxMiwgMCwgMCksCiAgICAgICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIC0x",
+"MjAsIDEsIDApLAogICAgICAgICAgICAgICAgRm9udCA9IEVudW0uRm9udC5Hb3RoYW1NZWRpdW0sCiAgICAgICAgICAgICAgICBU",
+"ZXh0ID0gRWxlbWVudE5hbWUsCiAgICAgICAgICAgICAgICBUZXh0Q29sb3IzID0gVGhlbWUuVGV4dFN1YiwKICAgICAgICAgICAg",
+"ICAgIFRleHRTaXplID0gMTMsCiAgICAgICAgICAgICAgICBUZXh0WEFsaWdubWVudCA9IEVudW0uVGV4dFhBbGlnbm1lbnQuTGVm",
+"dAogICAgICAgICAgICB9KQogICAgICAgICAgICByZWdUaGVtZShUaXRsZUxhYmVsLCBmdW5jdGlvbigpIFRpdGxlTGFiZWwuVGV4",
+"dENvbG9yMyA9IFRoZW1lLlRleHRTdWIgZW5kKQoKICAgICAgICAgICAgbG9jYWwgQ29sb3JWaWV3ID0gY3JlYXRlSW5zdGFuY2Uo",
+"J0ZyYW1lJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gQ29udGFpbmVyLAogICAgICAgICAgICAgICAgQmFja2dyb3VuZENv",
+"bG9yMyA9IGN1cnJlbnRDb2xvciwKICAgICAgICAgICAgICAgIEFuY2hvclBvaW50ID0gVmVjdG9yMi5uZXcoMSwgMC41KSwKICAg",
+"ICAgICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDEsIC02LCAwLjUsIDApLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVE",
+"aW0yLm5ldygwLCA0MCwgMCwgMjApCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcics",
+"IHtQYXJlbnQgPSBDb2xvclZpZXcsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDQpfSkKICAgICAgICAgICAgbG9jYWwgQ29s",
+"b3JWaWV3U3Ryb2tlID0gY3JlYXRlSW5zdGFuY2UoJ1VJU3Ryb2tlJywge1BhcmVudCA9IENvbG9yVmlldywgQ29sb3IgPSBUaGVt",
+"ZS5Cb3JkZXJ9KQogICAgICAgICAgICByZWdUaGVtZShDb2xvclZpZXdTdHJva2UsIGZ1bmN0aW9uKCkgQ29sb3JWaWV3U3Ryb2tl",
+"LkNvbG9yID0gVGhlbWUuQm9yZGVyIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIEZsb2F0UGlja2VyID0gY3JlYXRlSW5zdGFuY2Uo",
+"J0ZyYW1lJywgewogICAgICAgICAgICAgICAgUGFyZW50ID0gU2NyZWVuR3VpLAogICAgICAgICAgICAgICAgQmFja2dyb3VuZENv",
+"bG9yMyA9IENvbG9yMy5mcm9tUkdCKDI1LCAyNSwgMjUpLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCAxODAs",
+"IDAsIDE5MCksCiAgICAgICAgICAgICAgICBaSW5kZXggPSAxMDAsCiAgICAgICAgICAgICAgICBWaXNpYmxlID0gZmFsc2UKICAg",
+"ICAgICAgICAgfSkKICAgICAgICAgICAgCiAgICAgICAgICAgIGxvY2FsIEZsb2F0UGlja2VyU2NhbGUgPSBjcmVhdGVJbnN0YW5j",
+"ZSgnVUlTY2FsZScsIHtQYXJlbnQgPSBGbG9hdFBpY2tlciwgU2NhbGUgPSBDdXJyZW50U2NhbGV9KQogICAgICAgICAgICB0YWJs",
+"ZS5pbnNlcnQoU2NhbGVzVG9VcGRhdGUsIEZsb2F0UGlja2VyU2NhbGUpCgogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlD",
+"b3JuZXInLCB7UGFyZW50ID0gRmxvYXRQaWNrZXIsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDYpfSkKICAgICAgICAgICAg",
+"bG9jYWwgRmxvYXRQaWNrZXJTdHJva2UgPSBjcmVhdGVJbnN0YW5jZSgnVUlTdHJva2UnLCB7UGFyZW50ID0gRmxvYXRQaWNrZXIs",
+"IENvbG9yID0gVGhlbWUuQm9yZGVyfSkKICAgICAgICAgICAgcmVnVGhlbWUoRmxvYXRQaWNrZXJTdHJva2UsIGZ1bmN0aW9uKCkg",
+"RmxvYXRQaWNrZXJTdHJva2UuQ29sb3IgPSBUaGVtZS5Cb3JkZXIgZW5kKQogICAgICAgICAgICByZWdUaGVtZShGbG9hdFBpY2tl",
+"ciwgZnVuY3Rpb24oKSBGbG9hdFBpY2tlci5CYWNrZ3JvdW5kQ29sb3IzID0gVGhlbWUuRWxlbWVudEJHIGVuZCkKCiAgICAgICAg",
+"ICAgIGxvY2FsIFNhdFZhbE1hcCA9IGNyZWF0ZUluc3RhbmNlKCdJbWFnZUJ1dHRvbicsIHsKICAgICAgICAgICAgICAgIFBhcmVu",
+"dCA9IEZsb2F0UGlja2VyLAogICAgICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IENvbG9yMy5mcm9tSFNWKGgsIDEsIDEp",
+"LAogICAgICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMTAsIDAsIDEwKSwKICAgICAgICAgICAgICAgIFNpemUg",
+"PSBVRGltMi5uZXcoMCwgMTMwLCAwLCAxMzApLAogICAgICAgICAgICAgICAgSW1hZ2UgPSAncmJ4YXNzZXRpZDovLzQxNTU4MDEy",
+"NTInLAogICAgICAgICAgICAgICAgQXV0b0J1dHRvbkNvbG9yID0gZmFsc2UKICAgICAgICAgICAgfSkKICAgICAgICAgICAgY3Jl",
+"YXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IFNhdFZhbE1hcCwgQ29ybmVyUmFkaXVzID0gVURpbS5uZXcoMCwgNCl9",
+"KQoKICAgICAgICAgICAgbG9jYWwgU1ZLbm9iID0gY3JlYXRlSW5zdGFuY2UoJ0ZyYW1lJywgewogICAgICAgICAgICAgICAgUGFy",
+"ZW50ID0gU2F0VmFsTWFwLAogICAgICAgICAgICAgICAgQmFja2dyb3VuZENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDI1NSwgMjU1",
+"LCAyNTUpLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCA0LCAwLCA0KSwKICAgICAgICAgICAgICAgIEFuY2hv",
+"clBvaW50ID0gVmVjdG9yMi5uZXcoMC41LCAwLjUpLAogICAgICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcocywgMCwg",
+"MSAtIHYsIDApCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIGNyZWF0ZUluc3RhbmNlKCdVSUNvcm5lcicsIHtQYXJlbnQgPSBT",
+"Vktub2IsIENvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDEsIDApfSkKICAgICAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJU3Ryb2tl",
+"Jywge1BhcmVudCA9IFNWS25vYiwgQ29sb3IgPSBDb2xvcjMuZnJvbVJHQigwLCAwLCAwKX0pCgogICAgICAgICAgICBsb2NhbCBI",
+"dWVNYXAgPSBjcmVhdGVJbnN0YW5jZSgnSW1hZ2VCdXR0b24nLCB7CiAgICAgICAgICAgICAgICBQYXJlbnQgPSBGbG9hdFBpY2tl",
+"ciwKICAgICAgICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAsIDE1MCwgMCwgMTApLAogICAgICAgICAgICAgICAgU2l6",
+"ZSA9IFVEaW0yLm5ldygwLCAyMCwgMCwgMTMwKSwKICAgICAgICAgICAgICAgIEJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJv",
+"bVJHQigyNTUsIDI1NSwgMjU1KSwKICAgICAgICAgICAgICAgIEF1dG9CdXR0b25Db2xvciA9IGZhbHNlLAogICAgICAgICAgICAg",
+"ICAgSW1hZ2UgPSAnJwogICAgICAgICAgICB9KQogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlDb3JuZXInLCB7UGFyZW50",
+"ID0gSHVlTWFwLCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA0KX0pCgogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlH",
+"cmFkaWVudCcsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IEh1ZU1hcCwKICAgICAgICAgICAgICAgIENvbG9yID0gQ29sb3JT",
+"ZXF1ZW5jZS5uZXcoewogICAgICAgICAgICAgICAgICAgIENvbG9yU2VxdWVuY2VLZXlwb2ludC5uZXcoMCwgQ29sb3IzLmZyb21S",
+"R0IoMjU1LCAwLCAwKSksCiAgICAgICAgICAgICAgICAgICAgQ29sb3JTZXF1ZW5jZUtleXBvaW50Lm5ldygwLjE2NywgQ29sb3Iz",
+"LmZyb21SR0IoMjU1LCAyNTUsIDApKSwKICAgICAgICAgICAgICAgICAgICBDb2xvclNlcXVlbmNlS2V5cG9pbnQubmV3KDAuMzMz",
+"LCBDb2xvcjMuZnJvbVJHQigwLCAyNTUsIDApKSwKICAgICAgICAgICAgICAgICAgICBDb2xvclNlcXVlbmNlS2V5cG9pbnQubmV3",
+"KDAuNSwgQ29sb3IzLmZyb21SR0IoMCwgMjU1LCAyNTUpKSwKICAgICAgICAgICAgICAgICAgICBDb2xvclNlcXVlbmNlS2V5cG9p",
+"bnQubmV3KDAuNjY3LCBDb2xvcjMuZnJvbVJHQigwLCAwLCAyNTUpKSwKICAgICAgICAgICAgICAgICAgICBDb2xvclNlcXVlbmNl",
+"S2V5cG9pbnQubmV3KDAuODMzLCBDb2xvcjMuZnJvbVJHQigyNTUsIDAsIDI1NSkpLAogICAgICAgICAgICAgICAgICAgIENvbG9y",
+"U2VxdWVuY2VLZXlwb2ludC5uZXcoMSwgQ29sb3IzLmZyb21SR0IoMjU1LCAwLCAwKSkKICAgICAgICAgICAgICAgIH0pLAogICAg",
+"ICAgICAgICAgICAgUm90YXRpb24gPSA5MAogICAgICAgICAgICB9KQoKICAgICAgICAgICAgbG9jYWwgSHVlS25vYiA9IGNyZWF0",
+"ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IEh1ZU1hcCwKICAgICAgICAgICAgICAgIEJhY2tn",
+"cm91bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KSwKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5u",
+"ZXcoMSwgNCwgMCwgNCksCiAgICAgICAgICAgICAgICBBbmNob3JQb2ludCA9IFZlY3RvcjIubmV3KDAuNSwgMC41KSwKICAgICAg",
+"ICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAuNSwgMCwgMSAtIGgsIDApCiAgICAgICAgICAgIH0pCiAgICAgICAgICAg",
+"IGNyZWF0ZUluc3RhbmNlKCdVSVN0cm9rZScsIHtQYXJlbnQgPSBIdWVLbm9iLCBDb2xvciA9IENvbG9yMy5mcm9tUkdCKDAsIDAs",
+"IDApfSkKCiAgICAgICAgICAgIGxvY2FsIEhleEJveCA9IGNyZWF0ZUluc3RhbmNlKCdUZXh0Qm94JywgewogICAgICAgICAgICAg",
+"ICAgUGFyZW50ID0gRmxvYXRQaWNrZXIsCiAgICAgICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAxMCwgMCwgMTUw",
+"KSwKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgNzUsIDAsIDI0KSwKICAgICAgICAgICAgICAgIEJhY2tncm91",
+"bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigzNSwgMzUsIDM1KSwKICAgICAgICAgICAgICAgIFRleHRDb2xvcjMgPSBDb2xvcjMu",
+"ZnJvbVJHQigyNTUsIDI1NSwgMjU1KSwKICAgICAgICAgICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtLAogICAgICAgICAg",
+"ICAgICAgVGV4dFNpemUgPSAxMSwKICAgICAgICAgICAgICAgIFRleHQgPSBjdXJyZW50Q29sb3I6VG9IZXgoKSwKICAgICAgICAg",
+"ICAgICAgIENsZWFyVGV4dE9uRm9jdXMgPSBmYWxzZQogICAgICAgICAgICB9KQogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgn",
+"VUlDb3JuZXInLCB7UGFyZW50ID0gSGV4Qm94LCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA0KX0pCiAgICAgICAgICAgIHJl",
+"Z1RoZW1lKEhleEJveCwgZnVuY3Rpb24oKSBIZXhCb3guQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRyBlbmQpCgogICAg",
+"ICAgICAgICBsb2NhbCBSR0JCb3ggPSBjcmVhdGVJbnN0YW5jZSgnVGV4dEJveCcsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9",
+"IEZsb2F0UGlja2VyLAogICAgICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgOTUsIDAsIDE1MCksCiAgICAgICAg",
+"ICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDc1LCAwLCAyNCksCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kQ29sb3IzID0g",
+"Q29sb3IzLmZyb21SR0IoMzUsIDM1LCAzNSksCiAgICAgICAgICAgICAgICBUZXh0Q29sb3IzID0gQ29sb3IzLmZyb21SR0IoMjU1",
+"LCAyNTUsIDI1NSksCiAgICAgICAgICAgICAgICBGb250ID0gRW51bS5Gb250LkdvdGhhbSwKICAgICAgICAgICAgICAgIFRleHRT",
+"aXplID0gMTEsCiAgICAgICAgICAgICAgICBUZXh0ID0gbWF0aC5mbG9vcihjdXJyZW50Q29sb3IuUioyNTUpLi4nLCAnLi5tYXRo",
+"LmZsb29yKGN1cnJlbnRDb2xvci5HKjI1NSkuLicsICcuLm1hdGguZmxvb3IoY3VycmVudENvbG9yLkIqMjU1KSwKICAgICAgICAg",
+"ICAgICAgIENsZWFyVGV4dE9uRm9jdXMgPSBmYWxzZQogICAgICAgICAgICB9KQogICAgICAgICAgICBjcmVhdGVJbnN0YW5jZSgn",
+"VUlDb3JuZXInLCB7UGFyZW50ID0gUkdCQm94LCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA0KX0pCiAgICAgICAgICAgIHJl",
+"Z1RoZW1lKFJHQkJveCwgZnVuY3Rpb24oKSBSR0JCb3guQmFja2dyb3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRyBlbmQpCgogICAg",
+"ICAgICAgICBTZXR1cFRvb2x0aXAoQ29udGFpbmVyLCBvcHRpb25zLlRpcCkKCiAgICAgICAgICAgIGxvY2FsIFVwZGF0ZUNvbG9y",
+"ID0gZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgY3VycmVudENvbG9yID0gQ29sb3IzLmZyb21IU1YoaCwgcywgdikKICAgICAg",
+"ICAgICAgICAgIENvbG9yVmlldy5CYWNrZ3JvdW5kQ29sb3IzID0gY3VycmVudENvbG9yCiAgICAgICAgICAgICAgICBTYXRWYWxN",
+"YXAuQmFja2dyb3VuZENvbG9yMyA9IENvbG9yMy5mcm9tSFNWKGgsIDEsIDEpCiAgICAgICAgICAgICAgICBIZXhCb3guVGV4dCA9",
+"IGN1cnJlbnRDb2xvcjpUb0hleCgpCiAgICAgICAgICAgICAgICBSR0JCb3guVGV4dCA9IG1hdGguZmxvb3IoY3VycmVudENvbG9y",
+"LlIqMjU1KS4uJywgJy4ubWF0aC5mbG9vcihjdXJyZW50Q29sb3IuRyoyNTUpLi4nLCAnLi5tYXRoLmZsb29yKGN1cnJlbnRDb2xv",
+"ci5CKjI1NSkKICAgICAgICAgICAgICAgIEVsZW1lbnQuVmFsdWUgPSBjdXJyZW50Q29sb3IKICAgICAgICAgICAgICAgIEFlcm9M",
+"aWIuRmxhZ3NbRWxlbWVudE5hbWVdLlZhbHVlID0gY3VycmVudENvbG9yCiAgICAgICAgICAgICAgICBDYWxsYmFjayhjdXJyZW50",
+"Q29sb3IpCiAgICAgICAgICAgIGVuZAoKICAgICAgICAgICAgSGV4Qm94LkZvY3VzTG9zdDpDb25uZWN0KGZ1bmN0aW9uKCkKICAg",
+"ICAgICAgICAgICAgIGxvY2FsIHN1Y2Nlc3MsIGNvbG9yID0gcGNhbGwoZnVuY3Rpb24oKSByZXR1cm4gQ29sb3IzLmZyb21IZXgo",
+"SGV4Qm94LlRleHQpIGVuZCkKICAgICAgICAgICAgICAgIGlmIHN1Y2Nlc3MgdGhlbgogICAgICAgICAgICAgICAgICAgIGN1cnJl",
+"bnRDb2xvciA9IGNvbG9yCiAgICAgICAgICAgICAgICAgICAgaCwgcywgdiA9IENvbG9yMy50b0hTVihjdXJyZW50Q29sb3IpCiAg",
+"ICAgICAgICAgICAgICAgICAgU1ZLbm9iLlBvc2l0aW9uID0gVURpbTIubmV3KHMsIDAsIDEgLSB2LCAwKQogICAgICAgICAgICAg",
+"ICAgICAgIEh1ZUtub2IuUG9zaXRpb24gPSBVRGltMi5uZXcoMC41LCAwLCAxIC0gaCwgMCkKICAgICAgICAgICAgICAgICAgICBV",
+"cGRhdGVDb2xvcigpCiAgICAgICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICAgICAgSGV4Qm94LlRleHQgPSBjdXJyZW50",
+"Q29sb3I6VG9IZXgoKQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGVuZCkKCiAgICAgICAgICAgIFJHQkJveC5Gb2N1",
+"c0xvc3Q6Q29ubmVjdChmdW5jdGlvbigpCiAgICAgICAgICAgICAgICBsb2NhbCByLCBnLCBiID0gUkdCQm94LlRleHQ6bWF0Y2go",
+"JyglZCspWyVzLF0rKCVkKylbJXMsXSsoJWQrKScpCiAgICAgICAgICAgICAgICBpZiByIGFuZCBnIGFuZCBiIHRoZW4KICAgICAg",
+"ICAgICAgICAgICAgICBjdXJyZW50Q29sb3IgPSBDb2xvcjMuZnJvbVJHQih0b251bWJlcihyKSwgdG9udW1iZXIoZyksIHRvbnVt",
+"YmVyKGIpKQogICAgICAgICAgICAgICAgICAgIGgsIHMsIHYgPSBDb2xvcjMudG9IU1YoY3VycmVudENvbG9yKQogICAgICAgICAg",
+"ICAgICAgICAgIFNWS25vYi5Qb3NpdGlvbiA9IFVEaW0yLm5ldyhzLCAwLCAxIC0gdiwgMCkKICAgICAgICAgICAgICAgICAgICBI",
+"dWVLbm9iLlBvc2l0aW9uID0gVURpbTIubmV3KDAuNSwgMCwgMSAtIGgsIDApCiAgICAgICAgICAgICAgICAgICAgVXBkYXRlQ29s",
+"b3IoKQogICAgICAgICAgICAgICAgZWxzZQogICAgICAgICAgICAgICAgICAgIFJHQkJveC5UZXh0ID0gbWF0aC5mbG9vcihjdXJy",
+"ZW50Q29sb3IuUioyNTUpLi4nLCAnLi5tYXRoLmZsb29yKGN1cnJlbnRDb2xvci5HKjI1NSkuLicsICcuLm1hdGguZmxvb3IoY3Vy",
+"cmVudENvbG9yLkIqMjU1KQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIGRy",
+"YWdnaW5nU1YgPSBmYWxzZQogICAgICAgICAgICBTYXRWYWxNYXAuSW5wdXRCZWdhbjpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQog",
+"ICAgICAgICAgICAgICAgaWYgaW5wdXQuVXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VCdXR0b24xIG9y",
+"IGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2VySW5wdXRUeXBlLlRvdWNoIHRoZW4gZHJhZ2dpbmdTViA9IHRydWUgZW5k",
+"CiAgICAgICAgICAgIGVuZCkKICAgICAgICAgICAgbG9jYWwgZHJhZ2dpbmdIdWUgPSBmYWxzZQogICAgICAgICAgICBIdWVNYXAu",
+"SW5wdXRCZWdhbjpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgICAgICAgICAgaWYgaW5wdXQuVXNlcklucHV0VHlwZSA9",
+"PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VCdXR0b24xIG9yIGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2VySW5wdXRU",
+"eXBlLlRvdWNoIHRoZW4gZHJhZ2dpbmdIdWUgPSB0cnVlIGVuZAogICAgICAgICAgICBlbmQpCiAgICAgICAgICAgIFVzZXJJbnB1",
+"dFNlcnZpY2UuSW5wdXRFbmRlZDpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgICAgICAgICAgaWYgaW5wdXQuVXNlcklu",
+"cHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VCdXR0b24xIG9yIGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5V",
+"c2VySW5wdXRUeXBlLlRvdWNoIHRoZW4KICAgICAgICAgICAgICAgICAgICBkcmFnZ2luZ1NWID0gZmFsc2UKICAgICAgICAgICAg",
+"ICAgICAgICBkcmFnZ2luZ0h1ZSA9IGZhbHNlCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kKQogICAgICAgICAg",
+"ICBVc2VySW5wdXRTZXJ2aWNlLklucHV0Q2hhbmdlZDpDb25uZWN0KGZ1bmN0aW9uKGlucHV0KQogICAgICAgICAgICAgICAgaWYg",
+"aW5wdXQuVXNlcklucHV0VHlwZSA9PSBFbnVtLlVzZXJJbnB1dFR5cGUuTW91c2VNb3ZlbWVudCBvciBpbnB1dC5Vc2VySW5wdXRU",
+"eXBlID09IEVudW0uVXNlcklucHV0VHlwZS5Ub3VjaCB0aGVuCiAgICAgICAgICAgICAgICAgICAgaWYgZHJhZ2dpbmdTViB0aGVu",
+"CiAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIHBjdFggPSBtYXRoLmNsYW1wKChpbnB1dC5Qb3NpdGlvbi5YIC0gU2F0VmFs",
+"TWFwLkFic29sdXRlUG9zaXRpb24uWCkgLyBTYXRWYWxNYXAuQWJzb2x1dGVTaXplLlgsIDAsIDEpCiAgICAgICAgICAgICAgICAg",
+"ICAgICAgIGxvY2FsIHBjdFkgPSBtYXRoLmNsYW1wKChpbnB1dC5Qb3NpdGlvbi5ZIC0gU2F0VmFsTWFwLkFic29sdXRlUG9zaXRp",
+"b24uWSkgLyBTYXRWYWxNYXAuQWJzb2x1dGVTaXplLlksIDAsIDEpCiAgICAgICAgICAgICAgICAgICAgICAgIHMgPSBwY3RYCiAg",
+"ICAgICAgICAgICAgICAgICAgICAgIHYgPSAxIC0gcGN0WQogICAgICAgICAgICAgICAgICAgICAgICBTVktub2IuUG9zaXRpb24g",
+"PSBVRGltMi5uZXcocywgMCwgMSAtIHYsIDApCiAgICAgICAgICAgICAgICAgICAgICAgIFVwZGF0ZUNvbG9yKCkKICAgICAgICAg",
+"ICAgICAgICAgICBlbHNlaWYgZHJhZ2dpbmdIdWUgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICBsb2NhbCBwY3RZID0gbWF0",
+"aC5jbGFtcCgoaW5wdXQuUG9zaXRpb24uWSAtIEh1ZU1hcC5BYnNvbHV0ZVBvc2l0aW9uLlkpIC8gSHVlTWFwLkFic29sdXRlU2l6",
+"ZS5ZLCAwLCAxKQogICAgICAgICAgICAgICAgICAgICAgICBoID0gMSAtIHBjdFkKICAgICAgICAgICAgICAgICAgICAgICAgSHVl",
+"S25vYi5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLjUsIDAsIDEgLSBoLCAwKQogICAgICAgICAgICAgICAgICAgICAgICBVcGRhdGVD",
+"b2xvcigpCiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kKQoKICAgICAg",
+"ICAgICAgQ29udGFpbmVyLk1vdXNlQnV0dG9uMUNsaWNrOkNvbm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgRmxvYXRQ",
+"aWNrZXIuUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgQ29sb3JWaWV3LkFic29sdXRlUG9zaXRpb24uWCAtICgxNDAgKiBDdXJyZW50",
+"U2NhbGUpLCAwLCBDb2xvclZpZXcuQWJzb2x1dGVQb3NpdGlvbi5ZICsgKDI4ICogQ3VycmVudFNjYWxlKSkKICAgICAgICAgICAg",
+"ICAgIEZsb2F0UGlja2VyLlZpc2libGUgPSBub3QgRmxvYXRQaWNrZXIuVmlzaWJsZQogICAgICAgICAgICBlbmQpCgogICAgICAg",
+"ICAgICBVc2VySW5wdXRTZXJ2aWNlLklucHV0QmVnYW46Q29ubmVjdChmdW5jdGlvbihpbnB1dCkKICAgICAgICAgICAgICAgIGlm",
+"IGlucHV0LlVzZXJJbnB1dFR5cGUgPT0gRW51bS5Vc2VySW5wdXRUeXBlLk1vdXNlQnV0dG9uMSBvciBpbnB1dC5Vc2VySW5wdXRU",
+"eXBlID09IEVudW0uVXNlcklucHV0VHlwZS5Ub3VjaCB0aGVuCiAgICAgICAgICAgICAgICAgICAgbG9jYWwgcG9zID0gaW5wdXQu",
+"UG9zaXRpb24KICAgICAgICAgICAgICAgICAgICBpZiBGbG9hdFBpY2tlci5WaXNpYmxlIHRoZW4KICAgICAgICAgICAgICAgICAg",
+"ICAgICAgbG9jYWwgeDEsIHkxID0gRmxvYXRQaWNrZXIuQWJzb2x1dGVQb3NpdGlvbi5YLCBGbG9hdFBpY2tlci5BYnNvbHV0ZVBv",
+"c2l0aW9uLlkKICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgeDIsIHkyID0geDEgKyBGbG9hdFBpY2tlci5BYnNvbHV0ZVNp",
+"emUuWCwgeTEgKyBGbG9hdFBpY2tlci5BYnNvbHV0ZVNpemUuWQogICAgICAgICAgICAgICAgICAgICAgICBsb2NhbCBjeDEsIGN5",
+"MSA9IENvbnRhaW5lci5BYnNvbHV0ZVBvc2l0aW9uLlgsIENvbnRhaW5lci5BYnNvbHV0ZVBvc2l0aW9uLlkKICAgICAgICAgICAg",
+"ICAgICAgICAgICAgbG9jYWwgY3gyLCBjeTIgPSBjeDEgKyBDb250YWluZXIuQWJzb2x1dGVTaXplLlgsIGN5MSArIENvbnRhaW5l",
+"ci5BYnNvbHV0ZVNpemUuWQogICAgICAgICAgICAgICAgICAgICAgICBpZiBub3QgKHBvcy5YID49IHgxIGFuZCBwb3MuWCA8PSB4",
+"MiBhbmQgcG9zLlkgPj0geTEgYW5kIHBvcy5ZIDw9IHkyKSBhbmQgbm90IChwb3MuWCA+PSBjeDEgYW5kIHBvcy5YIDw9IGN4MiBh",
+"bmQgcG9zLlkgPj0gY3kxIGFuZCBwb3MuWSA8PSBjeTIpIHRoZW4KICAgICAgICAgICAgICAgICAgICAgICAgICAgIEZsb2F0UGlj",
+"a2VyLlZpc2libGUgPSBmYWxzZQogICAgICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgICAgICBlbmQKICAg",
+"ICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQpCiAgICAgICAgICAgIAogICAgICAgICAgICBmdW5jdGlvbiBFbGVtZW50",
+"OlNldCh2YWwpCiAgICAgICAgICAgICAgICBjdXJyZW50Q29sb3IgPSB2YWwKICAgICAgICAgICAgICAgIGgsIHMsIHYgPSBDb2xv",
+"cjMudG9IU1YoY3VycmVudENvbG9yKQogICAgICAgICAgICAgICAgU1ZLbm9iLlBvc2l0aW9uID0gVURpbTIubmV3KHMsIDAsIDEg",
+"LSB2LCAwKQogICAgICAgICAgICAgICAgSHVlS25vYi5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLjUsIDAsIDEgLSBoLCAwKQogICAg",
+"ICAgICAgICAgICAgVXBkYXRlQ29sb3IoKQogICAgICAgICAgICBlbmQKCiAgICAgICAgICAgIHJldHVybiBFbGVtZW50CiAgICAg",
+"ICAgZW5kCgogICAgICAgIEJ1aWxkZXIuQ3JlYXRlS2V5YmluZCA9IGZ1bmN0aW9uKHNlbGYsIG9wdGlvbnMpCiAgICAgICAgICAg",
+"IGxvY2FsIEVsZW1lbnROYW1lID0gb3B0aW9ucy5OYW1lIG9yICdLZXliaW5kJwogICAgICAgICAgICBsb2NhbCBEZWZhdWx0ID0g",
+"b3B0aW9ucy5EZWZhdWx0IG9yIEVudW0uS2V5Q29kZS5FCiAgICAgICAgICAgIGxvY2FsIENhbGxiYWNrID0gb3B0aW9ucy5DYWxs",
+"YmFjayBvciBmdW5jdGlvbigpIGVuZAogICAgICAgICAgICBsb2NhbCBjdXJyZW50QmluZCA9IERlZmF1bHQKICAgICAgICAgICAg",
+"CiAgICAgICAgICAgIGxvY2FsIEVsZW1lbnQgPSB7IFZhbHVlID0gY3VycmVudEJpbmQgfQogICAgICAgICAgICBBZXJvTGliLkZs",
+"YWdzW0VsZW1lbnROYW1lXSA9IEVsZW1lbnQKCiAgICAgICAgICAgIGxvY2FsIEJpbmRGcmFtZSA9IGNyZWF0ZUluc3RhbmNlKCdG",
+"cmFtZScsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IFBhZ2VUYXJnZXQsCiAgICAgICAgICAgICAgICBCYWNrZ3JvdW5kQ29s",
+"b3IzID0gVGhlbWUuRWxlbWVudEJHLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAwLCAzNikKICAgICAg",
+"ICAgICAgfSkKICAgICAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJQ29ybmVyJywge1BhcmVudCA9IEJpbmRGcmFtZSwgQ29ybmVy",
+"UmFkaXVzID0gVURpbS5uZXcoMCwgNCl9KQogICAgICAgICAgICByZWdUaGVtZShCaW5kRnJhbWUsIGZ1bmN0aW9uKCkgQmluZEZy",
+"YW1lLkJhY2tncm91bmRDb2xvcjMgPSBUaGVtZS5FbGVtZW50QkcgZW5kKQogICAgICAgICAgICB0YWJsZS5pbnNlcnQoV2luZG93",
+"T2JqLkVsZW1lbnRzTGlzdCwge05hbWUgPSBFbGVtZW50TmFtZSwgRnJhbWUgPSBCaW5kRnJhbWUsIFRhYiA9IFBhcmVudFRhYn0p",
+"CgogICAgICAgICAgICBsb2NhbCBUaXRsZUxhYmVsID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRMYWJlbCcsIHsKICAgICAgICAgICAg",
+"ICAgIFBhcmVudCA9IEJpbmRGcmFtZSwKICAgICAgICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxLAogICAgICAg",
+"ICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMTIsIDAsIDApLAogICAgICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5l",
+"dygxLCAtMTIwLCAxLCAwKSwKICAgICAgICAgICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290aGFtTWVkaXVtLAogICAgICAgICAg",
+"ICAgICAgVGV4dCA9IEVsZW1lbnROYW1lLAogICAgICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWIsCiAgICAg",
+"ICAgICAgICAgICBUZXh0U2l6ZSA9IDEzLAogICAgICAgICAgICAgICAgVGV4dFhBbGlnbm1lbnQgPSBFbnVtLlRleHRYQWxpZ25t",
+"ZW50LkxlZnQKICAgICAgICAgICAgfSkKICAgICAgICAgICAgcmVnVGhlbWUoVGl0bGVMYWJlbCwgZnVuY3Rpb24oKSBUaXRsZUxh",
+"YmVsLlRleHRDb2xvcjMgPSBUaGVtZS5UZXh0U3ViIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIEJpbmRDb250YWluZXIgPSBjcmVh",
+"dGVJbnN0YW5jZSgnRnJhbWUnLCB7CiAgICAgICAgICAgICAgICBQYXJlbnQgPSBCaW5kRnJhbWUsCiAgICAgICAgICAgICAgICBB",
+"bmNob3JQb2ludCA9IFZlY3RvcjIubmV3KDEsIDAuNSksCiAgICAgICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygxLCAt",
+"NiwgMC41LCAwKSwKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMCwgNjAsIDAsIDIyKSwKICAgICAgICAgICAgICAg",
+"IEJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigzNSwgMzUsIDM1KQogICAgICAgICAgICB9KQogICAgICAgICAgICBj",
+"cmVhdGVJbnN0YW5jZSgnVUlDb3JuZXInLCB7UGFyZW50ID0gQmluZENvbnRhaW5lciwgQ29ybmVyUmFkaXVzID0gVURpbS5uZXco",
+"MCwgNCl9KQogICAgICAgICAgICByZWdUaGVtZShCaW5kQ29udGFpbmVyLCBmdW5jdGlvbigpIEJpbmRDb250YWluZXIuQmFja2dy",
+"b3VuZENvbG9yMyA9IFRoZW1lLk1haW5CRyBlbmQpCiAgICAgICAgICAgIAogICAgICAgICAgICBsb2NhbCBCaW5kQ29udGFpbmVy",
+"U3Ryb2tlID0gY3JlYXRlSW5zdGFuY2UoJ1VJU3Ryb2tlJywge1BhcmVudCA9IEJpbmRDb250YWluZXIsIENvbG9yID0gVGhlbWUu",
+"Qm9yZGVyfSkKICAgICAgICAgICAgcmVnVGhlbWUoQmluZENvbnRhaW5lclN0cm9rZSwgZnVuY3Rpb24oKSBCaW5kQ29udGFpbmVy",
+"U3Ryb2tlLkNvbG9yID0gVGhlbWUuQm9yZGVyIGVuZCkKCiAgICAgICAgICAgIGxvY2FsIEJpbmRCdG4gPSBjcmVhdGVJbnN0YW5j",
+"ZSgnVGV4dEJ1dHRvbicsIHsKICAgICAgICAgICAgICAgIFBhcmVudCA9IEJpbmRDb250YWluZXIsCiAgICAgICAgICAgICAgICBC",
+"YWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMSwgMCksCiAg",
+"ICAgICAgICAgICAgICBUZXh0ID0gY3VycmVudEJpbmQuTmFtZSwKICAgICAgICAgICAgICAgIEZvbnQgPSBFbnVtLkZvbnQuR290",
+"aGFtLAogICAgICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWIsCiAgICAgICAgICAgICAgICBUZXh0U2l6ZSA9",
+"IDExCiAgICAgICAgICAgIH0pCgogICAgICAgICAgICBTZXR1cFRvb2x0aXAoQmluZEZyYW1lLCBvcHRpb25zLlRpcCkKCiAgICAg",
+"ICAgICAgIGxvY2FsIFVwZGF0ZUJpbmRTaXplID0gZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgbG9jYWwgYmluZE5hbWUgPSBj",
+"dXJyZW50QmluZCBhbmQgY3VycmVudEJpbmQuTmFtZSBvciAnTm9uZScKICAgICAgICAgICAgICAgIEJpbmRCdG4uVGV4dCA9IGJp",
+"bmROYW1lCiAgICAgICAgICAgICAgICBsb2NhbCB0ZXh0Qm91bmRzID0gVGV4dFNlcnZpY2U6R2V0VGV4dFNpemUoYmluZE5hbWUs",
+"IDExLCBFbnVtLkZvbnQuR290aGFtLCBWZWN0b3IyLm5ldygxMDAwLCAyMikpCiAgICAgICAgICAgICAgICBCaW5kQ29udGFpbmVy",
+"LlNpemUgPSBVRGltMi5uZXcoMCwgbWF0aC5tYXgodGV4dEJvdW5kcy5YICsgMTYsIDQwKSwgMCwgMjIpCiAgICAgICAgICAgIGVu",
+"ZAogICAgICAgICAgICBVcGRhdGVCaW5kU2l6ZSgpCgogICAgICAgICAgICBsb2NhbCBpc0JpbmRpbmcgPSBmYWxzZQogICAgICAg",
+"ICAgICBCaW5kQnRuLk1vdXNlQnV0dG9uMUNsaWNrOkNvbm5lY3QoZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgaXNCaW5kaW5n",
+"ID0gdHJ1ZQogICAgICAgICAgICAgICAgQmluZEJ0bi5UZXh0ID0gJy4uLicKICAgICAgICAgICAgICAgIEJpbmRDb250YWluZXIu",
+"U2l6ZSA9IFVEaW0yLm5ldygwLCA0MCwgMCwgMjIpCiAgICAgICAgICAgIGVuZCkKCiAgICAgICAgICAgIFVzZXJJbnB1dFNlcnZp",
+"Y2UuSW5wdXRCZWdhbjpDb25uZWN0KGZ1bmN0aW9uKGlucHV0LCBncGUpCiAgICAgICAgICAgICAgICBpZiBpc0JpbmRpbmcgYW5k",
+"IChpbnB1dC5Vc2VySW5wdXRUeXBlID09IEVudW0uVXNlcklucHV0VHlwZS5LZXlib2FyZCBvciBpbnB1dC5Vc2VySW5wdXRUeXBl",
+"ID09IEVudW0uVXNlcklucHV0VHlwZS5HYW1lcGFkMSkgdGhlbgogICAgICAgICAgICAgICAgICAgIGN1cnJlbnRCaW5kID0gaW5w",
+"dXQuS2V5Q29kZQogICAgICAgICAgICAgICAgICAgIGlzQmluZGluZyA9IGZhbHNlCiAgICAgICAgICAgICAgICAgICAgVXBkYXRl",
+"QmluZFNpemUoKQogICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAgIEVsZW1lbnQuVmFsdWUgPSBjdXJyZW50",
+"QmluZAogICAgICAgICAgICAgICAgICAgIEFlcm9MaWIuRmxhZ3NbRWxlbWVudE5hbWVdLlZhbHVlID0gY3VycmVudEJpbmQKICAg",
+"ICAgICAgICAgICAgICAgICBDYWxsYmFjayhjdXJyZW50QmluZCkKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQp",
+"CiAgICAgICAgICAgIAogICAgICAgICAgICBmdW5jdGlvbiBFbGVtZW50OlNldCh2YWwpCiAgICAgICAgICAgICAgICBjdXJyZW50",
+"QmluZCA9IHZhbAogICAgICAgICAgICAgICAgVXBkYXRlQmluZFNpemUoKQogICAgICAgICAgICAgICAgRWxlbWVudC5WYWx1ZSA9",
+"IGN1cnJlbnRCaW5kCiAgICAgICAgICAgICAgICBBZXJvTGliLkZsYWdzW0VsZW1lbnROYW1lXS5WYWx1ZSA9IGN1cnJlbnRCaW5k",
+"CiAgICAgICAgICAgICAgICBDYWxsYmFjayhjdXJyZW50QmluZCkKICAgICAgICAgICAgZW5kCgogICAgICAgICAgICByZXR1cm4g",
+"RWxlbWVudAogICAgICAgIGVuZAoKICAgICAgICByZXR1cm4gc2V0bWV0YXRhYmxlKEJ1aWxkZXIsIHtfX2luZGV4ID0gQnVpbGRl",
+"cn0pCiAgICBlbmQKCiAgICBsb2NhbCBIb21lQm9keSA9IE1hc3RlckNvbnRhaW5lcnNbJ0hvbWUnXQogICAgbG9jYWwgU2lkZWJh",
+"ciA9IGNyZWF0ZUluc3RhbmNlKCdTY3JvbGxpbmdGcmFtZScsIHsKICAgICAgICBQYXJlbnQgPSBIb21lQm9keSwKICAgICAgICBC",
+"YWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICBTaXplID0gVURpbTIubmV3KDAsIDE2MCwgMSwgMCksCiAgICAgICAg",
+"Qm9yZGVyU2l6ZVBpeGVsID0gMCwKICAgICAgICBTY3JvbGxCYXJUaGlja25lc3MgPSAwLAogICAgICAgIEF1dG9tYXRpY0NhbnZh",
+"c1NpemUgPSBFbnVtLkF1dG9tYXRpY1NpemUuWSwKICAgICAgICBDYW52YXNTaXplID0gVURpbTIubmV3KDAsIDAsIDAsIDApCiAg",
+"ICB9KQoKICAgIGNyZWF0ZUluc3RhbmNlKCdVSUxpc3RMYXlvdXQnLCB7CiAgICAgICAgUGFyZW50ID0gU2lkZWJhciwKICAgICAg",
+"ICBTb3J0T3JkZXIgPSBFbnVtLlNvcnRPcmRlci5MYXlvdXRPcmRlciwKICAgICAgICBQYWRkaW5nID0gVURpbS5uZXcoMCwgNCkK",
+"ICAgIH0pCiAgICAKICAgIGNyZWF0ZUluc3RhbmNlKCdVSVBhZGRpbmcnLCB7CiAgICAgICAgUGFyZW50ID0gU2lkZWJhciwKICAg",
+"ICAgICBQYWRkaW5nVG9wID0gVURpbS5uZXcoMCwgMTApLAogICAgICAgIFBhZGRpbmdMZWZ0ID0gVURpbS5uZXcoMCwgOCksCiAg",
+"ICAgICAgUGFkZGluZ1JpZ2h0ID0gVURpbS5uZXcoMCwgOCkKICAgIH0pCgogICAgbG9jYWwgQ29udGVudENvbnRhaW5lciA9IGNy",
+"ZWF0ZUluc3RhbmNlKCdGcmFtZScsIHsKICAgICAgICBQYXJlbnQgPSBIb21lQm9keSwKICAgICAgICBCYWNrZ3JvdW5kVHJhbnNw",
+"YXJlbmN5ID0gMSwKICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAxNjAsIDAsIDApLAogICAgICAgIFNpemUgPSBVRGlt",
+"Mi5uZXcoMSwgLTE2MCwgMSwgMCkKICAgIH0pCgogICAgV2luZG93T2JqLkNyZWF0ZVRhYiA9IGZ1bmN0aW9uKHNlbGYsIG9wdGlv",
+"bnMpCiAgICAgICAgbG9jYWwgVGFiTmFtZSA9IG9wdGlvbnMuTmFtZSBvciAnVGFiJwogICAgICAgIGxvY2FsIFRhYkljb25JZCA9",
+"IG9wdGlvbnMuSWNvbiBvciAncmJ4YXNzZXRpZDovLzYwMzQ1MDI4NDQnCgogICAgICAgIGxvY2FsIFRhYkJ0biA9IGNyZWF0ZUlu",
+"c3RhbmNlKCdJbWFnZUJ1dHRvbicsIHsKICAgICAgICAgICAgUGFyZW50ID0gU2lkZWJhciwKICAgICAgICAgICAgQmFja2dyb3Vu",
+"ZENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDI1NSwgMjU1LCAyNTUpLAogICAgICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5",
+"ID0gMSwKICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAwLCAzOCksCiAgICAgICAgICAgIEF1dG9CdXR0b25Db2xv",
+"ciA9IGZhbHNlLAogICAgICAgICAgICBJbWFnZSA9ICcnCiAgICAgICAgfSkKICAgICAgICBjcmVhdGVJbnN0YW5jZSgnVUlDb3Ju",
+"ZXInLCB7UGFyZW50ID0gVGFiQnRuLCBDb3JuZXJSYWRpdXMgPSBVRGltLm5ldygwLCA0KX0pCgogICAgICAgIGxvY2FsIFRhYkdy",
+"YWRpZW50ID0gY3JlYXRlSW5zdGFuY2UoJ1VJR3JhZGllbnQnLCB7CiAgICAgICAgICAgIFBhcmVudCA9IFRhYkJ0biwKICAgICAg",
+"ICAgICAgQ29sb3IgPSBDb2xvclNlcXVlbmNlLm5ldyhUaGVtZS5BY2NlbnQpLAogICAgICAgICAgICBPZmZzZXQgPSBWZWN0b3Iy",
+"Lm5ldygtMSwgMCksCiAgICAgICAgICAgIFRyYW5zcGFyZW5jeSA9IE51bWJlclNlcXVlbmNlLm5ldyh7CiAgICAgICAgICAgICAg",
+"ICBOdW1iZXJTZXF1ZW5jZUtleXBvaW50Lm5ldygwLCAwLjg2KSwKICAgICAgICAgICAgICAgIE51bWJlclNlcXVlbmNlS2V5cG9p",
+"bnQubmV3KDAuNiwgMSksCiAgICAgICAgICAgICAgICBOdW1iZXJTZXF1ZW5jZUtleXBvaW50Lm5ldygxLCAxKQogICAgICAgICAg",
+"ICB9KQogICAgICAgIH0pCiAgICAgICAgcmVnVGhlbWUoVGFiR3JhZGllbnQsIGZ1bmN0aW9uKCkKICAgICAgICAgICAgVGFiR3Jh",
+"ZGllbnQuQ29sb3IgPSBDb2xvclNlcXVlbmNlLm5ldyhUaGVtZS5BY2NlbnQpCiAgICAgICAgZW5kKQoKICAgICAgICBsb2NhbCBJ",
+"Y29uSW1nID0gY3JlYXRlSW5zdGFuY2UoJ0ltYWdlTGFiZWwnLCB7CiAgICAgICAgICAgIFBhcmVudCA9IFRhYkJ0biwKICAgICAg",
+"ICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAgICAgIFBvc2l0aW9uID0gVURpbTIubmV3KDAsIDEyLCAw",
+"LjUsIC05KSwKICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygwLCAxOCwgMCwgMTgpLAogICAgICAgICAgICBJbWFnZSA9IFRh",
+"Ykljb25JZCwKICAgICAgICAgICAgSW1hZ2VDb2xvcjMgPSBUaGVtZS5UZXh0U3ViCiAgICAgICAgfSkKCiAgICAgICAgbG9jYWwg",
+"VGV4dExhYmVsID0gY3JlYXRlSW5zdGFuY2UoJ1RleHRMYWJlbCcsIHsKICAgICAgICAgICAgUGFyZW50ID0gVGFiQnRuLAogICAg",
+"ICAgICAgICBCYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgUG9zaXRpb24gPSBVRGltMi5uZXcoMCwgNDAs",
+"IDAsIDApLAogICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIC00MCwgMSwgMCksCiAgICAgICAgICAgIEZvbnQgPSBFbnVt",
+"LkZvbnQuR290aGFtTWVkaXVtLAogICAgICAgICAgICBUZXh0ID0gVGFiTmFtZSwKICAgICAgICAgICAgVGV4dENvbG9yMyA9IFRo",
+"ZW1lLlRleHRTdWIsCiAgICAgICAgICAgIFRleHRTaXplID0gMTMsCiAgICAgICAgICAgIFRleHRYQWxpZ25tZW50ID0gRW51bS5U",
+"ZXh0WEFsaWdubWVudC5MZWZ0CiAgICAgICAgfSkKCiAgICAgICAgVGFiQnRuLk1vdXNlRW50ZXI6Q29ubmVjdChmdW5jdGlvbigp",
+"CiAgICAgICAgICAgIGlmIFdpbmRvd09iai5DdXJyZW50VGFiIH49IFRhYk5hbWUgdGhlbgogICAgICAgICAgICAgICAgVHdlZW5T",
+"ZXJ2aWNlOkNyZWF0ZShUZXh0TGFiZWwsIFR3ZWVuSW5mby5uZXcoMC4yKSwge1RleHRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigy",
+"MTAsIDIxMCwgMjEwKX0pOlBsYXkoKQogICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShJY29uSW1nLCBUd2Vlbklu",
+"Zm8ubmV3KDAuMiksIHtJbWFnZUNvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDIxMCwgMjEwLCAyMTApfSk6UGxheSgpCiAgICAgICAg",
+"ICAgIGVuZAogICAgICAgIGVuZCkKICAgICAgICBUYWJCdG4uTW91c2VMZWF2ZTpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAg",
+"ICAgaWYgV2luZG93T2JqLkN1cnJlbnRUYWIgfj0gVGFiTmFtZSB0aGVuCiAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3Jl",
+"YXRlKFRleHRMYWJlbCwgVHdlZW5JbmZvLm5ldygwLjIpLCB7VGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWJ9KTpQbGF5KCkKICAg",
+"ICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoSWNvbkltZywgVHdlZW5JbmZvLm5ldygwLjIpLCB7SW1hZ2VDb2xvcjMg",
+"PSBUaGVtZS5UZXh0U3VifSk6UGxheSgpCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZCkKCiAgICAgICAgbG9jYWwgUGFnZUdy",
+"b3VwID0gY3JlYXRlSW5zdGFuY2UoJ0NhbnZhc0dyb3VwJywgewogICAgICAgICAgICBQYXJlbnQgPSBDb250ZW50Q29udGFpbmVy",
+"LAogICAgICAgICAgICBTaXplID0gVURpbTIubmV3KDEsIDAsIDEsIDApLAogICAgICAgICAgICBQb3NpdGlvbiA9IFVEaW0yLm5l",
+"dygwLCA1MCwgMCwgMCksCiAgICAgICAgICAgIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxLAogICAgICAgICAgICBHcm91cFRy",
+"YW5zcGFyZW5jeSA9IDEsCiAgICAgICAgICAgIEJvcmRlclNpemVQaXhlbCA9IDAsCiAgICAgICAgICAgIFZpc2libGUgPSBmYWxz",
+"ZQogICAgICAgIH0pCgogICAgICAgIGxvY2FsIFBhZ2UgPSBjcmVhdGVJbnN0YW5jZSgnU2Nyb2xsaW5nRnJhbWUnLCB7CiAgICAg",
+"ICAgICAgIFBhcmVudCA9IFBhZ2VHcm91cCwKICAgICAgICAgICAgQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEsCiAgICAgICAg",
+"ICAgIFNpemUgPSBVRGltMi5uZXcoMSwgMCwgMSwgMCksCiAgICAgICAgICAgIFNjcm9sbEJhclRoaWNrbmVzcyA9IDIsCiAgICAg",
+"ICAgICAgIFNjcm9sbEJhckltYWdlQ29sb3IzID0gVGhlbWUuQm9yZGVyLAogICAgICAgICAgICBCb3JkZXJTaXplUGl4ZWwgPSAw",
+"LAogICAgICAgICAgICBBdXRvbWF0aWNDYW52YXNTaXplID0gRW51bS5BdXRvbWF0aWNTaXplLlksCiAgICAgICAgICAgIENhbnZh",
+"c1NpemUgPSBVRGltMi5uZXcoMCwgMCwgMCwgMCkKICAgICAgICB9KQogICAgICAgIHJlZ1RoZW1lKFBhZ2UsIGZ1bmN0aW9uKCkg",
+"UGFnZS5TY3JvbGxCYXJJbWFnZUNvbG9yMyA9IFRoZW1lLkJvcmRlciBlbmQpCiAgICAgICAgCiAgICAgICAgY3JlYXRlSW5zdGFu",
+"Y2UoJ1VJUGFkZGluZycsIHsKICAgICAgICAgICAgUGFyZW50ID0gUGFnZSwKICAgICAgICAgICAgUGFkZGluZ1RvcCA9IFVEaW0u",
+"bmV3KDAsIDE1KSwKICAgICAgICAgICAgUGFkZGluZ0xlZnQgPSBVRGltLm5ldygwLCAyMCksCiAgICAgICAgICAgIFBhZGRpbmdS",
+"aWdodCA9IFVEaW0ubmV3KDAsIDIwKQogICAgICAgIH0pCgogICAgICAgIGNyZWF0ZUluc3RhbmNlKCdVSUxpc3RMYXlvdXQnLCB7",
+"CiAgICAgICAgICAgIFBhcmVudCA9IFBhZ2UsCiAgICAgICAgICAgIFNvcnRPcmRlciA9IEVudW0uU29ydE9yZGVyLkxheW91dE9y",
+"ZGVyLAogICAgICAgICAgICBQYWRkaW5nID0gVURpbS5uZXcoMCwgOCkKICAgICAgICB9KQoKICAgICAgICBsb2NhbCBUYWJPYmog",
+"PSB7IE5hbWUgPSBUYWJOYW1lLCBQYWdlID0gUGFnZSwgU2VsZWN0ID0gbmlsIH0KICAgICAgICBsb2NhbCBCdWlsZGVyID0gQ3Jl",
+"YXRlRWxlbWVudEJ1aWxkZXIoUGFnZSwgVGFiT2JqKQoKICAgICAgICBUYWJPYmouU2VsZWN0ID0gZnVuY3Rpb24oKQogICAgICAg",
+"ICAgICBpZiBXaW5kb3dPYmouQ3VycmVudFRhYiA9PSBUYWJPYmouTmFtZSB0aGVuIHJldHVybiBlbmQKICAgICAgICAgICAgaWYg",
+"V2luZG93T2JqLkN1cnJlbnRUYWIgdGhlbiAKICAgICAgICAgICAgICAgIFdpbmRvd09iai5DdXJyZW50VGFiLlVuc2VsZWN0KCkg",
+"CiAgICAgICAgICAgIGVuZAogICAgICAgICAgICBXaW5kb3dPYmouQ3VycmVudFRhYiA9IFRhYk9iagogICAgICAgICAgICAKICAg",
+"ICAgICAgICAgUGFnZUdyb3VwLlZpc2libGUgPSB0cnVlCiAgICAgICAgICAgIFBhZ2VHcm91cC5Qb3NpdGlvbiA9IFVEaW0yLm5l",
+"dygwLCA1MCwgMCwgMCkKICAgICAgICAgICAgUGFnZUdyb3VwLkdyb3VwVHJhbnNwYXJlbmN5ID0gMQogICAgICAgICAgICBUd2Vl",
+"blNlcnZpY2U6Q3JlYXRlKFBhZ2VHcm91cCwgVHdlZW5JbmZvLm5ldygwLjY1LCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBFbnVt",
+"LkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7UG9zaXRpb24gPSBVRGltMi5uZXcoMCwgMCwgMCwgMCksIEdyb3VwVHJhbnNwYXJlbmN5",
+"ID0gMH0pOlBsYXkoKQogICAgICAgICAgICAKICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShUYWJCdG4sIFR3ZWVuSW5m",
+"by5uZXcoMC4yKSwge0JhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAwfSk6UGxheSgpCiAgICAgICAgICAgIFR3ZWVuU2VydmljZTpD",
+"cmVhdGUoVGFiR3JhZGllbnQsIFR3ZWVuSW5mby5uZXcoMC40NSwgRW51bS5FYXNpbmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdE",
+"aXJlY3Rpb24uT3V0KSwge09mZnNldCA9IFZlY3RvcjIubmV3KDAsIDApfSk6UGxheSgpCiAgICAgICAgICAgIFR3ZWVuU2Vydmlj",
+"ZTpDcmVhdGUoVGV4dExhYmVsLCBUd2VlbkluZm8ubmV3KDAuMiksIHtUZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW59KTpQbGF5",
+"KCkKICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShJY29uSW1nLCBUd2VlbkluZm8ubmV3KDAuMiksIHtJbWFnZUNvbG9y",
+"MyA9IFRoZW1lLlRleHRNYWlufSk6UGxheSgpCiAgICAgICAgZW5kCgogICAgICAgIFRhYk9iai5VbnNlbGVjdCA9IGZ1bmN0aW9u",
+"KCkKICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShQYWdlR3JvdXAsIFR3ZWVuSW5mby5uZXcoMC42NSwgRW51bS5FYXNp",
+"bmdTdHlsZS5RdWFydCwgRW51bS5FYXNpbmdEaXJlY3Rpb24uT3V0KSwge1Bvc2l0aW9uID0gVURpbTIubmV3KDAsIC01MCwgMCwg",
+"MCksIEdyb3VwVHJhbnNwYXJlbmN5ID0gMX0pOlBsYXkoKQogICAgICAgICAgICB0YXNrLmRlbGF5KDAuNjUsIGZ1bmN0aW9uKCkg",
+"aWYgV2luZG93T2JqLkN1cnJlbnRUYWIgfj0gVGFiT2JqIHRoZW4gUGFnZUdyb3VwLlZpc2libGUgPSBmYWxzZSBlbmQgZW5kKQoK",
+"ICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShUYWJHcmFkaWVudCwgVHdlZW5JbmZvLm5ldygwLjQ1LCBFbnVtLkVhc2lu",
+"Z1N0eWxlLlF1YXJ0LCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7T2Zmc2V0ID0gVmVjdG9yMi5uZXcoLTEsIDApfSk6UGxh",
+"eSgpCiAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoVGFiQnRuLCBUd2VlbkluZm8ubmV3KDAuMiksIHtCYWNrZ3JvdW5k",
+"VHJhbnNwYXJlbmN5ID0gMX0pOlBsYXkoKQogICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3JlYXRlKFRleHRMYWJlbCwgVHdlZW5J",
+"bmZvLm5ldygwLjIpLCB7VGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWJ9KTpQbGF5KCkKICAgICAgICAgICAgVHdlZW5TZXJ2aWNl",
+"OkNyZWF0ZShJY29uSW1nLCBUd2VlbkluZm8ubmV3KDAuMiksIHtJbWFnZUNvbG9yMyA9IFRoZW1lLlRleHRTdWJ9KTpQbGF5KCkK",
+"ICAgICAgICBlbmQKCiAgICAgICAgVGFiQnRuLk1vdXNlQnV0dG9uMUNsaWNrOkNvbm5lY3QoVGFiT2JqLlNlbGVjdCkKCiAgICAg",
+"ICAgaWYgI1dpbmRvd09iai5UYWJzID09IDAgdGhlbiBUYWJPYmouU2VsZWN0KCkgZW5kCiAgICAgICAgdGFibGUuaW5zZXJ0KFdp",
+"bmRvd09iai5UYWJzLCBUYWJPYmopCgogICAgICAgIHJldHVybiBzZXRtZXRhdGFibGUoVGFiT2JqLCB7X19pbmRleCA9IEJ1aWxk",
+"ZXJ9KQogICAgZW5kCgogICAgbG9jYWwgTWFrZVN1YlRhYkVsZW1lbnRzID0gZnVuY3Rpb24oVGFiTmFtZSkKICAgICAgICBsb2Nh",
+"bCBwYXJlbnRHcnAgPSBNYXN0ZXJDb250YWluZXJzW1RhYk5hbWVdCiAgICAgICAgbG9jYWwgUGFnZSA9IGNyZWF0ZUluc3RhbmNl",
+"KCdTY3JvbGxpbmdGcmFtZScsIHsKICAgICAgICAgICAgUGFyZW50ID0gcGFyZW50R3JwLAogICAgICAgICAgICBCYWNrZ3JvdW5k",
+"VHJhbnNwYXJlbmN5ID0gMSwKICAgICAgICAgICAgU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAxLCAwKSwKICAgICAgICAgICAgU2Ny",
+"b2xsQmFyVGhpY2tuZXNzID0gMiwKICAgICAgICAgICAgU2Nyb2xsQmFySW1hZ2VDb2xvcjMgPSBUaGVtZS5Cb3JkZXIsCiAgICAg",
+"ICAgICAgIEJvcmRlclNpemVQaXhlbCA9IDAsCiAgICAgICAgICAgIEF1dG9tYXRpY0NhbnZhc1NpemUgPSBFbnVtLkF1dG9tYXRp",
+"Y1NpemUuWSwKICAgICAgICAgICAgQ2FudmFzU2l6ZSA9IFVEaW0yLm5ldygwLCAwLCAwLCAwKQogICAgICAgIH0pCiAgICAgICAg",
+"Y3JlYXRlSW5zdGFuY2UoJ1VJUGFkZGluZycsIHsKICAgICAgICAgICAgUGFyZW50ID0gUGFnZSwKICAgICAgICAgICAgUGFkZGlu",
+"Z1RvcCA9IFVEaW0ubmV3KDAsIDE1KSwKICAgICAgICAgICAgUGFkZGluZ0xlZnQgPSBVRGltLm5ldygwLCAyMCksCiAgICAgICAg",
+"ICAgIFBhZGRpbmdSaWdodCA9IFVEaW0ubmV3KDAsIDIwKQogICAgICAgIH0pCiAgICAgICAgY3JlYXRlSW5zdGFuY2UoJ1VJTGlz",
+"dExheW91dCcsIHsKICAgICAgICAgICAgUGFyZW50ID0gUGFnZSwKICAgICAgICAgICAgU29ydE9yZGVyID0gRW51bS5Tb3J0T3Jk",
+"ZXIuTGF5b3V0T3JkZXIsCiAgICAgICAgICAgIFBhZGRpbmcgPSBVRGltLm5ldygwLCA4KQogICAgICAgIH0pCiAgICAgICAgcmVn",
+"VGhlbWUoUGFnZSwgZnVuY3Rpb24oKSBQYWdlLlNjcm9sbEJhckltYWdlQ29sb3IzID0gVGhlbWUuQm9yZGVyIGVuZCkKICAgICAg",
+"ICByZXR1cm4gQ3JlYXRlRWxlbWVudEJ1aWxkZXIoUGFnZSwge05hbWUgPSBUYWJOYW1lLCBQYWdlID0gUGFnZSwgU2VsZWN0ID0g",
+"ZnVuY3Rpb24oKQogICAgICAgICAgICBpZiBhY3RpdmVTdWJUYWIgfj0gVGFiTmFtZSB0aGVuCiAgICAgICAgICAgICAgICBsb2Nh",
+"bCBidG4gPSBTdWJUYWJzOkZpbmRGaXJzdENoaWxkKFRhYk5hbWUgLi4gJ1RhYicpCiAgICAgICAgICAgICAgICBpZiBidG4gdGhl",
+"bgogICAgICAgICAgICAgICAgICAgIGxvY2FsIHN1YkNoaWxkcmVuID0gU3ViVGFiczpHZXRDaGlsZHJlbigpCiAgICAgICAgICAg",
+"ICAgICAgICAgZm9yIGkgPSAxLCAjc3ViQ2hpbGRyZW4gZG8KICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgY2hpbGQgPSBz",
+"dWJDaGlsZHJlbltpXQogICAgICAgICAgICAgICAgICAgICAgICBpZiBjaGlsZDpJc0EoJ0ltYWdlQnV0dG9uJykgYW5kIGNoaWxk",
+"Lk5hbWUgfj0gVGFiTmFtZSAuLiAnVGFiJyB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6Q3Jl",
+"YXRlKGNoaWxkLlRleHRMYWJlbCwgVHdlZW5JbmZvLm5ldygwLjIpLCB7VGV4dENvbG9yMyA9IFRoZW1lLlRleHRTdWJ9KTpQbGF5",
+"KCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIFR3ZWVuU2VydmljZTpDcmVhdGUoY2hpbGQuRnJhbWUsIFR3ZWVuSW5mby5u",
+"ZXcoMC4yKSwge1NpemUgPSBVRGltMi5uZXcoMCwgMCwgMCwgMiksIEJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxfSk6UGxheSgp",
+"CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBsb2NhbCBvYyA9IE1hc3RlckNvbnRhaW5lcnNbY2hpbGQuTmFtZTpnc3ViKCdU",
+"YWInLCAnJyldCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBvYyB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShvYywgVHdlZW5JbmZvLm5ldygwLjI1LCBFbnVtLkVhc2luZ1N0eWxlLlF1YXJ0LCBF",
+"bnVtLkVhc2luZ0RpcmVjdGlvbi5JbiksIHtQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAwLCAtMTUpLCBHcm91cFRyYW5zcGFy",
+"ZW5jeSA9IDF9KTpQbGF5KCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICB0YXNrLmRlbGF5KDAuMjUsIGZ1bmN0aW9u",
+"KCkgb2MuVmlzaWJsZSA9IGZhbHNlIGVuZCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAg",
+"ICAgICAgICBlbmQKICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgICAgICBhY3RpdmVTdWJUYWIgPSBUYWJO",
+"YW1lCiAgICAgICAgICAgICAgICAgICAgVHdlZW5TZXJ2aWNlOkNyZWF0ZShidG4uVGV4dExhYmVsLCBUd2VlbkluZm8ubmV3KDAu",
+"MiksIHtUZXh0Q29sb3IzID0gVGhlbWUuVGV4dE1haW59KTpQbGF5KCkKICAgICAgICAgICAgICAgICAgICBUd2VlblNlcnZpY2U6",
+"Q3JlYXRlKGJ0bi5GcmFtZSwgVHdlZW5JbmZvLm5ldygwLjIpLCB7U2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAwLCAyKSwgQmFja2dy",
+"b3VuZFRyYW5zcGFyZW5jeSA9IDB9KTpQbGF5KCkKICAgICAgICAgICAgICAgICAgICBsb2NhbCBuYyA9IE1hc3RlckNvbnRhaW5l",
+"cnNbVGFiTmFtZV0KICAgICAgICAgICAgICAgICAgICBpZiBuYyB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIG5jLlZpc2li",
+"bGUgPSB0cnVlCiAgICAgICAgICAgICAgICAgICAgICAgIG5jLlBvc2l0aW9uID0gVURpbTIubmV3KDAsIDAsIDAsIDE1KQogICAg",
+"ICAgICAgICAgICAgICAgICAgICBuYy5Hcm91cFRyYW5zcGFyZW5jeSA9IDEKICAgICAgICAgICAgICAgICAgICAgICAgVHdlZW5T",
+"ZXJ2aWNlOkNyZWF0ZShuYywgVHdlZW5JbmZvLm5ldygwLjQsIEVudW0uRWFzaW5nU3R5bGUuUXVhcnQsIEVudW0uRWFzaW5nRGly",
+"ZWN0aW9uLk91dCksIHtQb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAwLCAwKSwgR3JvdXBUcmFuc3BhcmVuY3kgPSAwfSk6UGxh",
+"eSgpCiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5k",
+"fSkKICAgIGVuZAoKICAgIFdpbmRvd09iai5VSVNldHRpbmdzID0gTWFrZVN1YlRhYkVsZW1lbnRzKCdVSSBTZXR0aW5ncycpCiAg",
+"ICAKICAgIFdpbmRvd09iai5VSVNldHRpbmdzOkNyZWF0ZUtleWJpbmQoewogICAgICAgIE5hbWUgPSAnTWVudSBWaXNpYmxlIEtl",
+"eWJpbmQnLAogICAgICAgIERlZmF1bHQgPSBNZW51S2V5YmluZCwKICAgICAgICBDYWxsYmFjayA9IGZ1bmN0aW9uKGtleSkgTWVu",
+"dUtleWJpbmQgPSBrZXkgZW5kCiAgICB9KQogICAgCiAgICBsb2NhbCB0aGVtZU5hbWVzTGlzdCA9IHt9CiAgICBmb3IgbmFtZSwg",
+"XyBpbiBwYWlycyhUaGVtZXMpIGRvCiAgICAgICAgdGFibGUuaW5zZXJ0KHRoZW1lTmFtZXNMaXN0LCBuYW1lKQogICAgZW5kCiAg",
+"ICB0YWJsZS5zb3J0KHRoZW1lTmFtZXNMaXN0KQoKICAgIFdpbmRvd09iai5VSVNldHRpbmdzOkNyZWF0ZURyb3Bkb3duKHsKICAg",
+"ICAgICBOYW1lID0gJ1NlbGVjdCBVSSBUaGVtZScsCiAgICAgICAgT3B0aW9ucyA9IHRoZW1lTmFtZXNMaXN0LAogICAgICAgIERl",
+"ZmF1bHQgPSBkZWZhdWx0VGhlbWUsCiAgICAgICAgQ2FsbGJhY2sgPSBmdW5jdGlvbihzZWxlY3RlZFRoZW1lKQogICAgICAgICAg",
+"ICBBcHBseVNlbGVjdGVkVGhlbWUoc2VsZWN0ZWRUaGVtZSkKICAgICAgICBlbmQKICAgIH0pCiAgICAKICAgIGxvY2FsIEFjY2Vu",
+"dENvbG9yRWxlbWVudAogICAgQWNjZW50Q29sb3JFbGVtZW50ID0gV2luZG93T2JqLlVJU2V0dGluZ3M6Q3JlYXRlQ29sb3JwaWNr",
+"ZXIoewogICAgICAgIE5hbWUgPSAnQWNjZW50IENvbG9yJywKICAgICAgICBEZWZhdWx0ID0gVGhlbWUuQWNjZW50LAogICAgICAg",
+"IENhbGxiYWNrID0gZnVuY3Rpb24oY29sb3IpIAogICAgICAgICAgICBpZiBub3QgQWVyb0xpYi5SYWluYm93QWNjZW50IHRoZW4K",
+"ICAgICAgICAgICAgICAgIFVwZGF0ZVRoZW1lQWNjZW50KGNvbG9yKSAKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICB9",
+"KQoKICAgIFdpbmRvd09iai5VSVNldHRpbmdzOkNyZWF0ZVRvZ2dsZSh7CiAgICAgICAgTmFtZSA9ICdSYWluYm93IEFjY2VudCcs",
+"CiAgICAgICAgRGVmYXVsdCA9IGZhbHNlLAogICAgICAgIENhbGxiYWNrID0gZnVuY3Rpb24odmFsKQogICAgICAgICAgICBBZXJv",
+"TGliLlJhaW5ib3dBY2NlbnQgPSB2YWwKICAgICAgICAgICAgaWYgbm90IHZhbCBhbmQgQWNjZW50Q29sb3JFbGVtZW50IHRoZW4K",
+"ICAgICAgICAgICAgICAgIFVwZGF0ZVRoZW1lQWNjZW50KEFjY2VudENvbG9yRWxlbWVudC5WYWx1ZSkKICAgICAgICAgICAgZW5k",
+"CiAgICAgICAgZW5kCiAgICB9KQoKICAgIFdpbmRvd09iai5VSVNldHRpbmdzOkNyZWF0ZVNsaWRlcih7CiAgICAgICAgTmFtZSA9",
+"ICdSYWluYm93IFNwZWVkJywKICAgICAgICBNaW4gPSAxLAogICAgICAgIE1heCA9IDIwLAogICAgICAgIERlZmF1bHQgPSA1LAog",
+"ICAgICAgIEluY3JlbWVudCA9IDEsCiAgICAgICAgU3VmZml4ID0gJycsCiAgICAgICAgQ2FsbGJhY2sgPSBmdW5jdGlvbih2YWwp",
+"CiAgICAgICAgICAgIEFlcm9MaWIuUmFpbmJvd1NwZWVkID0gdmFsCiAgICAgICAgZW5kCiAgICB9KQoKICAgIFdpbmRvd09iai5V",
+"SVNldHRpbmdzOkNyZWF0ZUJ1dHRvbih7CiAgICAgICAgTmFtZSA9ICdSYW5kb21pemUgVGhlbWUnLAogICAgICAgIENhbGxiYWNr",
+"ID0gZnVuY3Rpb24oKQogICAgICAgICAgICBsb2NhbCBiYXNlSHVlID0gbWF0aC5yYW5kb20oKQogICAgICAgICAgICBsb2NhbCBi",
+"Z1NhdHVyYXRpb24gPSBtYXRoLnJhbmRvbSgpICogMC4yCiAgICAgICAgICAgIGxvY2FsIGJnVmFsdWUgPSBtYXRoLnJhbmRvbSgp",
+"ICogMC4xNSArIDAuMDUKICAgICAgICAgICAgCiAgICAgICAgICAgIFRoZW1lLk1haW5CRyA9IENvbG9yMy5mcm9tSFNWKGJhc2VI",
+"dWUsIGJnU2F0dXJhdGlvbiwgYmdWYWx1ZSkKICAgICAgICAgICAgVGhlbWUuU2lkZWJhckJHID0gQ29sb3IzLmZyb21IU1YoYmFz",
+"ZUh1ZSwgYmdTYXR1cmF0aW9uLCBtYXRoLmNsYW1wKGJnVmFsdWUgKyAwLjAyLCAwLCAxKSkKICAgICAgICAgICAgVGhlbWUuVG9w",
+"YmFyQkcgPSBDb2xvcjMuZnJvbUhTVihiYXNlSHVlLCBiZ1NhdHVyYXRpb24sIG1hdGguY2xhbXAoYmdWYWx1ZSAtIDAuMDIsIDAs",
+"IDEpKQogICAgICAgICAgICBUaGVtZS5FbGVtZW50QkcgPSBDb2xvcjMuZnJvbUhTVihiYXNlSHVlLCBiZ1NhdHVyYXRpb24sIG1h",
+"dGguY2xhbXAoYmdWYWx1ZSArIDAuMDUsIDAsIDEpKQogICAgICAgICAgICBUaGVtZS5Cb3JkZXIgPSBDb2xvcjMuZnJvbUhTVihi",
+"YXNlSHVlLCBiZ1NhdHVyYXRpb24sIG1hdGguY2xhbXAoYmdWYWx1ZSArIDAuMSwgMCwgMSkpCiAgICAgICAgICAgIFRoZW1lLkRy",
+"b3Bkb3duTGlzdEJHID0gVGhlbWUuRWxlbWVudEJHCiAgICAgICAgICAgIFRoZW1lLkRyb3Bkb3duTGlzdFN0cm9rZSA9IFRoZW1l",
+"LkJvcmRlcgogICAgICAgICAgICAKICAgICAgICAgICAgbG9jYWwgYWNIID0gKGJhc2VIdWUgKyBtYXRoLnJhbmRvbSgpICogMC41",
+"KSAlIDEKICAgICAgICAgICAgVGhlbWUuQWNjZW50ID0gQ29sb3IzLmZyb21IU1YoYWNILCAwLjgsIDAuOSkKICAgICAgICAgICAg",
+"CiAgICAgICAgICAgIFRoZW1lLlRleHRNYWluID0gQ29sb3IzLmZyb21SR0IoMjQwLCAyNDAsIDI0MCkKICAgICAgICAgICAgVGhl",
+"bWUuVGV4dFN1YiA9IENvbG9yMy5mcm9tUkdCKDE2MCwgMTYwLCAxNjApCgogICAgICAgICAgICBsb2NhbCBhbGl2ZSA9IHt9CiAg",
+"ICAgICAgICAgIGZvciBpID0gMSwgI0Flcm9MaWIuVGhlbWVDb25uZWN0aW9ucyBkbwogICAgICAgICAgICAgICAgbG9jYWwgZnVu",
+"YyA9IEFlcm9MaWIuVGhlbWVDb25uZWN0aW9uc1tpXQogICAgICAgICAgICAgICAgaWYgdHlwZShmdW5jKSA9PSAnZnVuY3Rpb24n",
+"IHRoZW4KICAgICAgICAgICAgICAgICAgICBsb2NhbCBzLCByZXMgPSBwY2FsbChmdW5jKQogICAgICAgICAgICAgICAgICAgIGlm",
+"IHMgYW5kIHJlcyB+PSBmYWxzZSB0aGVuIAogICAgICAgICAgICAgICAgICAgICAgICB0YWJsZS5pbnNlcnQoYWxpdmUsIGZ1bmMp",
+"IAogICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGVuZAogICAgICAgICAgICBB",
+"ZXJvTGliLlRoZW1lQ29ubmVjdGlvbnMgPSBhbGl2ZQogICAgICAgIGVuZAogICAgfSkKCiAgICBXaW5kb3dPYmouVUlTZXR0aW5n",
+"czpDcmVhdGVUb2dnbGUoewogICAgICAgIE5hbWUgPSAnTm90aWZpY2F0aW9ucyAmIFRvb2x0aXBzJywKICAgICAgICBEZWZhdWx0",
+"ID0gdHJ1ZSwKICAgICAgICBDYWxsYmFjayA9IGZ1bmN0aW9uKHZhbCkgCiAgICAgICAgICAgIEFlcm9MaWIuU2hvd05vdGlmaWNh",
+"dGlvbnMgPSB2YWwgCiAgICAgICAgICAgIEFlcm9MaWIuU2hvd1Rvb2x0aXBzID0gdmFsIAogICAgICAgIGVuZAogICAgfSkKCiAg",
+"ICBXaW5kb3dPYmouVUlTZXR0aW5nczpDcmVhdGVTbGlkZXIoewogICAgICAgIE5hbWUgPSAnV2luZG93IFNjYWxlJywKICAgICAg",
+"ICBNaW4gPSA1MCwKICAgICAgICBNYXggPSAxNTAsCiAgICAgICAgRGVmYXVsdCA9IDEwMCwKICAgICAgICBJbmNyZW1lbnQgPSA1",
+"LAogICAgICAgIFN1ZmZpeCA9ICclJywKICAgICAgICBDYWxsYmFjayA9IGZ1bmN0aW9uKHZhbCkgV2luZG93T2JqOlVwZGF0ZVNj",
+"YWxlKHZhbCAvIDEwMCkgZW5kCiAgICB9KQoKICAgIFdpbmRvd09iai5Db25maWdzID0gTWFrZVN1YlRhYkVsZW1lbnRzKCdDb25m",
+"aWdzJykKICAgIGxvY2FsIENvbmZpZ05hbWUgPSAnZGVmYXVsdCcKICAgIGxvY2FsIENvbmZpZ0ZvbGRlciA9ICdhZXJvLycgLi4g",
+"dG9zdHJpbmcoZ2FtZS5HYW1lSWQpCiAgICBsb2NhbCBTZWN1cmVGb2xkZXIgPSBmdW5jdGlvbigpCiAgICAgICAgaWYgbWFrZWZv",
+"bGRlciB0aGVuCiAgICAgICAgICAgIGlmIG5vdCBpc2ZvbGRlcignYWVybycpIHRoZW4gbWFrZWZvbGRlcignYWVybycpIGVuZAog",
+"ICAgICAgICAgICBpZiBub3QgaXNmb2xkZXIoQ29uZmlnRm9sZGVyKSB0aGVuIG1ha2Vmb2xkZXIoQ29uZmlnRm9sZGVyKSBlbmQK",
+"ICAgICAgICBlbmQKICAgIGVuZAogICAgbG9jYWwgUmVmcmVzaENvbmZpZ3MgPSBmdW5jdGlvbihkcm9wZG93bk9iaikKICAgICAg",
+"ICBpZiBub3QgbGlzdGZpbGVzIHRoZW4gcmV0dXJuIGVuZAogICAgICAgIFNlY3VyZUZvbGRlcigpCiAgICAgICAgbG9jYWwgbGlz",
+"dCA9IHt9CiAgICAgICAgbG9jYWwgc3VjY2VzcywgZmlsZXMgPSBwY2FsbChmdW5jdGlvbigpIHJldHVybiBsaXN0ZmlsZXMoQ29u",
+"ZmlnRm9sZGVyKSBlbmQpCiAgICAgICAgaWYgc3VjY2VzcyBhbmQgdHlwZShmaWxlcykgPT0gJ3RhYmxlJyB0aGVuCiAgICAgICAg",
+"ICAgIGZvciBpID0gMSwgI2ZpbGVzIGRvCiAgICAgICAgICAgICAgICBsb2NhbCBmaWxlID0gZmlsZXNbaV0KICAgICAgICAgICAg",
+"ICAgIGlmIHR5cGUoZmlsZSkgPT0gJ3N0cmluZycgdGhlbgogICAgICAgICAgICAgICAgICAgIGxvY2FsIG1hdGNoID0gZmlsZTpt",
+"YXRjaCgnKFteL1xcXFxdKyklLmpzb24kJykKICAgICAgICAgICAgICAgICAgICBpZiBtYXRjaCB0aGVuIHRhYmxlLmluc2VydChs",
+"aXN0LCBtYXRjaCkgZW5kCiAgICAgICAgICAgICAgICBlbHNlaWYgdHlwZShmaWxlKSA9PSAndGFibGUnIHRoZW4KICAgICAgICAg",
+"ICAgICAgICAgICBsb2NhbCBwYXRoID0gZmlsZS5QYXRoIG9yIGZpbGUucGF0aCBvciBmaWxlLk5hbWUgb3IgZmlsZS5uYW1lIG9y",
+"IHRvc3RyaW5nKGZpbGUpCiAgICAgICAgICAgICAgICAgICAgaWYgdHlwZShwYXRoKSA9PSAnc3RyaW5nJyB0aGVuCiAgICAgICAg",
+"ICAgICAgICAgICAgICAgIGxvY2FsIG1hdGNoID0gcGF0aDptYXRjaCgnKFteL1xcXFxdKyklLmpzb24kJykKICAgICAgICAgICAg",
+"ICAgICAgICAgICAgaWYgbWF0Y2ggdGhlbiB0YWJsZS5pbnNlcnQobGlzdCwgbWF0Y2gpIGVuZAogICAgICAgICAgICAgICAgICAg",
+"IGVuZAogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgICAgIGRyb3Bkb3duT2JqOlJl",
+"ZnJlc2gobGlzdCkKICAgIGVuZAoKICAgIGxvY2FsIENmZ1RleHRCb3ggPSBXaW5kb3dPYmouQ29uZmlnczpDcmVhdGVUZXh0Ym94",
+"KHsKICAgICAgICBOYW1lID0gJ0NvbmZpZyBOYW1lJywKICAgICAgICBVc2VMZXR0ZXIgPSB0cnVlLAogICAgICAgIFVzZU51bWJl",
+"ciA9IHRydWUsCiAgICAgICAgQ2FsbGJhY2sgPSBmdW5jdGlvbih0eHQpIENvbmZpZ05hbWUgPSB0eHQgZW5kCiAgICB9KQoKICAg",
+"IGxvY2FsIEF1dG9sb2FkVG9nCiAgICBsb2NhbCBpc0F1dG9sb2FkID0gKHJlYWRmaWxlIGFuZCBpc2ZpbGUoJ2Flcm9fYXV0b2xv",
+"YWQudHh0JykgYW5kIHJlYWRmaWxlKCdhZXJvX2F1dG9sb2FkLnR4dCcpID09IENvbmZpZ05hbWUpIG9yIGZhbHNlCiAgICAKICAg",
+"IEF1dG9sb2FkVG9nID0gV2luZG93T2JqLkNvbmZpZ3M6Q3JlYXRlVG9nZ2xlKHsKICAgICAgICBOYW1lID0gJ0F1dG9sb2FkJywK",
+"ICAgICAgICBEZWZhdWx0ID0gaXNBdXRvbG9hZCwKICAgICAgICBDYWxsYmFjayA9IGZ1bmN0aW9uKHZhbCkKICAgICAgICAgICAg",
+"aWYgd3JpdGVmaWxlIHRoZW4KICAgICAgICAgICAgICAgIFNlY3VyZUZvbGRlcigpCiAgICAgICAgICAgICAgICBpZiB2YWwgdGhl",
+"bgogICAgICAgICAgICAgICAgICAgIHdyaXRlZmlsZSgnYWVyb19hdXRvbG9hZC50eHQnLCBDb25maWdOYW1lKQogICAgICAgICAg",
+"ICAgICAgZWxzZQogICAgICAgICAgICAgICAgICAgIGlmIGlzZmlsZSgnYWVyb19hdXRvbG9hZC50eHQnKSB0aGVuCiAgICAgICAg",
+"ICAgICAgICAgICAgICAgIGRlbGZpbGUoJ2Flcm9fYXV0b2xvYWQudHh0JykKICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAg",
+"ICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIH0pCgogICAgbG9jYWwgQ29uZmlnRHJvcAogICAg",
+"V2luZG93T2JqLkNvbmZpZ3M6Q3JlYXRlQnV0dG9uKHsKICAgICAgICBOYW1lID0gJ1NhdmUgQ29uZmlnJywKICAgICAgICBDYWxs",
+"YmFjayA9IGZ1bmN0aW9uKCkKICAgICAgICAgICAgaWYgd3JpdGVmaWxlIHRoZW4KICAgICAgICAgICAgICAgIFNlY3VyZUZvbGRl",
+"cigpCiAgICAgICAgICAgICAgICBsb2NhbCBkYXRhID0ge30KICAgICAgICAgICAgICAgIGZvciBrLHYgaW4gcGFpcnMoQWVyb0xp",
+"Yi5GbGFncykgZG8gCiAgICAgICAgICAgICAgICAgICAgZGF0YVtrXSA9IFNlcmlhbGl6ZVZhbHVlKHYuVmFsdWUpIAogICAgICAg",
+"ICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICB3cml0ZWZpbGUoQ29uZmlnRm9sZGVyIC4uICcvJyAuLiBDb25maWdOYW1lIC4u",
+"ICcuanNvbicsIEh0dHBTZXJ2aWNlOkpTT05FbmNvZGUoZGF0YSkpCiAgICAgICAgICAgICAgICBpZiBDb25maWdEcm9wIHRoZW4g",
+"UmVmcmVzaENvbmZpZ3MoQ29uZmlnRHJvcCkgZW5kCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgfSkKCiAgICBXaW5k",
+"b3dPYmouQ29uZmlnczpDcmVhdGVCdXR0b24oewogICAgICAgIE5hbWUgPSAnTG9hZCBDb25maWcnLAogICAgICAgIENhbGxiYWNr",
+"ID0gZnVuY3Rpb24oKQogICAgICAgICAgICBpZiByZWFkZmlsZSBhbmQgaXNmaWxlKENvbmZpZ0ZvbGRlciAuLiAnLycgLi4gQ29u",
+"ZmlnTmFtZSAuLiAnLmpzb24nKSB0aGVuCiAgICAgICAgICAgICAgICBsb2NhbCBzdWNjZXNzLCBkYXRhID0gcGNhbGwoZnVuY3Rp",
+"b24oKQogICAgICAgICAgICAgICAgICAgIHJldHVybiBIdHRwU2VydmljZTpKU09ORGVjb2RlKHJlYWRmaWxlKENvbmZpZ0ZvbGRl",
+"ciAuLiAnLycgLi4gQ29uZmlnTmFtZSAuLiAnLmpzb24nKSkKICAgICAgICAgICAgICAgIGVuZCkKICAgICAgICAgICAgICAgIGlm",
+"IHN1Y2Nlc3MgYW5kIHR5cGUoZGF0YSkgPT0gJ3RhYmxlJyB0aGVuCiAgICAgICAgICAgICAgICAgICAgZm9yIGssdiBpbiBwYWly",
+"cyhkYXRhKSBkbwogICAgICAgICAgICAgICAgICAgICAgICBsb2NhbCBmbGFnRWxlbWVudCA9IEFlcm9MaWIuRmxhZ3Nba10KICAg",
+"ICAgICAgICAgICAgICAgICAgICAgaWYgZmxhZ0VsZW1lbnQgdGhlbiAKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxvY2Fs",
+"IGRlY29kZWRWYWwgPSBEZXNlcmlhbGl6ZVZhbHVlKHYpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBkZWNvZGVkVmFs",
+"IH49IG5pbCB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZmxhZ0VsZW1lbnQ6U2V0KGRlY29kZWRWYWwpCiAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAg",
+"ICAgZW5kCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICB9KQoKICAgIENvbmZpZ0Ry",
+"b3AgPSBXaW5kb3dPYmouQ29uZmlnczpDcmVhdGVEcm9wZG93bih7CiAgICAgICAgTmFtZSA9ICdWaWV3IENvbmZpZ3MnLAogICAg",
+"ICAgIE9wdGlvbnMgPSB7fSwKICAgICAgICBDYWxsYmFjayA9IGZ1bmN0aW9uKHNlbCkgCiAgICAgICAgICAgIENvbmZpZ05hbWUg",
+"PSBzZWwgCiAgICAgICAgICAgIGlmIEF1dG9sb2FkVG9nIHRoZW4KICAgICAgICAgICAgICAgIGxvY2FsIGFjdGl2ZUF1dG8gPSAo",
+"cmVhZGZpbGUgYW5kIGlzZmlsZSgnYWVyb19hdXRvbG9hZC50eHQnKSBhbmQgcmVhZGZpbGUoJ2Flcm9fYXV0b2xvYWQudHh0Jykg",
+"PT0gQ29uZmlnTmFtZSkgb3IgZmFsc2UKICAgICAgICAgICAgICAgIEF1dG9sb2FkVG9nOlNldChhY3RpdmVBdXRvKQogICAgICAg",
+"ICAgICBlbmQKICAgICAgICBlbmQKICAgIH0pCiAgICBSZWZyZXNoQ29uZmlncyhDb25maWdEcm9wKQoKICAgIFdpbmRvd09iai5D",
+"b25maWdzOkNyZWF0ZUJ1dHRvbih7CiAgICAgICAgTmFtZSA9ICdEZWxldGUgQ29uZmlnJywKICAgICAgICBDYWxsYmFjayA9IGZ1",
+"bmN0aW9uKCkKICAgICAgICAgICAgaWYgZGVsZmlsZSBhbmQgaXNmaWxlKENvbmZpZ0ZvbGRlciAuLiAnLycgLi4gQ29uZmlnTmFt",
+"ZSAuLiAnLmpzb24nKSB0aGVuCiAgICAgICAgICAgICAgICBkZWxmaWxlKENvbmZpZ0ZvbGRlciAuLiAnLycgLi4gQ29uZmlnTmFt",
+"ZSAuLiAnLmpzb24nKQogICAgICAgICAgICAgICAgaWYgQ29uZmlnRHJvcCB0aGVuIFJlZnJlc2hDb25maWdzKENvbmZpZ0Ryb3Ap",
+"IGVuZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIH0pCgogICAgQXBwbHlTZWxlY3RlZFRoZW1lKGRlZmF1bHRUaGVt",
+"ZSkKCiAgICB0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgICAgICBpZiByZWFkZmlsZSBhbmQgaXNmaWxlKCdhZXJvX2F1dG9sb2Fk",
+"LnR4dCcpIHRoZW4KICAgICAgICAgICAgbG9jYWwgYXV0b0NmZyA9IHJlYWRmaWxlKCdhZXJvX2F1dG9sb2FkLnR4dCcpCiAgICAg",
+"ICAgICAgIGxvY2FsIGZpbGVQYXRoID0gQ29uZmlnRm9sZGVyIC4uICcvJyAuLiBhdXRvQ2ZnIC4uICcuanNvbicKICAgICAgICAg",
+"ICAgaWYgaXNmaWxlKGZpbGVQYXRoKSB0aGVuCiAgICAgICAgICAgICAgICBsb2NhbCBzdWNjZXNzLCBkYXRhID0gcGNhbGwoZnVu",
+"Y3Rpb24oKQogICAgICAgICAgICAgICAgICAgIHJldHVybiBIdHRwU2VydmljZTpKU09ORGVjb2RlKHJlYWRmaWxlKGZpbGVQYXRo",
+"KSkKICAgICAgICAgICAgICAgIGVuZCkKICAgICAgICAgICAgICAgIGlmIHN1Y2Nlc3MgYW5kIHR5cGUoZGF0YSkgPT0gJ3RhYmxl",
+"JyB0aGVuCiAgICAgICAgICAgICAgICAgICAgdGFzay53YWl0KDAuNSkKICAgICAgICAgICAgICAgICAgICBmb3Igayx2IGluIHBh",
+"aXJzKGRhdGEpIGRvCiAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIGZsYWdFbGVtZW50ID0gQWVyb0xpYi5GbGFnc1trXQog",
+"ICAgICAgICAgICAgICAgICAgICAgICBpZiBmbGFnRWxlbWVudCB0aGVuIAogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9j",
+"YWwgZGVjb2RlZFZhbCA9IERlc2VyaWFsaXplVmFsdWUodikKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIGRlY29kZWRW",
+"YWwgfj0gbmlsIHRoZW4KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBmbGFnRWxlbWVudDpTZXQoZGVjb2RlZFZhbCkK",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAg",
+"ICAgICBlbmQKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZCkKCiAgICBsb2Nh",
+"bCBjb25uZWN0aW9uCiAgICBjb25uZWN0aW9uID0gUnVuU2VydmljZS5SZW5kZXJTdGVwcGVkOkNvbm5lY3QoZnVuY3Rpb24oKQog",
+"ICAgICAgIGxvY2FsIHN1Y2Nlc3MsIGhhc1BhcmVudCA9IHBjYWxsKGZ1bmN0aW9uKCkgcmV0dXJuIFNjcmVlbkd1aSBhbmQgU2Ny",
+"ZWVuR3VpLlBhcmVudCBlbmQpCiAgICAgICAgaWYgbm90IHN1Y2Nlc3Mgb3Igbm90IGhhc1BhcmVudCB0aGVuCiAgICAgICAgICAg",
+"IGlmIGNvbm5lY3Rpb24gdGhlbiBjb25uZWN0aW9uOkRpc2Nvbm5lY3QoKSBlbmQKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAg",
+"ZW5kCiAgICBlbmQpCgogICAgcmV0dXJuIFdpbmRvd09iagplbmQKCmxvY2FsIFdpbmRvdyA9IEFlcm9MaWI6Q3JlYXRlV2luZG93",
+"KHsKICAgIFRpdGxlID0gJ3JvJywKICAgIFByZWZpeCA9ICdBZScsCiAgICBUaGVtZSA9ICdNaW5pbWFsIFdoaXRlJwp9KQoKbG9j",
+"YWwgVGhyb3dpbmdUYWIgPSBXaW5kb3c6Q3JlYXRlVGFiKHsgTmFtZSA9ICdRQiBBaW1ib3QnLCBJY29uID0gJ3JieGFzc2V0aWQ6",
+"Ly82MDM0Njg0OTQ5JyB9KQoKZW5hYmxlUWJBaW1ib3QgPSBUaHJvd2luZ1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdF",
+"bmFibGUgUUIgQWltYm90JywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdBdXRvbWF0aWNhbGx5IGFpbXMgcGFzc2Vz",
+"IGF0IHRoZSBiZXN0IHRhcmdldCBmb3IgbW9yZSBhY2N1cmF0ZSB0aHJvd3MuJywKfSkKCnRocm93QWltYm90ID0gVGhyb3dpbmdU",
+"YWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnVGhyb3cgVG8gTW91c2UgQWltYm90JywKICAgIERlZmF1bHQgPSBmYWxzZSwK",
+"ICAgIFRpcCA9ICdBdXRvbWF0aWNhbGx5IGFpbXMgcGFzc2VzIHRvd2FyZCB5b3VyIG1vdXNlIHBvc2l0aW9uLicsCn0pCgphdXRv",
+"Q2hvb3NlV3IgPSBUaHJvd2luZ1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdBdXRvIENob29zZSBPcGVuIFJlY2lldmVy",
+"JywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdBdXRvbWF0aWNhbGx5IHNlbGVjdHMgdGhlIG1vc3Qgb3BlbiByZWNl",
+"aXZlciBmb3IgZWFjaCB0aHJvdy4nLAp9KQoKYXV0b1NlbGVjdFRocm93TW9kZSA9IFRocm93aW5nVGFiOkNyZWF0ZVRvZ2dsZSh7",
+"CiAgICBOYW1lID0gJ0F1dG8gU2VsZWN0IFRocm93IFR5cGUnLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ0F1dG9t",
+"YXRpY2FsbHkgY2hvb3NlcyB0aGUgYmVzdCB0aHJvdyB0eXBlIGZvciBlYWNoIHBhc3MuJywKfSkKCmF1dG9Qb3dlciA9IFRocm93",
+"aW5nVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0F1dG8gUG93ZXInLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlw",
+"ID0gJ0F1dG9tYXRpY2FsbHkgc2V0cyB0aGUgb3B0aW1hbCB0aHJvdyBwb3dlci4nLAp9KQoKYXV0b0FuZ2xlID0gVGhyb3dpbmdU",
+"YWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnQXV0byBBbmdsZScsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAn",
+"QXV0b21hdGljYWxseSBhZGp1c3RzIHRocm93IGFuZ2xlIGZvciBiZXR0ZXIgYWNjdXJhY3kuJywKfSkKCmhpZ2hQb3dlck9ubHkg",
+"PSBUaHJvd2luZ1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdIaWdoIFBvd2VyIE9ubHknLAogICAgRGVmYXVsdCA9IGZh",
+"bHNlLAogICAgVGlwID0gJ09ubHkgdXNlcyBoaWdoLXBvd2VyIHRocm93cyB3aGVuIHBhc3NpbmcuJywKfSkKCmFudGlEQiA9IFRo",
+"cm93aW5nVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0FudGkgREInLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlw",
+"ID0gJ0F2b2lkcyB0aHJvd3MgdGhhdCBkZWZlbmRlcnMgY2FuIGVhc2lseSBpbnRlcmNlcHQuJywKfSkKCmFudGlEQlRocmVzaG9s",
+"ZCA9IFRocm93aW5nVGFiOkNyZWF0ZVNsaWRlcih7CiAgICBOYW1lID0gJ0FudGkgREIgVGhyZXNob2xkJywKICAgIE1pbiA9IDAs",
+"CiAgICBNYXggPSAxNSwKICAgIERlZmF1bHQgPSAwLAogICAgSW5jcmVtZW50ID0gMC4xLAogICAgU3VmZml4ID0gJycsCiAgICBU",
+"aXAgPSAnU2V0cyBob3cgYWdncmVzc2l2ZWx5IGRlZmVuZGVyIGNvdmVyYWdlIGlzIGF2b2lkZWQuJywKfSkKCmFudGlPT0IgPSBU",
+"aHJvd2luZ1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdBbnRpIE9PQicsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBU",
+"aXAgPSAnUHJldmVudHMgdGhyb3dzIHRoYXQgbWF5IGxlYWQgcmVjZWl2ZXJzIG91dCBvZiBib3VuZHMuJywKfSkKCmFudGlPT0JU",
+"aHJlc2hvbGQgPSBUaHJvd2luZ1RhYjpDcmVhdGVTbGlkZXIoewogICAgTmFtZSA9ICdBbnRpIE9PQiBUaHJlc2hvbGQnLAogICAg",
+"TWluID0gMCwKICAgIE1heCA9IDE1LAogICAgRGVmYXVsdCA9IDAsCiAgICBJbmNyZW1lbnQgPSAwLjEsCiAgICBTdWZmaXggPSAn",
+"JywKICAgIFRpcCA9ICdTZXRzIGhvdyBjbG9zZSB0YXJnZXRzIGNhbiBiZSB0byB0aGUgc2lkZWxpbmUuJywKfSkKCnRocm93TGVh",
+"ZE9mZnNldCA9IFRocm93aW5nVGFiOkNyZWF0ZVNsaWRlcih7CiAgICBOYW1lID0gJ1Rocm93IExlYWQgT2Zmc2V0JywKICAgIE1p",
+"biA9IC0xMCwKICAgIE1heCA9IDEwLAogICAgRGVmYXVsdCA9IDAsCiAgICBJbmNyZW1lbnQgPSAwLjEsCiAgICBTdWZmaXggPSAn",
+"JywKICAgIFRpcCA9ICdBZGp1c3RzIGhvdyBmYXIgYWhlYWQgcGFzc2VzIGFyZSBsZWQuJywKfSkKCnRocm93SGVpZ2h0T2Zmc2V0",
+"ID0gVGhyb3dpbmdUYWI6Q3JlYXRlU2xpZGVyKHsKICAgIE5hbWUgPSAnVGhyb3cgSGVpZ2h0IE9mZnNldCcsCiAgICBNaW4gPSAt",
+"MTAsCiAgICBNYXggPSAxMCwKICAgIERlZmF1bHQgPSAwLAogICAgSW5jcmVtZW50ID0gMC4xLAogICAgU3VmZml4ID0gJycsCiAg",
+"ICBUaXAgPSAnQWRqdXN0cyB0aGUgaGVpZ2h0IG9mIHRhcmdldGVkIHRocm93cy4nLAp9KQoKYXV0b0p1a2UgPSBUaHJvd2luZ1Rh",
+"YjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdBdXRvIEp1a2UgUnVzaGVyJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRp",
+"cCA9ICdBdXRvbWF0aWNhbGx5IGp1a2VzIG5lYXJieSBydXNoZXJzIGJlZm9yZSB0aHJvd2luZy4nLAp9KQoKaGlkZUNhcmRzID0g",
+"VGhyb3dpbmdUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnSGlkZSBRQiBBaW1ib3QgQ2FyZHMnLAogICAgRGVmYXVsdCA9",
+"IGZhbHNlLAogICAgVGlwID0gJ0hpZGVzIFFCIEFpbWJvdCB2aXN1YWwgY2FyZHMgZnJvbSB0aGUgc2NyZWVuLicsCn0pCgphdXRv",
+"Q2hhbmdlUG93ZXJVSSA9IFRocm93aW5nVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0F1dG8gQ2hhbmdlIFBvd2VyIFVJ",
+"JywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdBdXRvbWF0aWNhbGx5IHVwZGF0ZXMgdGhlIHBvd2VyIFVJIHRvIG1h",
+"dGNoIHRocm93cy4nLAp9KQoKYXV0b0p1bXBXaGVuVGhyb3cgPSBUaHJvd2luZ1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9",
+"ICdBdXRvIEp1bXAgQmVmb3JlIFRocm93JywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdBdXRvbWF0aWNhbGx5IGp1",
+"bXBzIGJlZm9yZSByZWxlYXNpbmcgdGhlIGJhbGwuJywKfSkKCmF1dG9UaHJvd0FmdGVyU2FjayA9IFRocm93aW5nVGFiOkNyZWF0",
+"ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0F1dG8gVGhyb3cgQmVmb3JlIEdldHRpbmcgU2Fja2VkJywKICAgIERlZmF1bHQgPSBmYWxz",
+"ZSwKICAgIFRpcCA9ICdBdXRvbWF0aWNhbGx5IHRocm93cyB0aGUgYmFsbCB3aGVuIGEgc2FjayBpcyBpbW1pbmVudC4nLAp9KQoK",
+"ZGltZUtleWJpbmQgPSBUaHJvd2luZ1RhYjpDcmVhdGVLZXliaW5kKHsKICAgIE5hbWUgPSAnRGltZSBNb2RlIEtleWJpbmQnLAog",
+"ICAgRGVmYXVsdCA9IEVudW0uS2V5Q29kZS5PbmUsCiAgICBUaXAgPSAnU3dpdGNoZXMgdG8gRGltZSB0aHJvdyBtb2RlLicsCn0p",
+"CgptYWdLZXliaW5kID0gVGhyb3dpbmdUYWI6Q3JlYXRlS2V5YmluZCh7CiAgICBOYW1lID0gJ01hZyBNb2RlIEtleWJpbmQnLAog",
+"ICAgRGVmYXVsdCA9IEVudW0uS2V5Q29kZS5Ud28sCiAgICBUaXAgPSAnU3dpdGNoZXMgdG8gTWFnIHRocm93IG1vZGUuJywKfSkK",
+"CmRpdmVLZXliaW5kID0gVGhyb3dpbmdUYWI6Q3JlYXRlS2V5YmluZCh7CiAgICBOYW1lID0gJ0RpdmUgTW9kZSBLZXliaW5kJywK",
+"ICAgIERlZmF1bHQgPSBFbnVtLktleUNvZGUuVGhyZWUsCiAgICBUaXAgPSAnU3dpdGNoZXMgdG8gRGl2ZSB0aHJvdyBtb2RlLics",
+"Cn0pCgpqdW1wS2V5YmluZCA9IFRocm93aW5nVGFiOkNyZWF0ZUtleWJpbmQoewogICAgTmFtZSA9ICdKdW1wIE1vZGUgS2V5Ymlu",
+"ZCcsCiAgICBEZWZhdWx0ID0gRW51bS5LZXlDb2RlLkZvdXIsCiAgICBUaXAgPSAnU3dpdGNoZXMgdG8gSnVtcCB0aHJvdyBtb2Rl",
+"LicsCn0pCgpidWxsZXRLZXliaW5kID0gVGhyb3dpbmdUYWI6Q3JlYXRlS2V5YmluZCh7CiAgICBOYW1lID0gJ0J1bGxldCBNb2Rl",
+"IEtleWJpbmQnLAogICAgRGVmYXVsdCA9IEVudW0uS2V5Q29kZS5GaXZlLAogICAgVGlwID0gJ1N3aXRjaGVzIHRvIEJ1bGxldCB0",
+"aHJvdyBtb2RlLicsCn0pCgp0aHJvd0JhbGxBd2F5S2V5YmluZCA9IFRocm93aW5nVGFiOkNyZWF0ZUtleWJpbmQoewogICAgTmFt",
+"ZSA9ICdUaHJvdyBCYWxsIEF3YXkgS2V5YmluZCcsCiAgICBEZWZhdWx0ID0gRW51bS5LZXlDb2RlLlQsCiAgICBUaXAgPSAnSW5z",
+"dGFudGx5IHRocm93cyB0aGUgYmFsbCBhd2F5LicsCn0pCgppbmNyZWFzZUFuZ2xlS2V5YmluZCA9IFRocm93aW5nVGFiOkNyZWF0",
+"ZUtleWJpbmQoewogICAgTmFtZSA9ICdJbmNyZWFzZSBBbmdsZSBLZXliaW5kJywKICAgIERlZmF1bHQgPSBFbnVtLktleUNvZGUu",
+"UiwKICAgIFRpcCA9ICdJbmNyZWFzZXMgdGhlIGN1cnJlbnQgdGhyb3cgYW5nbGUuJywKfSkKCmRlY3JlYXNlQW5nbGVLZXliaW5k",
+"ID0gVGhyb3dpbmdUYWI6Q3JlYXRlS2V5YmluZCh7CiAgICBOYW1lID0gJ0RlY3JlYXNlIEFuZ2xlIEtleWJpbmQnLAogICAgRGVm",
+"YXVsdCA9IEVudW0uS2V5Q29kZS5GLAogICAgVGlwID0gJ0RlY3JlYXNlcyB0aGUgY3VycmVudCB0aHJvdyBhbmdsZS4nLAp9KQoK",
+"bG9ja0tleWJpbmQgPSBUaHJvd2luZ1RhYjpDcmVhdGVLZXliaW5kKHsKICAgIE5hbWUgPSAnTG9jayBUbyBUYXJnZXQgS2V5Ymlu",
+"ZCcsCiAgICBEZWZhdWx0ID0gRW51bS5LZXlDb2RlLlosCiAgICBUaXAgPSAnTG9ja3MgcGFzc2VzIG9udG8gdGhlIGN1cnJlbnQg",
+"dGFyZ2V0LicsCn0pCgpsb2NhbCBwbGF5ZXJzID0gZ2FtZTpHZXRTZXJ2aWNlKCdQbGF5ZXJzJykKbG9jYWwgcmVwbGljYXRlZFN0",
+"b3JhZ2UgPSBnYW1lOkdldFNlcnZpY2UoJ1JlcGxpY2F0ZWRTdG9yYWdlJykKbG9jYWwgdHdlZW5TZXJ2aWNlID0gZ2FtZTpHZXRT",
+"ZXJ2aWNlKCdUd2VlblNlcnZpY2UnKQpsb2NhbCB1c2VySW5wdXRTZXJ2aWNlID0gZ2FtZTpHZXRTZXJ2aWNlKCdVc2VySW5wdXRT",
+"ZXJ2aWNlJykKbG9jYWwgcnVuU2VydmljZSA9IGdhbWU6R2V0U2VydmljZSgnUnVuU2VydmljZScpCmxvY2FsIHN0YXRzID0gZ2Ft",
+"ZTpHZXRTZXJ2aWNlKCdTdGF0cycpCmxvY2FsIGNhbWVyYSA9IHdvcmtzcGFjZS5DdXJyZW50Q2FtZXJhCmxvY2FsIGxwID0gcGxh",
+"eWVycy5Mb2NhbFBsYXllcgppZiBub3QgbHAgdGhlbgogICAgcGxheWVyczpHZXRQcm9wZXJ0eUNoYW5nZWRTaWduYWwoJ0xvY2Fs",
+"UGxheWVyJyk6V2FpdCgpCiAgICBscCA9IHBsYXllcnMuTG9jYWxQbGF5ZXIKZW5kCmxvY2FsIG1vdXNlID0gbHA6R2V0TW91c2Uo",
+"KQoKbG9jYWwgaXNQcmFjdGljZSA9IChnYW1lLlBsYWNlSWQgPT0gODEzMTA1NDI0Nzg5NzIpCmlmIGlzUHJhY3RpY2UgdGhlbgog",
+"ICAgYXV0b0p1a2UuVmFsdWUgPSBmYWxzZQplbmQKCmxvY2FsIHRhcmdldExvY2tlZCA9IGZhbHNlCmxvY2FsIGxvY2tlZFRhcmdl",
+"dCA9IG5pbAoKbG9jYWwgUm91dGVEYXRhID0ge30KbG9jYWwgSFVEQ2FyZHMgPSB7fQpsb2NhbCBydXNoZXJIaWdobGlnaHRzID0g",
+"e30KbG9jYWwgbnVtQ2FyZHMgPSAwCgpsb2NhbCBsZWFkRGltZSA9IDguNQpsb2NhbCBsZWFkTWFnID0gOC42CmxvY2FsIGxlYWRE",
+"aXZlID0gOC41CmxvY2FsIGxlYWRKdW1wID0gOC40CmxvY2FsIGxlYWRCdWxsZXQgPSAyLjUgCgpsb2NhbCB5TGVhZERpbWUgPSAx",
+"LjIKbG9jYWwgeUxlYWRNYWcgPSAxLjAKbG9jYWwgeUxlYWREaXZlID0gMS41CmxvY2FsIHlMZWFkSnVtcCA9IDIuMApsb2NhbCB5",
+"TGVhZEJ1bGxldCA9IC0wLjgKCmxvY2FsIE1vZGVPcmRlciA9IHsnQnVsbGV0JywgJ0RpbWUnLCAnRGl2ZScsICdKdW1wJywgJ01h",
+"Zyd9Cgpsb2NhbCBRQktleWJpbmRzID0gewogICAgW2RpbWVLZXliaW5kLlZhbHVlXSA9ICdEaW1lJywKICAgIFttYWdLZXliaW5k",
+"LlZhbHVlXSA9ICdNYWcnLAogICAgW2RpdmVLZXliaW5kLlZhbHVlXSA9ICdEaXZlJywKICAgIFtqdW1wS2V5YmluZC5WYWx1ZV0g",
+"PSAnSnVtcCcsCiAgICBbYnVsbGV0S2V5YmluZC5WYWx1ZV0gPSAnQnVsbGV0Jwp9Cgpsb2NhbCBjdXN0b21IZWlnaHQgPSB7IFZh",
+"bHVlID0gMCB9Cgpsb2NhbCB0YXJnZXQgPSBuaWwKbG9jYWwgbGFzdFZhbGlkVGFyZ2V0ID0gbmlsCmxvY2FsIHRhcmdldExlYWRQ",
+"b3MgPSBuaWwKbG9jYWwgaGlnaGxpZ2h0ID0gbmlsCmxvY2FsIGRpcmVjdGlvbiA9IFZlY3RvcjMubmV3KDAsIDEsIDApCmxvY2Fs",
+"IHBvd2VyID0gNjAKbG9jYWwgYW5nbGUgPSA0NQpsb2NhbCBhaXJ0aW1lID0gMApsb2NhbCBpc1Rocm93aW5nID0gZmFsc2UKbG9j",
+"YWwgaXNUaHJvd2luZ0F3YXkgPSBmYWxzZQpsb2NhbCBmaXJlZFJlbW90ZSA9IGZhbHNlCmxvY2FsIG1vZGVJbmRleCA9IDEKbG9j",
+"YWwgc21vb3RoZWRKdWtlRGlyID0gVmVjdG9yMy56ZXJvCgpsb2NhbCBsb2NrZWRNb3VzZVBvcyA9IG5pbAoKbG9jYWwgTG9ja1Rv",
+"Z2dsZUJ0biA9IG5pbApsb2NhbCBMb2NrZWRMYWJlbCA9IG5pbAoKbG9jYWwgYXR0YWNoMCA9IEluc3RhbmNlLm5ldygnQXR0YWNo",
+"bWVudCcsIHdvcmtzcGFjZS5UZXJyYWluKQpsb2NhbCBhdHRhY2gxID0gSW5zdGFuY2UubmV3KCdBdHRhY2htZW50Jywgd29ya3Nw",
+"YWNlLlRlcnJhaW4pCgpsb2NhbCBiZWFtID0gSW5zdGFuY2UubmV3KCdCZWFtJykKYmVhbS5BdHRhY2htZW50MCA9IGF0dGFjaDAK",
+"YmVhbS5BdHRhY2htZW50MSA9IGF0dGFjaDEKYmVhbS5TZWdtZW50cyA9IDc1MDAKYmVhbS5XaWR0aDAgPSAxCmJlYW0uV2lkdGgx",
+"ID0gMQpiZWFtLkZhY2VDYW1lcmEgPSB0cnVlCmJlYW0uQ29sb3IgPSBDb2xvclNlcXVlbmNlLm5ldyhDb2xvcjMuZnJvbVJHQigy",
+"NTUsIDI1NSwgMjU1KSkKYmVhbS5UcmFuc3BhcmVuY3kgPSBOdW1iZXJTZXF1ZW5jZS5uZXcoewogICAgTnVtYmVyU2VxdWVuY2VL",
+"ZXlwb2ludC5uZXcoMCwgMSksCiAgICBOdW1iZXJTZXF1ZW5jZUtleXBvaW50Lm5ldygwLjAxLCAwKSwKICAgIE51bWJlclNlcXVl",
+"bmNlS2V5cG9pbnQubmV3KDEsIDApCn0pCmJlYW0uRW5hYmxlZCA9IHRydWUKYmVhbS5QYXJlbnQgPSB3b3Jrc3BhY2UuVGVycmFp",
+"bgoKbG9jYWwgcG9zUGFydCA9IEluc3RhbmNlLm5ldygnUGFydCcsIHdvcmtzcGFjZS5UZXJyYWluKQpwb3NQYXJ0LkFuY2hvcmVk",
+"ID0gdHJ1ZQpwb3NQYXJ0LkNhbkNvbGxpZGUgPSBmYWxzZQpwb3NQYXJ0LkNhc3RTaGFkb3cgPSBmYWxzZQpwb3NQYXJ0LlNpemUg",
+"PSBWZWN0b3IzLm5ldygzLCAzLCAzKQpwb3NQYXJ0LlNoYXBlID0gRW51bS5QYXJ0VHlwZS5CYWxsCnBvc1BhcnQuQ29sb3IgPSBD",
+"b2xvcjMuZnJvbVJHQigwLCAwLCAwKQoKbG9jYWwgaHVkRm9sZGVyID0gbmlsCnBjYWxsKGZ1bmN0aW9uKCkKICAgIGh1ZEZvbGRl",
+"ciA9IChnZXRodWkgYW5kIGdldGh1aSgpKSBvciBnYW1lOkdldFNlcnZpY2UoJ0NvcmVHdWknKQplbmQpCmlmIG5vdCBodWRGb2xk",
+"ZXIgb3IgKGh1ZEZvbGRlci5OYW1lID09ICdDb3JlR3VpJyBhbmQgbm90IHBjYWxsKGZ1bmN0aW9uKCkgSW5zdGFuY2UubmV3KCdG",
+"b2xkZXInLCBodWRGb2xkZXIpOkRlc3Ryb3koKSBlbmQpKSB0aGVuCiAgICBodWRGb2xkZXIgPSBscDpXYWl0Rm9yQ2hpbGQoJ1Bs",
+"YXllckd1aScsIDEwKQplbmQKCmxvY2FsIHNnID0gSW5zdGFuY2UubmV3KCdTY3JlZW5HdWknKQpzZy5SZXNldE9uU3Bhd24gPSBm",
+"YWxzZQpzZy5QYXJlbnQgPSBodWRGb2xkZXIKc2cuWkluZGV4QmVoYXZpb3IgPSBFbnVtLlpJbmRleEJlaGF2aW9yLlNpYmxpbmcK",
+"CmxvY2FsIGNvbnRhaW5lciA9IEluc3RhbmNlLm5ldygnQ2FudmFzR3JvdXAnKQpjb250YWluZXIuU2l6ZSA9IFVEaW0yLm5ldygx",
+"LCAwLCAwLCAxMDApCmNvbnRhaW5lci5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLjUsIDAsIDAuMDUsIDApCmNvbnRhaW5lci5BbmNo",
+"b3JQb2ludCA9IFZlY3RvcjIubmV3KDAuNSwgMCkKY29udGFpbmVyLkJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAxCmNvbnRhaW5l",
+"ci5Hcm91cFRyYW5zcGFyZW5jeSA9IDEKY29udGFpbmVyLlZpc2libGUgPSB0cnVlCmNvbnRhaW5lci5QYXJlbnQgPSBzZwoKbG9j",
+"YWwgaHVkVmlzaWJsZSA9IGZhbHNlCmxvY2FsIHVwZGF0ZUhVRFZpc2liaWxpdHkgPSBmdW5jdGlvbihzaG93KQogICAgaWYgc2hv",
+"dyBhbmQgbm90IGh1ZFZpc2libGUgdGhlbgogICAgICAgIGh1ZFZpc2libGUgPSB0cnVlCiAgICAgICAgdHdlZW5TZXJ2aWNlOkNy",
+"ZWF0ZShjb250YWluZXIsIFR3ZWVuSW5mby5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YWQsIEVudW0uRWFzaW5nRGlyZWN0",
+"aW9uLk91dCksIHtHcm91cFRyYW5zcGFyZW5jeSA9IDB9KTpQbGF5KCkKICAgIGVsc2VpZiBub3Qgc2hvdyBhbmQgaHVkVmlzaWJs",
+"ZSB0aGVuCiAgICAgICAgaHVkVmlzaWJsZSA9IGZhbHNlCiAgICAgICAgdHdlZW5TZXJ2aWNlOkNyZWF0ZShjb250YWluZXIsIFR3",
+"ZWVuSW5mby5uZXcoMC4zLCBFbnVtLkVhc2luZ1N0eWxlLlF1YWQsIEVudW0uRWFzaW5nRGlyZWN0aW9uLk91dCksIHtHcm91cFRy",
+"YW5zcGFyZW5jeSA9IDF9KTpQbGF5KCkKICAgIGVuZAplbmQKCmxvY2FsIGNvbnRhaW5lclNjYWxlID0gSW5zdGFuY2UubmV3KCdV",
+"SVNjYWxlJywgY29udGFpbmVyKQoKbG9jYWwgdXBkYXRlU2NhbGUgPSBmdW5jdGlvbigpCiAgICBsb2NhbCB2cCA9IGNhbWVyYS5W",
+"aWV3cG9ydFNpemUKICAgIGxvY2FsIHNjYWxlID0gKHZwLlggLyAxMTAwKQogICAgY29udGFpbmVyU2NhbGUuU2NhbGUgPSBtYXRo",
+"LmNsYW1wKHNjYWxlLCAwLjUsIDEuMikKZW5kCgpjYW1lcmE6R2V0UHJvcGVydHlDaGFuZ2VkU2lnbmFsKCdWaWV3cG9ydFNpemUn",
+"KTpDb25uZWN0KHVwZGF0ZVNjYWxlKQp1cGRhdGVTY2FsZSgpCgpsb2NhbCBsYXlvdXQgPSBJbnN0YW5jZS5uZXcoJ1VJTGlzdExh",
+"eW91dCcpCmxheW91dC5GaWxsRGlyZWN0aW9uID0gRW51bS5GaWxsRGlyZWN0aW9uLkhvcml6b250YWwKbGF5b3V0Lkhvcml6b250",
+"YWxBbGlnbm1lbnQgPSBFbnVtLkhvcml6b250YWxBbGlnbm1lbnQuQ2VudGVyCmxheW91dC5WZXJ0aWNhbEFsaWdubWVudCA9IEVu",
+"dW0uVmVydGljYWxBbGlnbm1lbnQuQ2VudGVyCmxheW91dC5Tb3J0T3JkZXIgPSBFbnVtLlNvcnRPcmRlci5MYXlvdXRPcmRlcgps",
+"YXlvdXQuUGFkZGluZyA9IFVEaW0ubmV3KDAsIDEwKQpsYXlvdXQuUGFyZW50ID0gY29udGFpbmVyCgpsb2NhbCBhc3NpZ25Gb250",
+"ID0gZnVuY3Rpb24oaW5zdGFuY2UsIGZvbnQpCiAgICBwY2FsbChmdW5jdGlvbigpCiAgICAgICAgaW5zdGFuY2UuRm9udCA9IGZv",
+"bnQKICAgIGVuZCkKZW5kCgpsb2NhbCBjcmVhdGVDYXJkID0gZnVuY3Rpb24odGl0bGVUeHQpCiAgICBsb2NhbCBjYXJkID0gSW5z",
+"dGFuY2UubmV3KCdGcmFtZScpCiAgICBjYXJkLkJhY2tncm91bmRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1",
+"KQogICAgY2FyZC5CYWNrZ3JvdW5kVHJhbnNwYXJlbmN5ID0gMAogICAgY2FyZC5Cb3JkZXJTaXplUGl4ZWwgPSAwCiAgICAKICAg",
+"IGxvY2FsIGdyYWRpZW50ID0gSW5zdGFuY2UubmV3KCdVSUdyYWRpZW50JykKICAgIGdyYWRpZW50LkNvbG9yID0gQ29sb3JTZXF1",
+"ZW5jZS5uZXcoewogICAgICAgIENvbG9yU2VxdWVuY2VLZXlwb2ludC5uZXcoMCwgQ29sb3IzLmZyb21SR0IoNDUsIDQ1LCA1MCkp",
+"LAogICAgICAgIENvbG9yU2VxdWVuY2VLZXlwb2ludC5uZXcoMSwgQ29sb3IzLmZyb21SR0IoMTUsIDE1LCAxOCkpCiAgICB9KQog",
+"ICAgZ3JhZGllbnQuUm90YXRpb24gPSA5MAogICAgZ3JhZGllbnQuUGFyZW50ID0gY2FyZAogICAgCiAgICBpZiB0aXRsZVR4dCA9",
+"PSAnVGhyb3cgVHlwZScgdGhlbgogICAgICAgIGNhcmQuU2l6ZSA9IFVEaW0yLm5ldygwLCAxMTAsIDAsIDgwKQogICAgZWxzZQog",
+"ICAgICAgIGNhcmQuU2l6ZSA9IFVEaW0yLm5ldygwLCA5NSwgMCwgODApCiAgICBlbmQKICAgIAogICAgY2FyZC5MYXlvdXRPcmRl",
+"ciA9IG51bUNhcmRzCiAgICBjYXJkLlBhcmVudCA9IGNvbnRhaW5lcgoKICAgIGxvY2FsIGNvcm5lciA9IEluc3RhbmNlLm5ldygn",
+"VUlDb3JuZXInLCBjYXJkKQogICAgY29ybmVyLkNvcm5lclJhZGl1cyA9IFVEaW0ubmV3KDAsIDgpCgogICAgbG9jYWwgc3Ryb2tl",
+"ID0gSW5zdGFuY2UubmV3KCdVSVN0cm9rZScsIGNhcmQpCiAgICBzdHJva2UuQ29sb3IgPSBDb2xvcjMuZnJvbVJHQig4MCwgODAs",
+"IDg1KQogICAgc3Ryb2tlLlRoaWNrbmVzcyA9IDEuMDAwCgogICAgbG9jYWwgcGFkZGluZyA9IEluc3RhbmNlLm5ldygnVUlQYWRk",
+"aW5nJywgY2FyZCkKICAgIHBhZGRpbmcuUGFkZGluZ1RvcCA9IFVEaW0ubmV3KDAsIDUpCiAgICBwYWRkaW5nLlBhZGRpbmdCb3R0",
+"b20gPSBVRGltLm5ldygwLCA1KQoKICAgIGxvY2FsIHRpdGxlID0gSW5zdGFuY2UubmV3KCdUZXh0TGFiZWwnKQogICAgdGl0bGUu",
+"QmFja2dyb3VuZENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDI1NSwgMjU1LCAyNTUpCiAgICB0aXRsZS5CYWNrZ3JvdW5kVHJhbnNw",
+"YXJlbmN5ID0gMS4wMDAKICAgIHRpdGxlLkJvcmRlclNpemVQaXhlbCA9IDAKICAgIHRpdGxlLlBvc2l0aW9uID0gVURpbTIubmV3",
+"KDAsIDAsIDAuNzAsIDApCiAgICB0aXRsZS5TaXplID0gVURpbTIubmV3KDEsIDAsIDAsIDE1KQogICAgYXNzaWduRm9udCh0aXRs",
+"ZSwgRW51bS5Gb250LkdvdGhhbUJvbGQpCiAgICB0aXRsZS5UZXh0ID0gdGl0bGVUeHQKICAgIHRpdGxlLlRleHRDb2xvcjMgPSBD",
+"b2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KQogICAgdGl0bGUuVGV4dFNjYWxlZCA9IHRydWUKICAgIHRpdGxlLlBhcmVudCA9",
+"IGNhcmQKCiAgICBsb2NhbCB2YWxCdG4gPSBJbnN0YW5jZS5uZXcoJ1RleHRCdXR0b24nKQogICAgdmFsQnRuLkJhY2tncm91bmRD",
+"b2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KQogICAgdmFsQnRuLkJhY2tncm91bmRUcmFuc3BhcmVuY3kgPSAx",
+"LjAwMAogICAgdmFsQnRuLkJvcmRlclNpemVQaXhlbCA9IDAKICAgIHZhbEJ0bi5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAw",
+"LjE1LCAwKQogICAgdmFsQnRuLlNpemUgPSBVRGltMi5uZXcoMSwgMCwgMC41LCAwKQogICAgYXNzaWduRm9udCh2YWxCdG4sIEVu",
+"dW0uRm9udC5Hb3RoYW1Cb2xkKQogICAgdmFsQnRuLlRleHQgPSAnLScKICAgIHZhbEJ0bi5UZXh0Q29sb3IzID0gQ29sb3IzLmZy",
+"b21SR0IoMjU1LCAyNTUsIDI1NSkKICAgIHZhbEJ0bi5UZXh0U2NhbGVkID0gdHJ1ZQogICAgdmFsQnRuLkF1dG9CdXR0b25Db2xv",
+"ciA9IGZhbHNlCiAgICB2YWxCdG4uUGFyZW50ID0gY2FyZAoKICAgIGlmIHRpdGxlVHh0ID09ICdUaHJvdyBUeXBlJyB0aGVuCiAg",
+"ICAgICAgbG9jYWwgdWlTY2FsZSA9IEluc3RhbmNlLm5ldygnVUlTY2FsZScsIGNhcmQpCiAgICAgICAgdmFsQnRuLk1vdXNlQnV0",
+"dG9uMURvd246Q29ubmVjdChmdW5jdGlvbigpCiAgICAgICAgICAgIGxvY2FsIGMgPSBscC5DaGFyYWN0ZXIKICAgICAgICAgICAg",
+"aWYgbm90IGMgb3Igbm90IGM6RmluZEZpcnN0Q2hpbGQoJ0Zvb3RiYWxsJykgdGhlbiByZXR1cm4gZW5kCiAgICAgICAgICAgIHR3",
+"ZWVuU2VydmljZTpDcmVhdGUodWlTY2FsZSwgVHdlZW5JbmZvLm5ldygwLjEsIEVudW0uRWFzaW5nU3R5bGUuUXVhZCwgRW51bS5F",
+"YXNpbmdEaXJlY3Rpb24uT3V0KSwge1NjYWxlID0gMC45fSk6UGxheSgpCiAgICAgICAgZW5kKQogICAgICAgIHZhbEJ0bi5Nb3Vz",
+"ZUJ1dHRvbjFVcDpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgbG9jYWwgYyA9IGxwLkNoYXJhY3RlcgogICAgICAgICAg",
+"ICBpZiBub3QgYyBvciBub3QgYzpGaW5kRmlyc3RDaGlsZCgnRm9vdGJhbGwnKSB0aGVuIHJldHVybiBlbmQKICAgICAgICAgICAg",
+"dHdlZW5TZXJ2aWNlOkNyZWF0ZSh1aVNjYWxlLCBUd2VlbkluZm8ubmV3KDAuMSwgRW51bS5FYXNpbmdTdHlsZS5RdWFkLCBFbnVt",
+"LkVhc2luZ0RpcmVjdGlvbi5PdXQpLCB7U2NhbGUgPSAxfSk6UGxheSgpCiAgICAgICAgICAgIG1vZGVJbmRleCA9IG1vZGVJbmRl",
+"eCArIDEKICAgICAgICAgICAgaWYgbW9kZUluZGV4ID4gI01vZGVPcmRlciB0aGVuIG1vZGVJbmRleCA9IDEgZW5kCiAgICAgICAg",
+"ZW5kKQogICAgZW5kCgogICAgaWYgdGl0bGVUeHQgPT0gJ1BsYXllcicgdGhlbgogICAgICAgIGxvY2FsIGxvY2tlZExibCA9IElu",
+"c3RhbmNlLm5ldygnVGV4dExhYmVsJykKICAgICAgICBsb2NrZWRMYmwuU2l6ZSA9IFVEaW0yLm5ldygxLCAwLCAwLjI1LCAwKQog",
+"ICAgICAgIGxvY2tlZExibC5Qb3NpdGlvbiA9IFVEaW0yLm5ldygwLCAwLCAwLjA1LCAwKQogICAgICAgIGxvY2tlZExibC5CYWNr",
+"Z3JvdW5kVHJhbnNwYXJlbmN5ID0gMQogICAgICAgIGxvY2tlZExibC5UZXh0ID0gJ0xPQ0tFRCcKICAgICAgICBsb2NrZWRMYmwu",
+"VGV4dENvbG9yMyA9IENvbG9yMy5mcm9tUkdCKDI1NSwgNTAsIDUwKQogICAgICAgIGFzc2lnbkZvbnQobG9ja2VkTGJsLCBFbnVt",
+"LkZvbnQuR290aGFtQm9sZCkKICAgICAgICBsb2NrZWRMYmwuVGV4dFNpemUgPSAxMgogICAgICAgIGxvY2tlZExibC5WaXNpYmxl",
+"ID0gZmFsc2UKICAgICAgICBsb2NrZWRMYmwuWkluZGV4ID0gMgogICAgICAgIGxvY2tlZExibC5QYXJlbnQgPSBjYXJkCgogICAg",
+"ICAgIExvY2tlZExhYmVsID0gbG9ja2VkTGJsCgogICAgICAgIGxvY2FsIGxvY2tPdmVybGF5ID0gSW5zdGFuY2UubmV3KCdUZXh0",
+"QnV0dG9uJykKICAgICAgICBsb2NrT3ZlcmxheS5TaXplID0gVURpbTIubmV3KDEsIDAsIDEsIDApCiAgICAgICAgbG9ja092ZXJs",
+"YXkuQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9IDEKICAgICAgICBsb2NrT3ZlcmxheS5UZXh0ID0gJycKICAgICAgICBsb2NrT3Zl",
+"cmxheS5aSW5kZXggPSA1CiAgICAgICAgbG9ja092ZXJsYXkuUGFyZW50ID0gY2FyZAoKICAgICAgICBsb2NrT3ZlcmxheS5Nb3Vz",
+"ZUJ1dHRvbjFDbGljazpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgbG9jYWwgYyA9IGxwLkNoYXJhY3RlcgogICAgICAg",
+"ICAgICBpZiBub3QgYyBvciBub3QgYzpGaW5kRmlyc3RDaGlsZCgnRm9vdGJhbGwnKSB0aGVuIHJldHVybiBlbmQKICAgICAgICAg",
+"ICAgaWYgdGFyZ2V0IG9yIHRhcmdldExvY2tlZCB0aGVuCiAgICAgICAgICAgICAgICB0YXJnZXRMb2NrZWQgPSBub3QgdGFyZ2V0",
+"TG9ja2VkCiAgICAgICAgICAgICAgICBpZiB0YXJnZXRMb2NrZWQgdGhlbgogICAgICAgICAgICAgICAgICAgIGxvY2tlZFRhcmdl",
+"dCA9IHRhcmdldAogICAgICAgICAgICAgICAgICAgIGlmIExvY2tlZExhYmVsIHRoZW4gTG9ja2VkTGFiZWwuVmlzaWJsZSA9IHRy",
+"dWUgZW5kCiAgICAgICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICAgICAgbG9ja2VkVGFyZ2V0ID0gbmlsCiAgICAgICAg",
+"ICAgICAgICAgICAgaWYgTG9ja2VkTGFiZWwgdGhlbiBMb2NrZWRMYWJlbC5WaXNpYmxlID0gZmFsc2UgZW5kCiAgICAgICAgICAg",
+"ICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kKQogICAgICAgIAogICAgICAgIExvY2tUb2dnbGVCdG4gPSB2YWxC",
+"dG4KICAgIGVuZAoKICAgIEhVRENhcmRzW3RpdGxlVHh0XSA9IHZhbEJ0bgogICAgbnVtQ2FyZHMgPSBudW1DYXJkcyArIDEKZW5k",
+"CgpjcmVhdGVDYXJkKCdBbmdsZScpCmNyZWF0ZUNhcmQoJ1Rocm93IFR5cGUnKQpjcmVhdGVDYXJkKCdQbGF5ZXInKQpjcmVhdGVD",
+"YXJkKCdBaXJ0aW1lJykKY3JlYXRlQ2FyZCgnUG93ZXInKQoKbG9jYWwgZ2V0QWN0aXZlQm90cyA9IGZ1bmN0aW9uKCkKICAgIGxv",
+"Y2FsIGJvdHMgPSB7fQogICAgbG9jYWwgbnBjd3IgPSB3b3Jrc3BhY2U6RmluZEZpcnN0Q2hpbGQoJ25wY3dyJykKICAgIGlmIG5w",
+"Y3dyIHRoZW4KICAgICAgICBsb2NhbCBhID0gbnBjd3I6RmluZEZpcnN0Q2hpbGQoJ2EnKQogICAgICAgIGlmIGEgdGhlbgogICAg",
+"ICAgICAgICBsb2NhbCBib3QxID0gYTpGaW5kRmlyc3RDaGlsZCgnYm90IDEnKQogICAgICAgICAgICBpZiBib3QxIGFuZCBib3Qx",
+"OklzQSgnTW9kZWwnKSB0aGVuIHRhYmxlLmluc2VydChib3RzLCBib3QxKSBlbmQKICAgICAgICBlbmQKICAgICAgICBsb2NhbCBi",
+"ID0gbnBjd3I6RmluZEZpcnN0Q2hpbGQoJ2InKQogICAgICAgIGlmIGIgdGhlbgogICAgICAgICAgICBsb2NhbCBib3QzID0gYjpG",
+"aW5kRmlyc3RDaGlsZCgnYm90IDMnKQogICAgICAgICAgICBpZiBib3QzIGFuZCBib3QzOklzQSgnTW9kZWwnKSB0aGVuIHRhYmxl",
+"Lmluc2VydChib3RzLCBib3QzKSBlbmQKICAgICAgICBlbmQKICAgIGVuZAogICAgcmV0dXJuIGJvdHMKZW5kCgpsb2NhbCBwZXJm",
+"b3JtVGhyb3cgPSBmdW5jdGlvbigpCiAgICBpZiBub3QgZW5hYmxlUWJBaW1ib3QuVmFsdWUgdGhlbiByZXR1cm4gZW5kCgogICAg",
+"bG9jYWwgY2hhcmFjdGVyID0gbHAuQ2hhcmFjdGVyCiAgICBpZiBub3QgY2hhcmFjdGVyIHRoZW4gcmV0dXJuIGVuZAoKICAgIGxv",
+"Y2FsIGZvb3RiYWxsID0gY2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkT2ZDbGFzcygnVG9vbCcpCiAgICBpZiBub3QgZm9vdGJhbGwg",
+"dGhlbiByZXR1cm4gZW5kCgogICAgbG9jYWwgaGFuZGxlID0gZm9vdGJhbGw6RmluZEZpcnN0Q2hpbGQoJ0hhbmRsZScpCiAgICBp",
+"ZiBub3QgaGFuZGxlIHRoZW4gcmV0dXJuIGVuZAoKICAgIGxvY2FsIHJlbW90ZSA9IGhhbmRsZTpGaW5kRmlyc3RDaGlsZCgnUmVt",
+"b3RlRXZlbnQnKQogICAgaWYgbm90IHJlbW90ZSB0aGVuIHJldHVybiBlbmQKCiAgICBsb2NhbCBoZWFkID0gY2hhcmFjdGVyOkZp",
+"bmRGaXJzdENoaWxkKCdIZWFkJykKICAgIGlmIG5vdCBoZWFkIHRoZW4gcmV0dXJuIGVuZAoKICAgIGxvY2FsIHJvb3QgPSBjaGFy",
+"YWN0ZXI6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKQogICAgaWYgbm90IHJvb3QgdGhlbiByZXR1cm4gZW5kCgog",
+"ICAgbG9jYWwgZmluYWxEaXJlY3Rpb24gPSBkaXJlY3Rpb24gb3IgVmVjdG9yMy5uZXcoMCwgMSwgMCkKCiAgICBpZiBpc1ByYWN0",
+"aWNlIHRoZW4KICAgICAgICBsb2NhbCBhcmcgPSAnQ2xpY2tlZCcKICAgICAgICBsb2NhbCBhcmcxID0gaGVhZC5Qb3NpdGlvbgog",
+"ICAgICAgIGxvY2FsIGFyZzIgPSBoZWFkLlBvc2l0aW9uICsgZmluYWxEaXJlY3Rpb24gKiAxMDAwMAogICAgICAgIGxvY2FsIGFy",
+"ZzMgPSB0b251bWJlcihwb3dlcikgb3IgMAogICAgICAgIHJlbW90ZTpGaXJlU2VydmVyKGFyZywgYXJnMSwgYXJnMiwgYXJnMykK",
+"ICAgIGVsc2UKICAgICAgICBsb2NhbCBhcmcgPSAnQ2xpY2tlZCcKICAgICAgICBsb2NhbCBhcmcxID0gKHJvb3QuQ0ZyYW1lICog",
+"Q0ZyYW1lLm5ldygwLCAxLjUsIDApKS5Qb3NpdGlvbiArIFZlY3RvcjMubmV3KDcwMDAwMDAwKQogICAgICAgIGxvY2FsIGFyZzIg",
+"PSBoZWFkLlBvc2l0aW9uICsgZmluYWxEaXJlY3Rpb24gKiAxMDAwMAogICAgICAgIGxvY2FsIGFyZzMgPSB0b251bWJlcihwb3dl",
+"cikgb3IgMAogICAgICAgIHJlbW90ZTpGaXJlU2VydmVyKGFyZywgYXJnMSwgYXJnMiwgYXJnMywgMSkKICAgIGVuZAplbmQKCmxv",
+"Y2FsIGZpbmRSb3V0ZSA9IGZ1bmN0aW9uKGNoYXJhY3RlcikKICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiByZXR1cm4gJ3N0YXRp",
+"b25hcnknLCBWZWN0b3IzLnplcm8gZW5kCiAgICBsb2NhbCBpc1BsYXllciA9IHBsYXllcnM6R2V0UGxheWVyRnJvbUNoYXJhY3Rl",
+"cihjaGFyYWN0ZXIpCiAgICBsb2NhbCBodW1hbm9pZCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWQnKQogICAg",
+"bG9jYWwgdGFyZ2V0SFJQID0gY2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQYXJ0JykKICAgIGxvY2FsIHFi",
+"Q2hhciA9IGxwLkNoYXJhY3RlcgogICAgbG9jYWwgcWJIUlAgPSBxYkNoYXIgYW5kIHFiQ2hhcjpGaW5kRmlyc3RDaGlsZCgnSHVt",
+"YW5vaWRSb290UGFydCcpCiAgICAKICAgIGlmIG5vdCBodW1hbm9pZCBvciBub3QgdGFyZ2V0SFJQIG9yIG5vdCBxYkhSUCB0aGVu",
+"IAogICAgICAgIHJldHVybiAnc3RhdGlvbmFyeScsIFZlY3RvcjMuemVybyAKICAgIGVuZAogICAgCiAgICBsb2NhbCBtb3ZlRGly",
+"ZWN0aW9uID0gVmVjdG9yMy56ZXJvCiAgICBpZiBpc1BsYXllciB0aGVuCiAgICAgICAgbW92ZURpcmVjdGlvbiA9IGh1bWFub2lk",
+"Lk1vdmVEaXJlY3Rpb24KICAgIGVsc2UKICAgICAgICBsb2NhbCB3dHBEaWZmID0gaHVtYW5vaWQuV2Fsa1RvUG9pbnQgLSB0YXJn",
+"ZXRIUlAuUG9zaXRpb24KICAgICAgICBtb3ZlRGlyZWN0aW9uID0gd3RwRGlmZi5NYWduaXR1ZGUgPiAwLjAxIGFuZCB3dHBEaWZm",
+"LlVuaXQgb3IgVmVjdG9yMy56ZXJvCiAgICBlbmQKICAgIAogICAgbG9jYWwgdG9XUiA9IHRhcmdldEhSUC5Qb3NpdGlvbiAtIHFi",
+"SFJQLlBvc2l0aW9uCiAgICBsb2NhbCBkaXN0YW5jZSA9IHRvbnVtYmVyKHRvV1IuTWFnbml0dWRlKSBvciAwCgogICAgbG9jYWwg",
+"dG9XUkRpciA9IFZlY3RvcjMubmV3KHRvV1IuWCwgMCwgdG9XUi5aKQogICAgaWYgdG9XUkRpci5NYWduaXR1ZGUgPiAwLjAxIHRo",
+"ZW4KICAgICAgICB0b1dSRGlyID0gdG9XUkRpci5Vbml0CiAgICBlbHNlCiAgICAgICAgdG9XUkRpciA9IFZlY3RvcjMubmV3KDAs",
+"IDAsIDEpCiAgICBlbmQKCiAgICBsb2NhbCBtZEZsYXQgPSBWZWN0b3IzLm5ldyhtb3ZlRGlyZWN0aW9uLlgsIDAsIG1vdmVEaXJl",
+"Y3Rpb24uWikKICAgIGlmIG1kRmxhdC5NYWduaXR1ZGUgPCAwLjAxIHRoZW4KICAgICAgICByZXR1cm4gJ3N0YXRpb25hcnknLCBt",
+"b3ZlRGlyZWN0aW9uCiAgICBlbmQKICAgIG1kRmxhdCA9IG1kRmxhdC5Vbml0CgogICAgbG9jYWwgZG90ID0gdG9udW1iZXIobWRG",
+"bGF0OkRvdCh0b1dSRGlyKSkgb3IgMAoKICAgIGlmIGRvdCA+IDAuNzUgdGhlbgogICAgICAgIHJldHVybiAnZ28vZmFkZScsIG1v",
+"dmVEaXJlY3Rpb24KICAgIGVsc2VpZiBkb3QgPj0gMC4yNSBhbmQgZG90IDw9IDAuNzUgdGhlbgogICAgICAgIGlmIGRpc3RhbmNl",
+"IDw9IDEyMCB0aGVuIHJldHVybiAnc2xhbnQnLCBtb3ZlRGlyZWN0aW9uCiAgICAgICAgZWxzZWlmIGRpc3RhbmNlIDw9IDE2MCB0",
+"aGVuIHJldHVybiAnc2VhbScsIG1vdmVEaXJlY3Rpb24KICAgICAgICBlbHNlIHJldHVybiAncG9zdC9jb3JuZXInLCBtb3ZlRGly",
+"ZWN0aW9uIGVuZAogICAgZWxzZWlmIGRvdCA+IC0wLjI1IGFuZCBkb3QgPCAwLjI1IHRoZW4KICAgICAgICBpZiBkaXN0YW5jZSA8",
+"PSA2MCB0aGVuIHJldHVybiAnZHJhZycsIG1vdmVEaXJlY3Rpb24KICAgICAgICBlbHNlaWYgZGlzdGFuY2UgPD0gMTMwIHRoZW4g",
+"cmV0dXJuICdpbi9vdXQnLCBtb3ZlRGlyZWN0aW9uCiAgICAgICAgZWxzZSByZXR1cm4gJ2ZsYXQnLCBtb3ZlRGlyZWN0aW9uIGVu",
+"ZAogICAgZWxzZQogICAgICAgIGlmIGRpc3RhbmNlIDw9IDUwIHRoZW4gcmV0dXJuICdoaXRjaCcsIG1vdmVEaXJlY3Rpb24KICAg",
+"ICAgICBlbHNlIHJldHVybiAnY3VybC9jb21lYmFjaycsIG1vdmVEaXJlY3Rpb24gZW5kCiAgICBlbmQKZW5kCgpsb2NhbCBpc1dS",
+"T3BlbiA9IGZ1bmN0aW9uKHdyQ2hhcikKICAgIGlmIG5vdCB3ckNoYXIgdGhlbiByZXR1cm4gZmFsc2UgZW5kCiAgICBsb2NhbCBo",
+"cnAgPSB3ckNoYXI6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKQogICAgaWYgbm90IGhycCB0aGVuIHJldHVybiBm",
+"YWxzZSBlbmQKCiAgICBsb2NhbCBpc0NvdmVyZWQgPSBmYWxzZQogICAgbG9jYWwgXywgbW92ZURpciA9IGZpbmRSb3V0ZSh3ckNo",
+"YXIpCiAgICAKICAgIGxvY2FsIHRlYW1Db3VudCA9IDAKICAgIHBjYWxsKGZ1bmN0aW9uKCkgdGVhbUNvdW50ID0gdG9udW1iZXIo",
+"I2dhbWU6R2V0U2VydmljZSgnVGVhbXMnKTpHZXRUZWFtcygpKSBvciAwIGVuZCkKICAgIAogICAgbG9jYWwgY2hlY2tEQiA9IGZ1",
+"bmN0aW9uKGRiSFJQKQogICAgICAgIGxvY2FsIHRvREIgPSBkYkhSUC5Qb3NpdGlvbiAtIGhycC5Qb3NpdGlvbgogICAgICAgIGxv",
+"Y2FsIGRpc3QgPSB0b251bWJlcih0b0RCLk1hZ25pdHVkZSkgb3IgMAogICAgICAgIGlmIGRpc3QgPCA1IHRoZW4KICAgICAgICAg",
+"ICAgbG9jYWwgcm91dGVEaXJYWiA9IFZlY3RvcjMubmV3KG1vdmVEaXIuWCwgMCwgbW92ZURpci5aKQogICAgICAgICAgICBpZiAo",
+"dG9udW1iZXIocm91dGVEaXJYWi5NYWduaXR1ZGUpIG9yIDApID4gMC4wMSB0aGVuCiAgICAgICAgICAgICAgICByb3V0ZURpclha",
+"ID0gcm91dGVEaXJYWi5Vbml0CiAgICAgICAgICAgICAgICBsb2NhbCBkb3QgPSB0b251bWJlcih0b0RCLlVuaXQ6RG90KHJvdXRl",
+"RGlyWFopKSBvciAwCiAgICAgICAgICAgICAgICBpZiBkb3QgPiAtMC43IHRoZW4gCiAgICAgICAgICAgICAgICAgICAgcmV0dXJu",
+"IHRydWUKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICByZXR1cm4gdHJ1ZQogICAg",
+"ICAgICAgICBlbmQKICAgICAgICBlbmQKICAgICAgICByZXR1cm4gZmFsc2UKICAgIGVuZAoKICAgIGxvY2FsIGNoZWNrUFIgPSBm",
+"dW5jdGlvbihkYkhSUCkKICAgICAgICBsb2NhbCBxYkNoYXIgPSBscC5DaGFyYWN0ZXIKICAgICAgICBpZiBub3QgcWJDaGFyIHRo",
+"ZW4gcmV0dXJuIGZhbHNlIGVuZAogICAgICAgIGxvY2FsIHFiSFJQID0gcWJDaGFyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJv",
+"b3RQYXJ0JykKICAgICAgICBpZiBub3QgcWJIUlAgdGhlbiByZXR1cm4gZmFsc2UgZW5kCiAgICAgICAgCiAgICAgICAgbG9jYWwg",
+"dG9QUiA9IGRiSFJQLlBvc2l0aW9uIC0gcWJIUlAuUG9zaXRpb24KICAgICAgICBsb2NhbCB0b1dSID0gaHJwLlBvc2l0aW9uIC0g",
+"cWJIUlAuUG9zaXRpb24KICAgICAgICBsb2NhbCB3ckRpc3QgPSB0b251bWJlcih0b1dSLk1hZ25pdHVkZSkgb3IgMAogICAgICAg",
+"IGxvY2FsIHdyRGlyID0gdG9XUi5Vbml0CiAgICAgICAgCiAgICAgICAgbG9jYWwgcHJvaiA9IHRvbnVtYmVyKHRvUFI6RG90KHdy",
+"RGlyKSkgb3IgMAogICAgICAgIGlmIHByb2ogPiAyIGFuZCBwcm9qIDwgKHdyRGlzdCAqIDAuNikgdGhlbgogICAgICAgICAgICBs",
+"b2NhbCBkaXN0VG9MaW5lID0gdG9udW1iZXIoKHRvUFIgLSAod3JEaXIgKiBwcm9qKSkuTWFnbml0dWRlKSBvciAwCiAgICAgICAg",
+"ICAgIGlmIGRpc3RUb0xpbmUgPCA1LjUgdGhlbgogICAgICAgICAgICAgICAgcmV0dXJuIHRydWUKICAgICAgICAgICAgZW5kCiAg",
+"ICAgICAgZW5kCiAgICAgICAgcmV0dXJuIGZhbHNlCiAgICBlbmQKCiAgICBsb2NhbCBwbHJzID0gcGxheWVyczpHZXRQbGF5ZXJz",
+"KCkKICAgIGZvciBpID0gMSwgI3BscnMgZG8KICAgICAgICBsb2NhbCBwbHIgPSBwbHJzW2ldCiAgICAgICAgaWYgcGxyIH49IGxw",
+"IGFuZCBwbHIuQ2hhcmFjdGVyIHRoZW4KICAgICAgICAgICAgbG9jYWwgaXNFbmVteSA9IHRydWUKICAgICAgICAgICAgaWYgdGVh",
+"bUNvdW50ID4gMSBhbmQgbHAuVGVhbSB+PSBuaWwgYW5kIHBsci5UZWFtIH49IG5pbCBhbmQgbHAuVGVhbSA9PSBwbHIuVGVhbSB0",
+"aGVuCiAgICAgICAgICAgICAgICBpc0VuZW15ID0gZmFsc2UKICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGlmIGlzRW5lbXkg",
+"dGhlbgogICAgICAgICAgICAgICAgbG9jYWwgZGJIUlAgPSBwbHIuQ2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJv",
+"b3RQYXJ0JykKICAgICAgICAgICAgICAgIGlmIGRiSFJQIGFuZCAoY2hlY2tEQihkYkhSUCkgb3IgY2hlY2tQUihkYkhSUCkpIHRo",
+"ZW4KICAgICAgICAgICAgICAgICAgICBpc0NvdmVyZWQgPSB0cnVlCiAgICAgICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAg",
+"ICAgICAgIGVuZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZAoKICAgIGlmIG5vdCBpc0NvdmVyZWQgdGhlbgog",
+"ICAgICAgIGxvY2FsIGJvdHMgPSBnZXRBY3RpdmVCb3RzKCkKICAgICAgICBmb3IgaSA9IDEsICNib3RzIGRvCiAgICAgICAgICAg",
+"IGxvY2FsIGJvdCA9IGJvdHNbaV0KICAgICAgICAgICAgaWYgYm90IH49IHdyQ2hhciB0aGVuCiAgICAgICAgICAgICAgICBsb2Nh",
+"bCBkYkhSUCA9IGJvdDpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICAgICAgICAgICAgICBpZiBkYkhSUCBh",
+"bmQgKGNoZWNrREIoZGJIUlApIG9yIGNoZWNrUFIoZGJIUlApKSB0aGVuCiAgICAgICAgICAgICAgICAgICAgaXNDb3ZlcmVkID0g",
+"dHJ1ZQogICAgICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAg",
+"ZW5kCiAgICBlbmQKCiAgICByZXR1cm4gbm90IGlzQ292ZXJlZAplbmQKCmxvY2FsIGdldFRhcmdldCA9IGZ1bmN0aW9uKCkKICAg",
+"IGlmIGlzVGhyb3dpbmcgYW5kIHRhcmdldCB0aGVuIHJldHVybiB0YXJnZXQgZW5kCiAgICAKICAgIGlmIHRhcmdldExvY2tlZCBh",
+"bmQgbG9ja2VkVGFyZ2V0IGFuZCBsb2NrZWRUYXJnZXQ6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKSB0aGVuCiAg",
+"ICAgICAgcmV0dXJuIGxvY2tlZFRhcmdldAogICAgZWxzZWlmIHRhcmdldExvY2tlZCB0aGVuCiAgICAgICAgdGFyZ2V0TG9ja2Vk",
+"ID0gZmFsc2UKICAgICAgICBsb2NrZWRUYXJnZXQgPSBuaWwKICAgIGVuZAoKICAgIGxvY2FsIHBvdGVudGlhbFRhcmdldHMgPSB7",
+"fQogICAgbG9jYWwgdGVhbUNvdW50ID0gMAogICAgcGNhbGwoZnVuY3Rpb24oKSB0ZWFtQ291bnQgPSB0b251bWJlcigjZ2FtZTpH",
+"ZXRTZXJ2aWNlKCdUZWFtcycpOkdldFRlYW1zKCkpIG9yIDAgZW5kKQoKICAgIGxvY2FsIHBscnMgPSBwbGF5ZXJzOkdldFBsYXll",
+"cnMoKQogICAgZm9yIGkgPSAxLCAjcGxycyBkbwogICAgICAgIGxvY2FsIHBsciA9IHBscnNbaV0KICAgICAgICBpZiBwbHIgfj0g",
+"bHAgYW5kIHBsci5DaGFyYWN0ZXIgYW5kIHBsci5DaGFyYWN0ZXI6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKSB0",
+"aGVuCiAgICAgICAgICAgIGxvY2FsIGlzVGVhbW1hdGUgPSB0cnVlCiAgICAgICAgICAgIGlmIHRlYW1Db3VudCA+IDEgYW5kIGxw",
+"LlRlYW0gfj0gbmlsIGFuZCBwbHIuVGVhbSB+PSBuaWwgYW5kIGxwLlRlYW0gfj0gcGxyLlRlYW0gdGhlbgogICAgICAgICAgICAg",
+"ICAgaXNUZWFtbWF0ZSA9IGZhbHNlCiAgICAgICAgICAgIGVuZAogICAgICAgICAgICAKICAgICAgICAgICAgaWYgaXNUZWFtbWF0",
+"ZSB0aGVuCiAgICAgICAgICAgICAgICBsb2NhbCBlSHVtID0gcGxyLkNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZE9mQ2xhc3MoJ0h1",
+"bWFub2lkJykKICAgICAgICAgICAgICAgIGlmIG5vdCBlSHVtIG9yIG5vdCBlSHVtLlNpdCB0aGVuCiAgICAgICAgICAgICAgICAg",
+"ICAgdGFibGUuaW5zZXJ0KHBvdGVudGlhbFRhcmdldHMsIHBsci5DaGFyYWN0ZXIpCiAgICAgICAgICAgICAgICBlbmQKICAgICAg",
+"ICAgICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKCiAgICBsb2NhbCBib3RzID0gZ2V0QWN0aXZlQm90cygpCiAgICBmb3IgaSA9",
+"IDEsICNib3RzIGRvCiAgICAgICAgbG9jYWwgYm90ID0gYm90c1tpXQogICAgICAgIGlmIGJvdDpGaW5kRmlyc3RDaGlsZCgnSHVt",
+"YW5vaWRSb290UGFydCcpIHRoZW4KICAgICAgICAgICAgbG9jYWwgZUh1bSA9IGJvdDpGaW5kRmlyc3RDaGlsZE9mQ2xhc3MoJ0h1",
+"bWFub2lkJykKICAgICAgICAgICAgaWYgbm90IGVIdW0gb3Igbm90IGVIdW0uU2l0IHRoZW4KICAgICAgICAgICAgICAgIHRhYmxl",
+"Lmluc2VydChwb3RlbnRpYWxUYXJnZXRzLCBib3QpCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCgogICAgaWYg",
+"I3BvdGVudGlhbFRhcmdldHMgPT0gMCB0aGVuIHJldHVybiBuaWwgZW5kCgogICAgaWYgYXV0b0Nob29zZVdyLlZhbHVlIHRoZW4K",
+"ICAgICAgICBsb2NhbCBiZXN0QXV0b1RhcmdldCA9IG5pbAogICAgICAgIGxvY2FsIGJlc3RBdXRvRGlzdCA9IG1hdGguaHVnZQog",
+"ICAgICAgIGxvY2FsIHFiSFJQID0gbHAuQ2hhcmFjdGVyIGFuZCBscC5DaGFyYWN0ZXI6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lk",
+"Um9vdFBhcnQnKQogICAgICAgIGxvY2FsIHFiUG9zID0gcWJIUlAgYW5kIHFiSFJQLlBvc2l0aW9uIG9yIFZlY3RvcjMuemVybwoK",
+"ICAgICAgICBmb3IgaSA9IDEsICNwb3RlbnRpYWxUYXJnZXRzIGRvCiAgICAgICAgICAgIGxvY2FsIGNoYXIgPSBwb3RlbnRpYWxU",
+"YXJnZXRzW2ldCiAgICAgICAgICAgIGxvY2FsIGhycCA9IGNoYXI6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKQog",
+"ICAgICAgICAgICBpZiBocnAgdGhlbgogICAgICAgICAgICAgICAgbG9jYWwgXywgb25TY3JlZW4gPSBjYW1lcmE6V29ybGRUb1Zp",
+"ZXdwb3J0UG9pbnQoaHJwLlBvc2l0aW9uKQogICAgICAgICAgICAgICAgaWYgb25TY3JlZW4gYW5kIGlzV1JPcGVuKGNoYXIpIHRo",
+"ZW4KICAgICAgICAgICAgICAgICAgICBsb2NhbCBkaXN0ID0gdG9udW1iZXIoKGhycC5Qb3NpdGlvbiAtIHFiUG9zKS5NYWduaXR1",
+"ZGUpIG9yIDAKICAgICAgICAgICAgICAgICAgICBpZiBkaXN0IDwgYmVzdEF1dG9EaXN0IHRoZW4KICAgICAgICAgICAgICAgICAg",
+"ICAgICAgYmVzdEF1dG9EaXN0ID0gZGlzdAogICAgICAgICAgICAgICAgICAgICAgICBiZXN0QXV0b1RhcmdldCA9IGNoYXIKICAg",
+"ICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgICAg",
+"ICAKICAgICAgICBpZiBiZXN0QXV0b1RhcmdldCB0aGVuCiAgICAgICAgICAgIHJldHVybiBiZXN0QXV0b1RhcmdldAogICAgICAg",
+"IGVuZAogICAgZW5kCgogICAgbG9jYWwgbW91c2VQb3MyRCA9IHVzZXJJbnB1dFNlcnZpY2U6R2V0TW91c2VMb2NhdGlvbigpCiAg",
+"ICBsb2NhbCBiZXN0TWFudWFsVGFyZ2V0ID0gbmlsCiAgICBsb2NhbCBiZXN0TW91c2VEaXN0ID0gbWF0aC5odWdlCgogICAgZm9y",
+"IGkgPSAxLCAjcG90ZW50aWFsVGFyZ2V0cyBkbwogICAgICAgIGxvY2FsIGNoYXIgPSBwb3RlbnRpYWxUYXJnZXRzW2ldCiAgICAg",
+"ICAgbG9jYWwgaHJwID0gY2hhcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICAgICAgaWYgaHJwIHRoZW4K",
+"ICAgICAgICAgICAgbG9jYWwgc2NyZWVuUG9zLCBvblNjcmVlbiA9IGNhbWVyYTpXb3JsZFRvVmlld3BvcnRQb2ludChocnAuUG9z",
+"aXRpb24pCiAgICAgICAgICAgIGlmIG9uU2NyZWVuIHRoZW4KICAgICAgICAgICAgICAgIGxvY2FsIGRpc3QgPSB0b251bWJlcigo",
+"VmVjdG9yMi5uZXcoc2NyZWVuUG9zLlgsIHNjcmVlblBvcy5ZKSAtIG1vdXNlUG9zMkQpLk1hZ25pdHVkZSkgb3IgMAogICAgICAg",
+"ICAgICAgICAgaWYgZGlzdCA8IGJlc3RNb3VzZURpc3QgdGhlbgogICAgICAgICAgICAgICAgICAgIGJlc3RNb3VzZURpc3QgPSBk",
+"aXN0CiAgICAgICAgICAgICAgICAgICAgYmVzdE1hbnVhbFRhcmdldCA9IGNoYXIKICAgICAgICAgICAgICAgIGVuZAogICAgICAg",
+"ICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZAoKICAgIHJldHVybiBiZXN0TWFudWFsVGFyZ2V0CmVuZAoKbG9jYWwgY2FsY3Vs",
+"YXRlUm91dGVEaXJlY3Rpb24gPSBmdW5jdGlvbih0YXJnZXRDaGFyKQogICAgaWYgbm90IHRhcmdldENoYXIgdGhlbiByZXR1cm4g",
+"J01hZycgZW5kCiAgICBsb2NhbCB0YXJnZXRIUlAgPSB0YXJnZXRDaGFyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQYXJ0",
+"JykKICAgIGlmIG5vdCB0YXJnZXRIUlAgdGhlbiByZXR1cm4gJ01hZycgZW5kCiAgICAKICAgIGxvY2FsIGxwQ2hhciA9IGxwLkNo",
+"YXJhY3RlcgogICAgbG9jYWwgbHBIUlAgPSBscENoYXIgYW5kIGxwQ2hhcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFy",
+"dCcpCiAgICBpZiBub3QgbHBIUlAgdGhlbiByZXR1cm4gJ01hZycgZW5kCgogICAgbG9jYWwgcm91dGUsIG1vdmVEaXIgPSBmaW5k",
+"Um91dGUodGFyZ2V0Q2hhcikKICAgIGxvY2FsIGRpc3QgPSB0b251bWJlcigodGFyZ2V0SFJQLlBvc2l0aW9uIC0gbHBIUlAuUG9z",
+"aXRpb24pLk1hZ25pdHVkZSkgb3IgMAogICAgaWYgZGlzdCA8IDQwIHRoZW4gcmV0dXJuICdCdWxsZXQnIGVuZAogICAgCiAgICBs",
+"b2NhbCBkYkRpc3RhbmNlID0gbWF0aC5odWdlCiAgICBsb2NhbCB0ZWFtQ291bnQgPSAwCiAgICBwY2FsbChmdW5jdGlvbigpIHRl",
+"YW1Db3VudCA9IHRvbnVtYmVyKCNnYW1lOkdldFNlcnZpY2UoJ1RlYW1zJyk6R2V0VGVhbXMoKSkgb3IgMCBlbmQpCgogICAgbG9j",
+"YWwgcGxycyA9IHBsYXllcnM6R2V0UGxheWVycygpCiAgICBmb3IgaSA9IDEsICNwbHJzIGRvCiAgICAgICAgbG9jYWwgcGxyID0g",
+"cGxyc1tpXQogICAgICAgIGlmIHBsciB+PSBscCBhbmQgcGxyLkNoYXJhY3RlciB0aGVuCiAgICAgICAgICAgIGxvY2FsIGVIUlAg",
+"PSBwbHIuQ2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQYXJ0JykKICAgICAgICAgICAgaWYgZUhSUCBhbmQg",
+"ZUhSUCB+PSB0YXJnZXRIUlAgdGhlbgogICAgICAgICAgICAgICAgbG9jYWwgaXNFbmVteSA9IHRydWUKICAgICAgICAgICAgICAg",
+"IGlmIHRlYW1Db3VudCA+IDEgYW5kIGxwLlRlYW0gfj0gbmlsIGFuZCBwbHIuVGVhbSB+PSBuaWwgYW5kIGxwLlRlYW0gPT0gcGxy",
+"LlRlYW0gdGhlbgogICAgICAgICAgICAgICAgICAgIGlzRW5lbXkgPSBmYWxzZQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAg",
+"ICAgICAgICBpZiBpc0VuZW15IHRoZW4KICAgICAgICAgICAgICAgICAgICBsb2NhbCBkID0gdG9udW1iZXIoKGVIUlAuUG9zaXRp",
+"b24gLSB0YXJnZXRIUlAuUG9zaXRpb24pLk1hZ25pdHVkZSkgb3IgMAogICAgICAgICAgICAgICAgICAgIGlmIGQgPCBkYkRpc3Rh",
+"bmNlIHRoZW4gZGJEaXN0YW5jZSA9IGQgZW5kCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5k",
+"CiAgICBlbmQKCiAgICBsb2NhbCBib3RzID0gZ2V0QWN0aXZlQm90cygpCiAgICBmb3IgaSA9IDEsICNib3RzIGRvCiAgICAgICAg",
+"bG9jYWwgYm90ID0gYm90c1tpXQogICAgICAgIGxvY2FsIGJIUlAgPSBib3Q6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBh",
+"cnQnKQogICAgICAgIGlmIGJIUlAgYW5kIGJIUlAgfj0gdGFyZ2V0SFJQIHRoZW4KICAgICAgICAgICAgbG9jYWwgZCA9IHRvbnVt",
+"YmVyKChiSFJQLlBvc2l0aW9uIC0gdGFyZ2V0SFJQLlBvc2l0aW9uKS5NYWduaXR1ZGUpIG9yIDAKICAgICAgICAgICAgaWYgZCA8",
+"IGRiRGlzdGFuY2UgdGhlbiBkYkRpc3RhbmNlID0gZCBlbmQKICAgICAgICBlbmQKICAgIGVuZAoKICAgIGxvY2FsIHdpdGhpbiA9",
+"IGZ1bmN0aW9uKHRibCwgdmFsKQogICAgICAgIGZvciBpID0gMSwgI3RibCBkbwogICAgICAgICAgICBpZiB0YmxbaV0gPT0gdmFs",
+"IHRoZW4gcmV0dXJuIHRydWUgZW5kCiAgICAgICAgZW5kCiAgICAgICAgcmV0dXJuIGZhbHNlCiAgICBlbmQKCiAgICBsb2NhbCBm",
+"b3J3YXJkUm91dGVzID0geydnby9mYWRlJywgJ3Bvc3QvY29ybmVyJywgJ3NlYW0nLCAnY3VybC9jb21lYmFjaycsICdzdGF0aW9u",
+"YXJ5J30KICAgIGxvY2FsIHNpZGV3YXlSb3V0ZXMgPSB7J2luL291dCcsICdmbGF0JywgJ3doZWVsJ30KICAgIAogICAgaWYgcm91",
+"dGUgPT0gJ3NsYW50JyBvciByb3V0ZSA9PSAnaGl0Y2gnIG9yIHJvdXRlID09ICdkcmFnJyBvciByb3V0ZSA9PSAnaW4vb3V0JyBv",
+"ciByb3V0ZSA9PSAnZmxhdCcgdGhlbgogICAgICAgIHJldHVybiAnQnVsbGV0JwogICAgZWxzZWlmIHdpdGhpbihmb3J3YXJkUm91",
+"dGVzLCByb3V0ZSkgdGhlbgogICAgICAgIGlmIGRiRGlzdGFuY2UgPiA1IHRoZW4gcmV0dXJuICgodG9udW1iZXIoYW5nbGUpIG9y",
+"IDQ1KSA8IDQwKSBhbmQgJ0p1bXAnIG9yICdEaW1lJwogICAgICAgIGVsc2VpZiBkYkRpc3RhbmNlID4gMiB0aGVuIHJldHVybiAn",
+"RGl2ZScgZW5kCiAgICAgICAgcmV0dXJuICdNYWcnCiAgICBlbHNlaWYgd2l0aGluKHNpZGV3YXlSb3V0ZXMsIHJvdXRlKSB0aGVu",
+"CiAgICAgICAgaWYgZGJEaXN0YW5jZSA+IDQgdGhlbiByZXR1cm4gJ0RpbWUnIGVuZAogICAgICAgIHJldHVybiAnSnVtcCcKICAg",
+"IGVuZAogICAgcmV0dXJuICdEaW1lJwplbmQKCmxvY2FsIGdldE1vZGVMZWFkID0gZnVuY3Rpb24obW9kZU5hbWUpCiAgICBpZiBt",
+"b2RlTmFtZSA9PSAnRGltZScgdGhlbiByZXR1cm4gbGVhZERpbWUKICAgIGVsc2VpZiBtb2RlTmFtZSA9PSAnTWFnJyB0aGVuIHJl",
+"dHVybiBsZWFkTWFnCiAgICBlbHNlaWYgbW9kZU5hbWUgPT0gJ0RpdmUnIHRoZW4gcmV0dXJuIGxlYWREaXZlCiAgICBlbHNlaWYg",
+"bW9kZU5hbWUgPT0gJ0p1bXAnIHRoZW4gcmV0dXJuIGxlYWRKdW1wCiAgICBlbHNlaWYgbW9kZU5hbWUgPT0gJ0J1bGxldCcgdGhl",
+"biByZXR1cm4gbGVhZEJ1bGxldAogICAgZW5kCiAgICByZXR1cm4gOC42CmVuZAoKbG9jYWwgZ2V0TW9kZVlMZWFkID0gZnVuY3Rp",
+"b24obW9kZU5hbWUpCiAgICBpZiBtb2RlTmFtZSA9PSAnRGltZScgdGhlbiByZXR1cm4geUxlYWREaW1lCiAgICBlbHNlaWYgbW9k",
+"ZU5hbWUgPT0gJ01hZycgdGhlbiByZXR1cm4geUxlYWRNYWcKICAgIGVsc2VpZiBtb2RlTmFtZSA9PSAnRGl2ZScgdGhlbiByZXR1",
+"cm4geUxlYWREaXZlCiAgICBlbHNlaWYgbW9kZU5hbWUgPT0gJ0p1bXAnIHRoZW4gcmV0dXJuIHlMZWFkSnVtcAogICAgZWxzZWlm",
+"IG1vZGVOYW1lID09ICdCdWxsZXQnIHRoZW4gcmV0dXJuIHlMZWFkQnVsbGV0CiAgICBlbmQKICAgIHJldHVybiAwCmVuZAoKbG9j",
+"YWwgZ2V0UGluZyA9IGZ1bmN0aW9uKCkKICAgIGxvY2FsIG5ldHdvcmtQaW5nID0gMAogICAgcGNhbGwoZnVuY3Rpb24oKSBuZXR3",
+"b3JrUGluZyA9IHRvbnVtYmVyKGxwOkdldE5ldHdvcmtQaW5nKCkpIG9yIDAgZW5kKQogICAgbG9jYWwgZGF0YVBpbmcgPSAwCiAg",
+"ICBwY2FsbChmdW5jdGlvbigpIGRhdGFQaW5nID0gKHRvbnVtYmVyKHN0YXRzLk5ldHdvcmsuU2VydmVyU3RhdHNJdGVtWydEYXRh",
+"IFBpbmcnXTpHZXRWYWx1ZSgpKSBvciAwKSAvIDEwMDAgZW5kKQogICAgaWYgZGF0YVBpbmcgPT0gMCB0aGVuIGRhdGFQaW5nID0g",
+"bmV0d29ya1BpbmcgZW5kCiAgICByZXR1cm4gbmV0d29ya1BpbmcgKyBkYXRhUGluZwplbmQKCmxvY2FsIHNvbHZlS2luZW1hdGlj",
+"cyA9IGZ1bmN0aW9uKG9yaWdpbiwgdGFyZ2V0UG9zLCBncmF2aXR5TWFnKQogICAgbG9jYWwgZyA9IHRvbnVtYmVyKGdyYXZpdHlN",
+"YWcpIG9yIDI4CiAgICBsb2NhbCBkaXNwbGFjZW1lbnQgPSB0YXJnZXRQb3MgLSBvcmlnaW4KICAgIGxvY2FsIHggPSB0b251bWJl",
+"cihWZWN0b3IzLm5ldyhkaXNwbGFjZW1lbnQuWCwgMCwgZGlzcGxhY2VtZW50LlopLk1hZ25pdHVkZSkgb3IgMAogICAgbG9jYWwg",
+"eSA9IHRvbnVtYmVyKGRpc3BsYWNlbWVudC5ZKSBvciAwCiAgICAKICAgIGxvY2FsIGlubmVyID0gKHheMikgKyAoeV4yKQogICAg",
+"bG9jYWwgcm9vdCA9IHRvbnVtYmVyKG1hdGguc3FydChtYXRoLm1heChpbm5lciwgMCkpKSBvciAwCiAgICAKICAgIGxvY2FsIGJh",
+"c2VBbmdsZVJhZCA9IG1hdGgucmFkKDQ1KQogICAgaWYgeCA+IDAuMDEgdGhlbgogICAgICAgIGxvY2FsIGF0YW5SZXMgPSB0b251",
+"bWJlcihtYXRoLmF0YW4oKHkgKyByb290KSAvIHgpKSBvciBiYXNlQW5nbGVSYWQKICAgICAgICBpZiBhdGFuUmVzIGFuZCBhdGFu",
+"UmVzID09IGF0YW5SZXMgdGhlbgogICAgICAgICAgICBiYXNlQW5nbGVSYWQgPSBhdGFuUmVzCiAgICAgICAgZW5kCiAgICBlbmQK",
+"ICAgIAogICAgbG9jYWwgYW5nbGVSYWQgPSB0b251bWJlcihtYXRoLmNsYW1wKGJhc2VBbmdsZVJhZCAqIDAuODUsIG1hdGgucmFk",
+"KC0xNSksIG1hdGgucmFkKDY1KSkpIG9yIDAKICAgIAogICAgbG9jYWwgY29zQSA9IHRvbnVtYmVyKG1hdGguY29zKGFuZ2xlUmFk",
+"KSkgb3IgMQogICAgbG9jYWwgdGFuQSA9IHRvbnVtYmVyKG1hdGgudGFuKGFuZ2xlUmFkKSkgb3IgMAogICAgCiAgICBsb2NhbCB2",
+"MCA9IDk1CiAgICBsb2NhbCBkZW5vbSA9IDIgKiAoY29zQV4yKSAqICh4ICogdGFuQSAtIHkpCiAgICAKICAgIGlmIGRlbm9tID4g",
+"MC4wMDEgdGhlbgogICAgICAgIGxvY2FsIG51bSA9IGcgKiAoeF4yKQogICAgICAgIGxvY2FsIHJlcyA9IHRvbnVtYmVyKG1hdGgu",
+"c3FydChudW0gLyBkZW5vbSkpIG9yIHYwCiAgICAgICAgaWYgcmVzIGFuZCByZXMgPT0gcmVzIGFuZCByZXMgfj0gbWF0aC5odWdl",
+"IHRoZW4KICAgICAgICAgICAgdjAgPSByZXMKICAgICAgICBlbmQKICAgIGVuZAogICAgCiAgICBsb2NhbCBhbmdsZURlZyA9IHRv",
+"bnVtYmVyKG1hdGguZGVnKGFuZ2xlUmFkKSkgb3IgNDUKICAgIHJldHVybiB2MCwgYW5nbGVEZWcKZW5kCgpsb2NhbCBhdXRvQWlt",
+"ID0gZnVuY3Rpb24odGFyZ2V0SFJQKQogICAgbG9jYWwgaGVhZCA9IGxwLkNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSGVhZCcp",
+"CiAgICBsb2NhbCBvcmlnaW4gPSBoZWFkIGFuZCBoZWFkLlBvc2l0aW9uIG9yIGxwLkNoYXJhY3Rlci5IdW1hbm9pZFJvb3RQYXJ0",
+"LlBvc2l0aW9uCiAgICAKICAgIGxvY2FsIHRhcmdldENoYXIgPSB0YXJnZXRIUlAuUGFyZW50CiAgICBsb2NhbCB0YXJnZXRIZWFk",
+"T2JqID0gdGFyZ2V0Q2hhciBhbmQgdGFyZ2V0Q2hhcjpGaW5kRmlyc3RDaGlsZCgnSGVhZCcpCiAgICBsb2NhbCB0YXJnZXRIZWFk",
+"ID0gdGFyZ2V0SGVhZE9iaiBhbmQgdGFyZ2V0SGVhZE9iai5Qb3NpdGlvbiBvciB0YXJnZXRIUlAuUG9zaXRpb24gKyBWZWN0b3Iz",
+"Lm5ldygwLCAxLjUsIDApCiAgICAKICAgIGxvY2FsIG1vdmVEaXIgPSBWZWN0b3IzLnplcm8KICAgIGxvY2FsIHRhcmdldEh1bSA9",
+"IHRhcmdldENoYXIgYW5kIHRhcmdldENoYXI6RmluZEZpcnN0Q2hpbGRPZkNsYXNzKCdIdW1hbm9pZCcpCiAgICBpZiB0YXJnZXRI",
+"dW0gdGhlbgogICAgICAgIGxvY2FsIGlzQm90ID0gdGFyZ2V0Q2hhcjpGaW5kRmlyc3RBbmNlc3RvcignbnBjd3InKSB+PSBuaWwK",
+"ICAgICAgICBpZiBpc0JvdCB0aGVuCiAgICAgICAgICAgIGxvY2FsIHd0cERpZmYgPSB0YXJnZXRIdW0uV2Fsa1RvUG9pbnQgLSB0",
+"YXJnZXRIUlAuUG9zaXRpb24KICAgICAgICAgICAgbG9jYWwgZGlyID0gVmVjdG9yMy5uZXcod3RwRGlmZi5YLCAwLCB3dHBEaWZm",
+"LlopCiAgICAgICAgICAgIG1vdmVEaXIgPSBkaXIuTWFnbml0dWRlID4gMC4xIGFuZCBkaXIuVW5pdCBvciBWZWN0b3IzLnplcm8K",
+"ICAgICAgICBlbHNlCiAgICAgICAgICAgIGxvY2FsIG1kID0gdGFyZ2V0SHVtLk1vdmVEaXJlY3Rpb24KICAgICAgICAgICAgbG9j",
+"YWwgZmxhdE1kID0gVmVjdG9yMy5uZXcobWQuWCwgMCwgbWQuWikKICAgICAgICAgICAgbW92ZURpciA9IGZsYXRNZC5NYWduaXR1",
+"ZGUgPiAwLjAxIGFuZCBmbGF0TWQuVW5pdCBvciBWZWN0b3IzLnplcm8KICAgICAgICBlbmQKICAgIGVuZAogICAgCiAgICBsb2Nh",
+"bCBwaW5nID0gdG9udW1iZXIoZ2V0UGluZygpKSBvciAwCiAgICBsb2NhbCBzcGVlZCA9IDIwCiAgICAKICAgIGxvY2FsIG1vZGVO",
+"YW1lID0gTW9kZU9yZGVyW21vZGVJbmRleF0KICAgIGxvY2FsIGlzQ2hlc3RQYXNzID0gKG1vZGVOYW1lID09ICdCdWxsZXQnIG9y",
+"IHRhcmdldCBhbmQgKGZpbmRSb3V0ZSh0YXJnZXQpID09ICdzbGFudCcgb3IgZmluZFJvdXRlKHRhcmdldCkgPT0gJ2RyYWcnIG9y",
+"IGZpbmRSb3V0ZSh0YXJnZXQpID09ICdpbi9vdXQnIG9yIGZpbmRSb3V0ZSh0YXJnZXQpID09ICdmbGF0JyBvciBmaW5kUm91dGUo",
+"dGFyZ2V0KSA9PSAnaGl0Y2gnIG9yIGZpbmRSb3V0ZSh0YXJnZXQpID09ICdjdXJsL2NvbWViYWNrJykpCiAgICBsb2NhbCByb3V0",
+"ZVN0ciA9IHRhcmdldCBhbmQgZmluZFJvdXRlKHRhcmdldCkgb3IgJ2dvL2ZhZGUnCiAgICAKICAgIGxvY2FsIGFjdGl2ZVBvd2Vy",
+"ID0gdG9udW1iZXIocG93ZXIpIG9yIDYwCiAgICBpZiBtb2RlTmFtZSA9PSAnQnVsbGV0JyBvciAoYXV0b1Bvd2VyLlZhbHVlIGFu",
+"ZCBpc0NoZXN0UGFzcykgb3IgaGlnaFBvd2VyT25seS5WYWx1ZSB0aGVuCiAgICAgICAgYWN0aXZlUG93ZXIgPSA5NQogICAgZW5k",
+"CiAgICAKICAgIGxvY2FsIGxEaXZpc29yID0gNjAKICAgIGlmIGFjdGl2ZVBvd2VyID4gNzUgdGhlbgogICAgICAgIGxEaXZpc29y",
+"ID0gNjAgKyAoKGFjdGl2ZVBvd2VyIC0gNzUpICogMS41KQogICAgZW5kCiAgICAKICAgIGxvY2FsIGRpc3RUb1RhcmdldCA9IHRv",
+"bnVtYmVyKCh0YXJnZXRIUlAuUG9zaXRpb24gLSBvcmlnaW4pLk1hZ25pdHVkZSkgb3IgMAogICAgbG9jYWwgZXN0RmxpZ2h0VGlt",
+"ZSA9IGRpc3RUb1RhcmdldCAvICh0b251bWJlcihsRGl2aXNvcikgb3IgNjApCiAgICAKICAgIGxvY2FsIGN1cnJlbnRIVmVsID0g",
+"YWN0aXZlUG93ZXIgKiAodG9udW1iZXIobWF0aC5jb3MobWF0aC5yYWQodG9udW1iZXIoYW5nbGUpIG9yIDQ1KSkpIG9yIDEpCiAg",
+"ICBpZiBjdXJyZW50SFZlbCA8IDMwIHRoZW4gY3VycmVudEhWZWwgPSA1NSBlbmQKICAgIAogICAgbG9jYWwgZXN0SFZlbCA9ICht",
+"b2RlTmFtZSA9PSAnQnVsbGV0JyBvciBpc0NoZXN0UGFzcykgYW5kIDkwIG9yIGN1cnJlbnRIVmVsCiAgICAKICAgIGxvY2FsIG1v",
+"ZGVMZWFkU2NhbGUgPSAodG9udW1iZXIoZ2V0TW9kZUxlYWQobW9kZU5hbWUpKSBvciA4LjYpICogMy4wNQogICAgbG9jYWwgc2Vs",
+"ZWN0ZWRNb2RlWUxlYWQgPSB0b251bWJlcihnZXRNb2RlWUxlYWQobW9kZU5hbWUpKSBvciAwCiAgICAKICAgIGxvY2FsIHJvdXRl",
+"TXVsdGlwbGllcnMgPSB7CiAgICAgICAgWydzbGFudCddID0gMC40NSwKICAgICAgICBbJ2RyYWcnXSA9IDAuNiwKICAgICAgICBb",
+"J2luL291dCddID0gMC42NSwKICAgICAgICBbJ2ZsYXQnXSA9IDAuNjUsCiAgICAgICAgWyd3aGVlbCddID0gMC45LAogICAgICAg",
+"IFsnZ28vZmFkZSddID0gMS4wLAogICAgICAgIFsncG9zdC9jb3JuZXInXSA9IDAuODUsCiAgICAgICAgWydzZWFtJ10gPSAwLjg1",
+"LAogICAgICAgIFsnaGl0Y2gnXSA9IDAuMSwKICAgICAgICBbJ2N1cmwvY29tZWJhY2snXSA9IDAuMSwKICAgICAgICBbJ3N0YXRp",
+"b25hcnknXSA9IDAuMAogICAgfQogICAgbG9jYWwgck11bHQgPSB0b251bWJlcihyb3V0ZU11bHRpcGxpZXJzW3JvdXRlU3RyXSkg",
+"b3IgMS4wCiAgICAKICAgIGxvY2FsIGRpclVuaXQgPSBtb3ZlRGlyLk1hZ25pdHVkZSA+IDAuMDEgYW5kIG1vdmVEaXIuVW5pdCBv",
+"ciBWZWN0b3IzLnplcm8KICAgIAogICAgbG9jYWwgdGFyZ2V0QmFzZSA9IChpc0NoZXN0UGFzcyBvciBtb2RlTmFtZSA9PSAnQnVs",
+"bGV0JykgYW5kIHRhcmdldEhSUC5Qb3NpdGlvbiBvciB0YXJnZXRIZWFkCiAgICAKICAgIGxvY2FsIHN0YW5kaW5nU3RpbGwgPSAo",
+"cm91dGVTdHIgPT0gJ3N0YXRpb25hcnknKQogICAgCiAgICBpZiBzdGFuZGluZ1N0aWxsIHRoZW4KICAgICAgICBsZWFkUG9zID0g",
+"dGFyZ2V0SGVhZAogICAgZWxzZQogICAgICAgIGxlYWRQb3MgPSB0YXJnZXRCYXNlICsgKG1vdmVEaXIgKiBzcGVlZCAqIGVzdEZs",
+"aWdodFRpbWUgKiByTXVsdCkgKyAobW92ZURpciAqIHNwZWVkICogcGluZyAqIHJNdWx0KSArIChkaXJVbml0ICogbW9kZUxlYWRT",
+"Y2FsZSAqIHJNdWx0KQogICAgICAgIGxlYWRQb3MgPSBsZWFkUG9zICsgKGRpclVuaXQgKiAodG9udW1iZXIodGhyb3dMZWFkT2Zm",
+"c2V0LlZhbHVlKSBvciAwKSkKICAgICAgICAKICAgICAgICBpZiBpc0NoZXN0UGFzcyBvciBtb2RlTmFtZSA9PSAnQnVsbGV0JyB0",
+"aGVuCiAgICAgICAgICAgIGxlYWRQb3MgPSBWZWN0b3IzLm5ldyhsZWFkUG9zLlgsIHRhcmdldEhlYWQuWSwgbGVhZFBvcy5aKQog",
+"ICAgICAgICAgICBzZWxlY3RlZE1vZGVZTGVhZCA9IDAKICAgICAgICBlbmQKICAgICAgICAKICAgICAgICBsZWFkUG9zID0gbGVh",
+"ZFBvcyArIFZlY3RvcjMubmV3KDAsIHNlbGVjdGVkTW9kZVlMZWFkLCAwKQogICAgICAgIGxlYWRQb3MgPSBsZWFkUG9zICsgVmVj",
+"dG9yMy5uZXcoMCwgdG9udW1iZXIodGhyb3dIZWlnaHRPZmZzZXQuVmFsdWUpIG9yIDAsIDApCiAgICAgICAgCiAgICAgICAgaWYg",
+"cm91dGVTdHIgPT0gJ2N1cmwvY29tZWJhY2snIG9yIHJvdXRlU3RyID09ICdoaXRjaCcgdGhlbgogICAgICAgICAgICBsZWFkUG9z",
+"ID0gbGVhZFBvcyArIFZlY3RvcjMubmV3KDAsIC01LCAwKQogICAgICAgIGVuZAogICAgZW5kCiAgICAKICAgIGxvY2FsIGZvcmNl",
+"QXV0b0FuZ2xlID0gKG1vZGVOYW1lID09ICdCdWxsZXQnIG9yIGlzQ2hlc3RQYXNzIG9yICh0b251bWJlcihwb3dlcikgb3IgNjAp",
+"ID09IDk1IG9yIGhpZ2hQb3dlck9ubHkuVmFsdWUpCiAgICBpZiBub3QgYXV0b0FuZ2xlLlZhbHVlIGFuZCBub3QgZm9yY2VBdXRv",
+"QW5nbGUgdGhlbgogICAgICAgIGxlYWRQb3MgPSBsZWFkUG9zICsgVmVjdG9yMy5uZXcoMCwgdG9udW1iZXIoY3VzdG9tSGVpZ2h0",
+"LlZhbHVlKSBvciAwLCAwKQogICAgZW5kCiAgICAKICAgIGlmIGFudGlEQi5WYWx1ZSB0aGVuCiAgICAgICAgbG9jYWwgcHVzaFZl",
+"YyA9IFZlY3RvcjMuemVybwogICAgICAgIGxvY2FsIHBscnMgPSBwbGF5ZXJzOkdldFBsYXllcnMoKQogICAgICAgIGxvY2FsIHRl",
+"YW1Db3VudCA9IDAKICAgICAgICBwY2FsbChmdW5jdGlvbigpIHRlYW1Db3VudCA9IHRvbnVtYmVyKCNnYW1lOkdldFNlcnZpY2Uo",
+"J1RlYW1zJyk6R2V0VGVhbXMoKSkgb3IgMCBlbmQpCgogICAgICAgIGZvciBpID0gMSwgI3BscnMgZG8KICAgICAgICAgICAgbG9j",
+"YWwgcGxyID0gcGxyc1tpXQogICAgICAgICAgICBpZiBwbHIgfj0gbHAgYW5kIHBsci5DaGFyYWN0ZXIgdGhlbgogICAgICAgICAg",
+"ICAgICAgbG9jYWwgaXNFbmVteSA9IHRydWUKICAgICAgICAgICAgICAgIGlmIHRlYW1Db3VudCA+IDEgYW5kIGxwLlRlYW0gfj0g",
+"bmlsIGFuZCBwbHIuVGVhbSB+PSBuaWwgYW5kIGxwLlRlYW0gPT0gcGxyLlRlYW0gdGhlbgogICAgICAgICAgICAgICAgICAgIGlz",
+"RW5lbXkgPSBmYWxzZQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICBpZiBpc0VuZW15IHRoZW4KICAgICAgICAg",
+"ICAgICAgICAgICBsb2NhbCBlSFJQID0gcGxyLkNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAg",
+"ICAgICAgICAgICAgICAgICAgaWYgZUhSUCB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIGRpc3QgPSB0b251bWJl",
+"cihWZWN0b3IzLm5ldyhlSFJQLlBvc2l0aW9uLlggLSBsZWFkUG9zLlgsIDAsIGVIUlAuUG9zaXRpb24uWiAtIGxlYWRQb3MuWiku",
+"TWFnbml0dWRlKSBvciAwCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIGRpc3QgPCAodG9udW1iZXIoYW50aURCVGhyZXNob2xk",
+"LlZhbHVlKSBvciAxNSkgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgYXdheSA9IChsZWFkUG9zIC0gZUhS",
+"UC5Qb3NpdGlvbikKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGF3YXkgPSBWZWN0b3IzLm5ldyhhd2F5LlgsIDAsIGF3YXku",
+"WikKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIGF3YXkuTWFnbml0dWRlID4gMCB0aGVuCiAgICAgICAgICAgICAgICAg",
+"ICAgICAgICAgICAgICAgcHVzaFZlYyA9IHB1c2hWZWMgKyAoYXdheS5Vbml0ICogKCh0b251bWJlcihhbnRpREJUaHJlc2hvbGQu",
+"VmFsdWUpIG9yIDE1KSAtIGRpc3QpKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAg",
+"ICAgIGVuZAogICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgIGVuZAogICAgICAg",
+"IGVuZAogICAgICAgIGxlYWRQb3MgPSBwdXNoVmVjICsgbGVhZFBvcwogICAgZW5kCgogICAgbG9jYWwgZlBvcyA9IFZlY3RvcjMu",
+"emVybwogICAgbG9jYWwgZmllbGQgPSB3b3Jrc3BhY2U6RmluZEZpcnN0Q2hpbGQoJ01vZGVscycpCiAgICBpZiBmaWVsZCB0aGVu",
+"IGZpZWxkID0gZmllbGQ6RmluZEZpcnN0Q2hpbGQoJ0ZpZWxkJykgZW5kCiAgICBpZiBmaWVsZCB0aGVuIGZpZWxkID0gZmllbGQ6",
+"RmluZEZpcnN0Q2hpbGQoJ0dyb3VuZCcpIGVuZAogICAgaWYgZmllbGQgdGhlbiBmUG9zID0gZmllbGQuUG9zaXRpb24gZW5kCgog",
+"ICAgaWYgYW50aU9PQi5WYWx1ZSBhbmQgZlBvcyB+PSBWZWN0b3IzLnplcm8gdGhlbgogICAgICAgIGxvY2FsIGhhbGZXaWR0aCA9",
+"IDc1IC0gKHRvbnVtYmVyKGFudGlPT0JUaHJlc2hvbGQuVmFsdWUpIG9yIDUpCiAgICAgICAgbG9jYWwgaGFsZkxlbmd0aCA9IDE3",
+"NSAtICh0b251bWJlcihhbnRpT09CVGhyZXNob2xkLlZhbHVlKSBvciA1KQogICAgICAgIGxlYWRQb3MgPSBWZWN0b3IzLm5ldygK",
+"ICAgICAgICAgICAgbWF0aC5jbGFtcChsZWFkUG9zLlgsIGZQb3MuWCAtIGhhbGZXaWR0aCwgZlBvcy5YICsgaGFsZldpZHRoKSwK",
+"ICAgICAgICAgICAgbGVhZFBvcy5ZLAogICAgICAgICAgICBtYXRoLmNsYW1wKGxlYWRQb3MuWiwgZlBvcy5aIC0gaGFsZkxlbmd0",
+"aCwgZlBvcy5aICsgaGFsZkxlbmd0aCkKICAgICAgICApCiAgICBlbmQKICAgIAogICAgdGFyZ2V0TGVhZFBvcyA9IGxlYWRQb3MK",
+"ICAgIAogICAgbG9jYWwgZ01hZyA9IDI4IAogICAgbG9jYWwgY2FsY1Bvd2VyLCBjYWxjQW5nbGUgPSBzb2x2ZUtpbmVtYXRpY3Mo",
+"b3JpZ2luLCBsZWFkUG9zLCBnTWFnKQogICAgY2FsY1Bvd2VyID0gdG9udW1iZXIoY2FsY1Bvd2VyKSBvciA5NQogICAgY2FsY0Fu",
+"Z2xlID0gdG9udW1iZXIoY2FsY0FuZ2xlKSBvciA0NQogICAgCiAgICBpZiBzdGFuZGluZ1N0aWxsIGFuZCBtb2RlTmFtZSB+PSAn",
+"QnVsbGV0JyBhbmQgbm90IGhpZ2hQb3dlck9ubHkuVmFsdWUgdGhlbgogICAgICAgIGxvY2FsIGR5bmFtaWNUaHJlc2hvbGQgPSB0",
+"b251bWJlcihtYXRoLmNsYW1wKDQgKyAoZGlzdFRvVGFyZ2V0ICogMC4wOCksIDUsIDE0KSkgb3IgMTAKICAgICAgICBpZiBjYWxj",
+"QW5nbGUgPiBkeW5hbWljVGhyZXNob2xkIHRoZW4KICAgICAgICAgICAgbG9jYWwgZGlzcGxhY2VtZW50ID0gbGVhZFBvcyAtIG9y",
+"aWdpbgogICAgICAgICAgICBsb2NhbCB4ID0gdG9udW1iZXIoVmVjdG9yMy5uZXcoZGlzcGxhY2VtZW50LlgsIDAsIGRpc3BsYWNl",
+"bWVudC5aKS5NYWduaXR1ZGUpIG9yIDAKICAgICAgICAgICAgbG9jYWwgeSA9IHRvbnVtYmVyKGRpc3BsYWNlbWVudC5ZKSBvciAw",
+"CiAgICAgICAgICAgIGxvY2FsIGFSYWQgPSB0b251bWJlcihtYXRoLnJhZChkeW5hbWljVGhyZXNob2xkKSkgb3IgMC4xCiAgICAg",
+"ICAgICAgIGxvY2FsIGRlbm9tID0gMiAqIChtYXRoLmNvcyhhUmFkKV4yKSAqICh4ICogbWF0aC50YW4oYVJhZCkgLSB5KQogICAg",
+"ICAgICAgICAKICAgICAgICAgICAgaWYgZGVub20gPiAwLjAwMSB0aGVuCiAgICAgICAgICAgICAgICBsb2NhbCBuZXdQd3IgPSB0",
+"b251bWJlcihtYXRoLnNxcnQoKGdNYWcgKiB4XjIpIC8gZGVub20pKSBvciBjYWxjUG93ZXIKICAgICAgICAgICAgICAgIGlmIG5l",
+"d1B3ciA9PSBuZXdQd3IgYW5kIG5ld1B3ciB+PSBtYXRoLmh1Z2UgdGhlbgogICAgICAgICAgICAgICAgICAgIGNhbGNBbmdsZSA9",
+"IGR5bmFtaWNUaHJlc2hvbGQKICAgICAgICAgICAgICAgICAgICBjYWxjUG93ZXIgPSBuZXdQd3IKICAgICAgICAgICAgICAgIGVu",
+"ZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZAogICAgCiAgICBpZiBoaWdoUG93ZXJPbmx5LlZhbHVlIHRoZW4K",
+"ICAgICAgICBwb3dlciA9IDk1CiAgICAgICAgbG9jYWwgZGlzcGxhY2VtZW50ID0gbGVhZFBvcyAtIG9yaWdpbgogICAgICAgIGxv",
+"Y2FsIHggPSB0b251bWJlcihWZWN0b3IzLm5ldyhkaXNwbGFjZW1lbnQuWCwgMCwgZGlzcGxhY2VtZW50LlopLk1hZ25pdHVkZSkg",
+"b3IgMAogICAgICAgIGxvY2FsIHkgPSB0b251bWJlcihkaXNwbGFjZW1lbnQuWSkgb3IgMAogICAgICAgIAogICAgICAgIGxvY2Fs",
+"IHYyID0gOTVeMgogICAgICAgIGxvY2FsIHY0ID0gOTVeNAogICAgICAgIGxvY2FsIGd4ID0gZ01hZyAqIHgKICAgICAgICBsb2Nh",
+"bCBkaXNjcmltaW5hbnQgPSB2NCAtIGdNYWcgKiAoZ01hZyAqIHheMiArIDIgKiB5ICogdjIpCiAgICAgICAgCiAgICAgICAgaWYg",
+"ZGlzY3JpbWluYW50ID49IDAgdGhlbgogICAgICAgICAgICBhbmdsZSA9IHRvbnVtYmVyKG1hdGguY2xhbXAobWF0aC5kZWcobWF0",
+"aC5hdGFuKCh2MiAtIG1hdGguc3FydChkaXNjcmltaW5hbnQpKSAvIGd4KSkgKiAwLjk0LCAtMTUsIDg1KSkgb3IgNDUKICAgICAg",
+"ICBlbHNlCiAgICAgICAgICAgIGFuZ2xlID0gNDUKICAgICAgICBlbmQKICAgIGVsc2VpZiBtb2RlTmFtZSA9PSAnQnVsbGV0JyBv",
+"ciAoYXV0b1Bvd2VyLlZhbHVlIGFuZCBpc0NoZXN0UGFzcykgdGhlbgogICAgICAgIHBvd2VyID0gOTUKICAgICAgICBsb2NhbCBk",
+"aXNwbGFjZW1lbnQgPSBsZWFkUG9zIC0gb3JpZ2luCiAgICAgICAgbG9jYWwgaCA9IHRvbnVtYmVyKFZlY3RvcjMubmV3KGRpc3Bs",
+"YWNlbWVudC5YLCAwLCBkaXNwbGFjZW1lbnQuWikuTWFnbml0dWRlKSBvciAwCiAgICAgICAgbG9jYWwgdiA9IHRvbnVtYmVyKGRp",
+"c3BsYWNlbWVudC5ZKSBvciAwCiAgICAgICAgbG9jYWwgdF9lc3QgPSBoIC8gOTUKICAgICAgICBsb2NhbCBkcm9wID0gMC41ICog",
+"MjggKiB0X2VzdCAqIHRfZXN0CiAgICAgICAgYW5nbGUgPSB0b251bWJlcihtYXRoLmNsYW1wKG1hdGguZGVnKG1hdGguYXRhbjIo",
+"diArIGRyb3AsIGgpKSwgLTE1LCA0NSkpIG9yIDE1CiAgICBlbHNlCiAgICAgICAgaWYgYXV0b1Bvd2VyLlZhbHVlIHRoZW4KICAg",
+"ICAgICAgICAgcG93ZXIgPSB0b251bWJlcihtYXRoLmNsYW1wKGNhbGNQb3dlciwgMCwgOTUpKSBvciA2MAogICAgICAgIGVuZAog",
+"ICAgICAgIGlmIGF1dG9BbmdsZS5WYWx1ZSB0aGVuCiAgICAgICAgICAgIGFuZ2xlID0gdG9udW1iZXIobWF0aC5jbGFtcChjYWxj",
+"QW5nbGUsIC0xNSwgOTApKSBvciA0NQogICAgICAgIGVuZAogICAgZW5kCiAgICAKICAgIGlmIG5vdCBhdXRvQW5nbGUuVmFsdWUg",
+"YW5kIG5vdCBmb3JjZUF1dG9BbmdsZSB0aGVuCiAgICAgICAgYW5nbGUgPSB0b251bWJlcihtYXRoLmNsYW1wKGNhbGNBbmdsZSwg",
+"LTE1LCA5MCkpIG9yIDQ1CiAgICBlbmQKICAgIAogICAgbG9jYWwgc2FmZVBvd2VyID0gdG9udW1iZXIocG93ZXIpIG9yIDYwCiAg",
+"ICBsb2NhbCBzYWZlQW5nbGUgPSB0b251bWJlcihhbmdsZSkgb3IgNDUKICAgIGxvY2FsIGFuZ2xlUmFkID0gdG9udW1iZXIobWF0",
+"aC5yYWQoc2FmZUFuZ2xlKSkgb3IgMAogICAgCiAgICBsb2NhbCBoRGlyUmF3ID0gVmVjdG9yMy5uZXcobGVhZFBvcy5YIC0gb3Jp",
+"Z2luLlgsIDAsIGxlYWRQb3MuWiAtIG9yaWdpbi5aKQogICAgbG9jYWwgaERpciA9IGhEaXJSYXcuTWFnbml0dWRlID4gMC4wMSBh",
+"bmQgaERpclJhdy5Vbml0IG9yIGhlYWQuQ0ZyYW1lLkxvb2tWZWN0b3IKICAgIGxvY2FsIGRpclZlbG9jaXR5ID0gKGhEaXIgKiAo",
+"dG9udW1iZXIobWF0aC5jb3MoYW5nbGVSYWQpKSBvciAxKSArIFZlY3RvcjMubmV3KDAsIHRvbnVtYmVyKG1hdGguc2luKGFuZ2xl",
+"UmFkKSkgb3IgMCwgMCkpICogc2FmZVBvd2VyCiAgICAKICAgIGRpcmVjdGlvbiA9IGRpclZlbG9jaXR5LlVuaXQgKiBzYWZlUG93",
+"ZXIKICAgIAogICAgbG9jYWwgaFZlbCA9IHNhZmVQb3dlciAqICh0b251bWJlcihtYXRoLmNvcyhhbmdsZVJhZCkpIG9yIDEpCiAg",
+"ICBpZiBoVmVsID4gMC4xIHRoZW4KICAgICAgICBsb2NhbCB4RGlzdCA9IHRvbnVtYmVyKFZlY3RvcjMubmV3KGxlYWRQb3MuWCAt",
+"IG9yaWdpbi5YLCAwLCBsZWFkUG9zLlogLSBvcmlnaW4uWikuTWFnbml0dWRlKSBvciAwCiAgICAgICAgYWlydGltZSA9IHhEaXN0",
+"IC8gaFZlbAogICAgZWxzZQogICAgICAgIGFpcnRpbWUgPSAwCiAgICBlbmQKICAgIAogICAgcmV0dXJuIHNhZmVBbmdsZQplbmQK",
+"CmxvY2FsIGJlYW1Qcm9qZWN0aWxlID0gZnVuY3Rpb24oZywgdjAsIHgwLCB0MSkKICAgIGxvY2FsIGMgPSAwLjUgKiAwLjUgKiAw",
+"LjUKICAgIGxvY2FsIHNhZmVUMSA9IHRvbnVtYmVyKHQxKSBvciAwLjEKICAgIGxvY2FsIHAzID0gMC41ICogZyAqIHNhZmVUMSAq",
+"IHNhZmVUMSArIHYwICogc2FmZVQxICsgeDAKICAgIGxvY2FsIHAyID0gcDMgLSAoZyAqIHNhZmVUMSAqIHNhZmVUMSArIHYwICog",
+"c2FmZVQxKSAvIDMKICAgIGxvY2FsIHAxID0gKGMgKiBnICogc2FmZVQxICogc2FmZVQxICsgMC41ICogdjAgKiBzYWZlVDEgKyB4",
+"MCAtIGMgKiAoeDAgKyBwMykpIC8gKDMgKiBjKSAtIHAyCgogICAgbG9jYWwgY3VydmUwID0gdG9udW1iZXIoKHAxIC0geDApLk1h",
+"Z25pdHVkZSkgb3IgMAogICAgbG9jYWwgY3VydmUxID0gdG9udW1iZXIoKHAyIC0gcDMpLk1hZ25pdHVkZSkgb3IgMAoKICAgIGxv",
+"Y2FsIGIgPSAoeDAgLSBwMykuVW5pdAogICAgbG9jYWwgcjEgPSAocDEgLSB4MCkuVW5pdAogICAgbG9jYWwgdTEgPSByMTpDcm9z",
+"cyhiKS5Vbml0CiAgICBsb2NhbCByMiA9IChwMiAtIHAzKS5Vbml0CiAgICBsb2NhbCB1MiA9IHIyOkNyb3NzKGIpLlVuaXQKICAg",
+"IGIgPSB1MTpDcm9zcyhyMSkuVW5pdAoKICAgIGxvY2FsIGNmMSA9IENGcmFtZS5uZXcoCiAgICAgICAgeDAuWCwgeDAuWSwgeDAu",
+"WiwKICAgICAgICByMS5YLCB1MS5YLCBiLlgsCiAgICAgICAgcjEuWSwgdTEuWSwgYi5ZLAogICAgICAgIHIxLlosIHUxLlosIGIu",
+"WgogICAgKQoKICAgIGxvY2FsIGNmMiA9IENGcmFtZS5uZXcoCiAgICAgICAgcDMuWCwgcDMuWSwgcDMuWiwKICAgICAgICByMi5Y",
+"LCB1Mi5YLCBiLlgsCiAgICAgICAgcjIuWSwgdTIuWSwgYi5ZLAogICAgICAgIHIyLlosIHUyLlosIGIuWgogICAgKQoKICAgIHJl",
+"dHVybiBjdXJ2ZTAsIC1jdXJ2ZTEsIGNmMSwgY2YyCmVuZAoKdXNlcklucHV0U2VydmljZS5JbnB1dEJlZ2FuOkNvbm5lY3QoZnVu",
+"Y3Rpb24oaW5wdXQsIGdwZSkKICAgIGlmIGdwZSB0aGVuIHJldHVybiBlbmQKICAgIGxvY2FsIGNoYXIgPSBscC5DaGFyYWN0ZXIK",
+"ICAgIGlmIG5vdCBjaGFyIG9yIG5vdCBjaGFyOkZpbmRGaXJzdENoaWxkKCdGb290YmFsbCcpIHRoZW4gcmV0dXJuIGVuZAogICAg",
+"CiAgICBpZiBpbnB1dC5LZXlDb2RlID09IHRocm93QmFsbEF3YXlLZXliaW5kLlZhbHVlIHRoZW4KICAgICAgICBsb2NhbCBmUG9z",
+"ID0gVmVjdG9yMy56ZXJvCiAgICAgICAgbG9jYWwgZmllbGQgPSB3b3Jrc3BhY2U6RmluZEZpcnN0Q2hpbGQoJ01vZGVscycpCiAg",
+"ICAgICAgaWYgZmllbGQgdGhlbiBmaWVsZCA9IGZpZWxkOkZpbmRGaXJzdENoaWxkKCdGaWVsZCcpIGVuZAogICAgICAgIGlmIGZp",
+"ZWxkIHRoZW4gZmllbGQgPSBmaWVsZDpGaW5kRmlyc3RDaGlsZCgnR3JvdW5kJykgZW5kCiAgICAgICAgaWYgZmllbGQgdGhlbiBm",
+"UG9zID0gZmllbGQuUG9zaXRpb24gZW5kCiAgICAgICAgCiAgICAgICAgbG9jYWwgc2lkZSA9IG1hdGgucmFuZG9tKDEsIDIpID09",
+"IDEgYW5kIC0xIG9yIDEKICAgICAgICBsb2NhbCB0aHJvd1RhcmdldCA9IGZQb3MgKyBWZWN0b3IzLm5ldyhzaWRlICogMTIwLCAw",
+"LCBtYXRoLnJhbmRvbSgtMTAwLCAxMDApKQogICAgICAgIAogICAgICAgIGxvY2FsIGhlYWQgPSBjaGFyOkZpbmRGaXJzdENoaWxk",
+"KCdIZWFkJykKICAgICAgICBsb2NhbCBvcmlnaW4gPSBoZWFkIGFuZCBoZWFkLlBvc2l0aW9uIG9yIGNoYXIuSHVtYW5vaWRSb290",
+"UGFydC5Qb3NpdGlvbgogICAgICAgIAogICAgICAgIGlzVGhyb3dpbmdBd2F5ID0gdHJ1ZQogICAgICAgIHBvd2VyID0gOTUKICAg",
+"ICAgICBhbmdsZSA9IDI1CiAgICAgICAgCiAgICAgICAgbG9jYWwgYW5nbGVSYWQgPSB0b251bWJlcihtYXRoLnJhZChhbmdsZSkp",
+"IG9yIDAKICAgICAgICBsb2NhbCBoRGlyID0gVmVjdG9yMy5uZXcodGhyb3dUYXJnZXQuWCAtIG9yaWdpbi5YLCAwLCB0aHJvd1Rh",
+"cmdldC5aIC0gb3JpZ2luLlopLlVuaXQKICAgICAgICBsb2NhbCBkaXJWZWxvY2l0eSA9IChoRGlyICogKHRvbnVtYmVyKG1hdGgu",
+"Y29zKGFuZ2xlUmFkKSkgb3IgMSkgKyBWZWN0b3IzLm5ldygwLCB0b251bWJlcihtYXRoLnNpbihhbmdsZVJhZCkpIG9yIDAsIDAp",
+"KSAqIDk1CiAgICAgICAgZGlyZWN0aW9uID0gZGlyVmVsb2NpdHkuVW5pdCAqIDk1CiAgICAgICAgCiAgICAgICAgbG9jYWwgaFZl",
+"bCA9IDk1ICogKHRvbnVtYmVyKG1hdGguY29zKGFuZ2xlUmFkKSkgb3IgMSkKICAgICAgICBhaXJ0aW1lID0gaFZlbCA+IDAuMSBh",
+"bmQgKCh0b251bWJlcihWZWN0b3IzLm5ldyh0aHJvd1RhcmdldC5YIC0gb3JpZ2luLlgsIDAsIHRocm93VGFyZ2V0LlogLSBvcmln",
+"aW4uWikuTWFnbml0dWRlKSBvciAwKSAvIGhWZWwpIG9yIDEKICAgICAgICAKICAgICAgICBsb2NhbCBodW0gPSBjaGFyOkZpbmRG",
+"aXJzdENoaWxkT2ZDbGFzcygnSHVtYW5vaWQnKQogICAgICAgIGxvY2FsIHRocm93QW5pbSA9IHJlcGxpY2F0ZWRTdG9yYWdlOkZp",
+"bmRGaXJzdENoaWxkKCdBbmltYXRpb25zJykgYW5kIHJlcGxpY2F0ZWRTdG9yYWdlLkFuaW1hdGlvbnM6RmluZEZpcnN0Q2hpbGQo",
+"J1Rocm93JykKICAgICAgICBpZiBodW0gYW5kIHRocm93QW5pbSB0aGVuCiAgICAgICAgICAgIGxvY2FsIGFuaW1hdG9yID0gaHVt",
+"OkZpbmRGaXJzdENoaWxkKCdBbmltYXRvcicpCiAgICAgICAgICAgIGlmIGFuaW1hdG9yIHRoZW4KICAgICAgICAgICAgICAgIGxv",
+"Y2FsIHRyYWNrID0gYW5pbWF0b3I6TG9hZEFuaW1hdGlvbih0aHJvd0FuaW0pCiAgICAgICAgICAgICAgICB0cmFjazpQbGF5KCkK",
+"ICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICAgICAgcmV0dXJuCiAgICBlbmQKCiAgICBpZiBpbnB1dC5LZXlDb2RlID09",
+"IGluY3JlYXNlQW5nbGVLZXliaW5kLlZhbHVlIHRoZW4KICAgICAgICBjdXN0b21IZWlnaHQuVmFsdWUgPSAodG9udW1iZXIoY3Vz",
+"dG9tSGVpZ2h0LlZhbHVlKSBvciAwKSArIDUKICAgIGVsc2VpZiBpbnB1dC5LZXlDb2RlID09IGRlY3JlYXNlQW5nbGVLZXliaW5k",
+"LlZhbHVlIHRoZW4KICAgICAgICBjdXN0b21IZWlnaHQuVmFsdWUgPSAodG9udW1iZXIoY3VzdG9tSGVpZ2h0LlZhbHVlKSBvciAw",
+"KSAtIDUKICAgIGVuZAogICAgCiAgICBpZiBub3QgYXV0b1NlbGVjdFRocm93TW9kZS5WYWx1ZSBhbmQgUUJLZXliaW5kc1tpbnB1",
+"dC5LZXlDb2RlXSB0aGVuCiAgICAgICAgbG9jYWwgZGVzaXJlZE1vZGUgPSBRQktleWJpbmRzW2lucHV0LktleUNvZGVdCiAgICAg",
+"ICAgZm9yIGkgPSAxLCAjTW9kZU9yZGVyIGRvCiAgICAgICAgICAgIGlmIE1vZGVPcmRlcltpXSA9PSBkZXNpcmVkTW9kZSB0aGVu",
+"CiAgICAgICAgICAgICAgICBtb2RlSW5kZXggPSBpCiAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICBlbmQKICAgICAg",
+"ICBlbmQKICAgIGVuZAoKICAgIGlmIGlucHV0LktleUNvZGUgPT0gbG9ja0tleWJpbmQuVmFsdWUgdGhlbgogICAgICAgIGlmIHRh",
+"cmdldCBvciB0YXJnZXRMb2NrZWQgdGhlbgogICAgICAgICAgICB0YXJnZXRMb2NrZWQgPSBub3QgdGFyZ2V0TG9ja2VkCiAgICAg",
+"ICAgICAgIGlmIHRhcmdldExvY2tlZCB0aGVuCiAgICAgICAgICAgICAgICBsb2NrZWRUYXJnZXQgPSB0YXJnZXQKICAgICAgICAg",
+"ICAgICAgIGlmIExvY2tUb2dnbGVCdG4gdGhlbiBMb2NrVG9nZ2xlQnRuLlRleHRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNTUs",
+"IDUwLCA1MCkgZW5kCiAgICAgICAgICAgICAgICBpZiBMb2NrZWRMYWJlbCB0aGVuIExvY2tlZExhYmVsLlZpc2libGUgPSB0cnVl",
+"IGVuZAogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICBsb2NrZWRUYXJnZXQgPSBuaWwKICAgICAgICAgICAgICAgIGlm",
+"IExvY2tUb2dnbGVCdG4gdGhlbiBMb2NrVG9nZ2xlQnRuLlRleHRDb2xvcjMgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1",
+"KSBlbmQKICAgICAgICAgICAgICAgIGlmIExvY2tlZExhYmVsIHRoZW4gTG9ja2VkTGFiZWwuVmlzaWJsZSA9IGZhbHNlIGVuZAog",
+"ICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZAplbmQpCgpsb2NhbCB0cmlnZ2VyVGhyb3dKdW1wID0gZnVuY3Rpb24o",
+"KQogICAgaWYgYXV0b0p1bXBXaGVuVGhyb3cuVmFsdWUgdGhlbgogICAgICAgIHRhc2suZGVsYXkoMC4wNSwgZnVuY3Rpb24oKQog",
+"ICAgICAgICAgICBsb2NhbCBjaGFyID0gbHAuQ2hhcmFjdGVyCiAgICAgICAgICAgIGlmIGNoYXIgdGhlbgogICAgICAgICAgICAg",
+"ICAgbG9jYWwgaHVtID0gY2hhcjpGaW5kRmlyc3RDaGlsZE9mQ2xhc3MoJ0h1bWFub2lkJykKICAgICAgICAgICAgICAgIGlmIGh1",
+"bSBhbmQgaHVtOkdldFN0YXRlKCkgfj0gRW51bS5IdW1hbm9pZFN0YXRlVHlwZS5KdW1waW5nIHRoZW4KICAgICAgICAgICAgICAg",
+"ICAgICBodW06Q2hhbmdlU3RhdGUoRW51bS5IdW1hbm9pZFN0YXRlVHlwZS5KdW1waW5nKQogICAgICAgICAgICAgICAgZW5kCiAg",
+"ICAgICAgICAgIGVuZAogICAgICAgIGVuZCkKICAgIGVuZAplbmQKCnRhc2suc3Bhd24oZnVuY3Rpb24oKQogICAgbG9jYWwgYmlu",
+"ZEFuaW1hdGlvbiA9IGZ1bmN0aW9uKGNoYXIpCiAgICAgICAgbG9jYWwgaHVtYW5vaWQgPSBjaGFyOldhaXRGb3JDaGlsZCgnSHVt",
+"YW5vaWQnLCA1KQogICAgICAgIGlmIG5vdCBodW1hbm9pZCB0aGVuIHJldHVybiBlbmQKICAgICAgICBsb2NhbCBhbmltYXRvciA9",
+"IGh1bWFub2lkOldhaXRGb3JDaGlsZCgnQW5pbWF0b3InLCA1KQogICAgICAgIGlmIG5vdCBhbmltYXRvciB0aGVuIHJldHVybiBl",
+"bmQKICAgICAgICAKICAgICAgICBhbmltYXRvci5BbmltYXRpb25QbGF5ZWQ6Q29ubmVjdChmdW5jdGlvbih0cmFjaykKICAgICAg",
+"ICAgICAgbG9jYWwgdGhyb3dBbmltID0gcmVwbGljYXRlZFN0b3JhZ2U6RmluZEZpcnN0Q2hpbGQoJ0FuaW1hdGlvbnMnKSBhbmQg",
+"cmVwbGljYXRlZFN0b3JhZ2UuQW5pbWF0aW9uczpGaW5kRmlyc3RDaGlsZCgnVGhyb3cnKQogICAgICAgICAgICBpZiB0aHJvd0Fu",
+"aW0gYW5kIHRyYWNrLkFuaW1hdGlvbiBhbmQgKHRyYWNrLkFuaW1hdGlvbiA9PSB0aHJvd0FuaW0gb3IgdHJhY2suQW5pbWF0aW9u",
+"LkFuaW1hdGlvbklkID09IHRocm93QW5pbS5BbmltYXRpb25JZCkgdGhlbgogICAgICAgICAgICAgICAgdHJhY2s6R2V0UHJvcGVy",
+"dHlDaGFuZ2VkU2lnbmFsKCdJc1BsYXlpbmcnKTpDb25uZWN0KGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgICAgICBpZiB0cmFj",
+"ay5Jc1BsYXlpbmcgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICBpZiBub3QgaXNUaHJvd2luZyB0aGVuCiAgICAgICAgICAg",
+"ICAgICAgICAgICAgICAgICBpc1Rocm93aW5nID0gdHJ1ZQogICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJpZ2dlclRocm93",
+"SnVtcCgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB0YXNrLmRlbGF5KDAuMTIsIGZ1bmN0aW9uKCkKICAgICAgICAgICAg",
+"ICAgICAgICAgICAgICAgICAgICBmaXJlZFJlbW90ZSA9IHRydWUKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBwZXJm",
+"b3JtVGhyb3coKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgZW5kKQogICAgICAgICAgICAgICAgICAgICAgICBlbmQKICAg",
+"ICAgICAgICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICAgICAgICAgIGlzVGhyb3dpbmcgPSBmYWxzZQogICAgICAgICAg",
+"ICAgICAgICAgICAgICBmaXJlZFJlbW90ZSA9IGZhbHNlCiAgICAgICAgICAgICAgICAgICAgICAgIGlzVGhyb3dpbmdBd2F5ID0g",
+"ZmFsc2UKICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIGVuZCkKICAgICAgICAgICAgICAgIAogICAgICAg",
+"ICAgICAgICAgaWYgdHJhY2suSXNQbGF5aW5nIGFuZCBub3QgaXNUaHJvd2luZyB0aGVuCiAgICAgICAgICAgICAgICAgICAgaXNU",
+"aHJvd2luZyA9IHRydWUKICAgICAgICAgICAgICAgICAgICB0cmlnZ2VyVGhyb3dKdW1wKCkKICAgICAgICAgICAgICAgICAgICB0",
+"YXNrLmRlbGF5KDAuMTIsIGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgICAgICAgICAgZmlyZWRSZW1vdGUgPSB0cnVlCiAgICAg",
+"ICAgICAgICAgICAgICAgICAgIHBlcmZvcm1UaHJvdygpCiAgICAgICAgICAgICAgICAgICAgZW5kKQogICAgICAgICAgICAgICAg",
+"ZW5kCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZCkKICAgIGVuZAoKICAgIGlmIGxwLkNoYXJhY3RlciB0aGVuCiAgICAgICAg",
+"YmluZEFuaW1hdGlvbihscC5DaGFyYWN0ZXIpCiAgICBlbmQKICAgIGxwLkNoYXJhY3RlckFkZGVkOkNvbm5lY3QoZnVuY3Rpb24o",
+"Y2hhcikKICAgICAgICBiaW5kQW5pbWF0aW9uKGNoYXIpCiAgICBlbmQpCmVuZCkKCmxvY2FsIHNldHVwU2Fja0hhbmRsZXIgPSBm",
+"dW5jdGlvbihjaGFyYWN0ZXIpCiAgICBjaGFyYWN0ZXIuQ2hpbGRBZGRlZDpDb25uZWN0KGZ1bmN0aW9uKHYpCiAgICAgICAgaWYg",
+"bm90IGF1dG9UaHJvd0FmdGVyU2Fjay5WYWx1ZSB0aGVuIHJldHVybiBlbmQKICAgICAgICBpZiBub3QgdjpJc0EoJ0xvY2FsU2Ny",
+"aXB0JykgdGhlbiByZXR1cm4gZW5kCiAgICAgICAgaWYgbm90IHYuTmFtZTpsb3dlcigpOmZpbmQoJ3RhY2tsZScpIHRoZW4gcmV0",
+"dXJuIGVuZAoKICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICBsb2NhbCBodW1hbm9pZCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RD",
+"aGlsZE9mQ2xhc3MoJ0h1bWFub2lkJykKICAgICAgICBpZiBub3QgaHVtYW5vaWQgdGhlbiByZXR1cm4gZW5kCgogICAgICAgIGlm",
+"IGF1dG9DaG9vc2VXci5WYWx1ZSB0aGVuCiAgICAgICAgICAgIGxvY2FsIG9wZW5XUiA9IG5pbAogICAgICAgICAgICBsb2NhbCBi",
+"ZXN0RGlzdCA9IG1hdGguaHVnZQogICAgICAgICAgICBsb2NhbCBtb3VzZVBvczJEID0gdXNlcklucHV0U2VydmljZTpHZXRNb3Vz",
+"ZUxvY2F0aW9uKCkKICAgICAgICAgICAgCiAgICAgICAgICAgIGxvY2FsIHRlYW1Db3VudCA9IDAKICAgICAgICAgICAgcGNhbGwo",
+"ZnVuY3Rpb24oKSB0ZWFtQ291bnQgPSB0b251bWJlcigjZ2FtZTpHZXRTZXJ2aWNlKCdUZWFtcycpOkdldFRlYW1zKCkpIG9yIDAg",
+"ZW5kKQogICAgICAgICAgICAKICAgICAgICAgICAgbG9jYWwgcGxycyA9IHBsYXllcnM6R2V0UGxheWVycygpCiAgICAgICAgICAg",
+"IGZvciBpID0gMSwgI3BscnMgZG8KICAgICAgICAgICAgICAgIGxvY2FsIHBsciA9IHBscnNbaV0KICAgICAgICAgICAgICAgIGlm",
+"IHBsciB+PSBscCBhbmQgcGxyLkNoYXJhY3RlciB0aGVuCiAgICAgICAgICAgICAgICAgICAgbG9jYWwgaXNUZWFtbWF0ZSA9IHRy",
+"dWUKICAgICAgICAgICAgICAgICAgICBpZiB0ZWFtQ291bnQgPiAxIGFuZCBscC5UZWFtIH49IG5pbCBhbmQgcGxyLlRlYW0gfj0g",
+"bmlsIGFuZCBscC5UZWFtIH49IHBsci5UZWFtIHRoZW4KICAgICAgICAgICAgICAgICAgICAgICAgaXNUZWFtbWF0ZSA9IGZhbHNl",
+"CiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgaWYgaXNUZWFt",
+"bWF0ZSB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIGVIcnAgPSBwbHIuQ2hhcmFjdGVyOkZpbmRGaXJzdENoaWxk",
+"KCdIdW1hbm9pZFJvb3RQYXJ0JykKICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgZUh1bSA9IHBsci5DaGFyYWN0ZXI6Rmlu",
+"ZEZpcnN0Q2hpbGRPZkNsYXNzKCdIdW1hbm9pZCcpCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIGVIcnAgYW5kIChub3QgZUh1",
+"bSBvciBub3QgZUh1bS5TaXQpIGFuZCBpc1dST3BlbihwbHIuQ2hhcmFjdGVyKSB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgICBsb2NhbCBzY3JlZW5Qb3MsIG9uU2NyZWVuID0gY2FtZXJhOldvcmxkVG9WaWV3cG9ydFBvaW50KGVIcnAuUG9zaXRpb24p",
+"CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBvblNjcmVlbiB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgbG9jYWwgZGlzdCA9IHRvbnVtYmVyKChWZWN0b3IyLm5ldyhzY3JlZW5Qb3MuWCwgc2NyZWVuUG9zLlkpIC0gbW91c2VQb3My",
+"RCkuTWFnbml0dWRlKSBvciAwCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgaWYgZGlzdCA8IGJlc3REaXN0IHRoZW4K",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgYmVzdERpc3QgPSBkaXN0CiAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgICAgICAgICAgIG9wZW5XUiA9IHBsci5DaGFyYWN0ZXIKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBlbmQKICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgICAg",
+"ICBlbmQKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQKCiAgICAgICAgICAgIGlmIG9wZW5XUiB0aGVuCiAgICAg",
+"ICAgICAgICAgICB0YXJnZXQgPSBvcGVuV1IKICAgICAgICAgICAgICAgIHRhcmdldExvY2tlZCA9IHRydWUKICAgICAgICAgICAg",
+"ICAgIGxvY2tlZFRhcmdldCA9IG9wZW5XUgogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKCiAgICAgICAgaWYgdGFyZ2V0IHRo",
+"ZW4KICAgICAgICAgICAgbG9jYWwgdGhyb3dBbmltID0gcmVwbGljYXRlZFN0b3JhZ2U6RmluZEZpcnN0Q2hpbGQoJ0FuaW1hdGlv",
+"bnMnKSBhbmQgcmVwbGljYXRlZFN0b3JhZ2UuQW5pbWF0aW9uczpGaW5kRmlyc3RDaGlsZCgnVGhyb3cnKQogICAgICAgICAgICBp",
+"ZiB0aHJvd0FuaW0gdGhlbgogICAgICAgICAgICAgICAgbG9jYWwgYW5pbWF0b3IgPSBodW1hbm9pZDpGaW5kRmlyc3RDaGlsZCgn",
+"QW5pbWF0b3InKQogICAgICAgICAgICAgICAgaWYgYW5pbWF0b3IgdGhlbgogICAgICAgICAgICAgICAgICAgIGxvY2FsIHRyYWNr",
+"ID0gYW5pbWF0b3I6TG9hZEFuaW1hdGlvbih0aHJvd0FuaW0pCiAgICAgICAgICAgICAgICAgICAgdHJhY2s6UGxheSgpCiAgICAg",
+"ICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQpCmVuZAoKaWYgbHAuQ2hhcmFjdGVyIHRo",
+"ZW4KICAgIHNldHVwU2Fja0hhbmRsZXIobHAuQ2hhcmFjdGVyKQplbmQKbHAuQ2hhcmFjdGVyQWRkZWQ6Q29ubmVjdChzZXR1cFNh",
+"Y2tIYW5kbGVyKQoKbG9jYWwgdXBkYXRlSGlnaGxpZ2h0cyA9IGZ1bmN0aW9uKGlzQWN0aXZlKQogICAgaWYgbm90IGlzQWN0aXZl",
+"IHRoZW4KICAgICAgICBpZiBoaWdobGlnaHQgdGhlbiBoaWdobGlnaHQ6RGVzdHJveSgpOyBoaWdobGlnaHQgPSBuaWwgZW5kCiAg",
+"ICAgICAgcmV0dXJuCiAgICBlbmQKCiAgICBpZiB0YXJnZXQgdGhlbgogICAgICAgIGlmIG5vdCBoaWdobGlnaHQgdGhlbgogICAg",
+"ICAgICAgICBoaWdobGlnaHQgPSBJbnN0YW5jZS5uZXcoJ0hpZ2hsaWdodCcpCiAgICAgICAgZW5kCiAgICAgICAgaGlnaGxpZ2h0",
+"LkFkb3JuZWUgPSB0YXJnZXQKICAgICAgICBoaWdobGlnaHQuUGFyZW50ID0gdGFyZ2V0CiAgICAgICAgaGlnaGxpZ2h0LkZpbGxU",
+"cmFuc3BhcmVuY3kgPSAxCiAgICAgICAgaGlnaGxpZ2h0Lk91dGxpbmVDb2xvciA9IHRhcmdldExvY2tlZCBhbmQgQ29sb3IzLm5l",
+"dygwLCAwLCAwKSBvciBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KQogICAgICAgIGhpZ2hsaWdodC5PdXRsaW5lVHJhbnNw",
+"YXJlbmN5ID0gMAogICAgZWxzZWlmIGhpZ2hsaWdodCB0aGVuCiAgICAgICAgaGlnaGxpZ2h0OkRlc3Ryb3koKQogICAgICAgIGhp",
+"Z2hsaWdodCA9IG5pbAogICAgZW5kCmVuZAoKd29ya3NwYWNlLkNoaWxkQWRkZWQ6Q29ubmVjdChmdW5jdGlvbih2KQogICAgaWYg",
+"bm90IGVuYWJsZVFiQWltYm90LlZhbHVlIHRoZW4gcmV0dXJuIGVuZAogICAgaWYgdjpJc0EoJ0Jhc2VQYXJ0JykgYW5kIHYuTmFt",
+"ZSA9PSAnRm9vdGJhbGwnIHRoZW4KICAgICAgICB0YXNrLndhaXQoKQogICAgICAgIGxvY2FsIGxwQ2hhciA9IGxwLkNoYXJhY3Rl",
+"cgogICAgICAgIGxvY2FsIGxwSGVhZCA9IGxwQ2hhciBhbmQgbHBDaGFyOkZpbmRGaXJzdENoaWxkKCdIZWFkJykKICAgICAgICBp",
+"ZiBub3QgbHBIZWFkIHRoZW4gcmV0dXJuIGVuZAogICAgICAgIAogICAgICAgIGlmIHY6R2V0QXR0cmlidXRlKCdMb2NhbEFpbWJv",
+"dEJhbGwnKSBvciAodi5Qb3NpdGlvbiAtIGxwSGVhZC5Qb3NpdGlvbikuTWFnbml0dWRlIDwgMTUgdGhlbgogICAgICAgICAgICBs",
+"b2NhbCB0QXR0YWNoMCA9IEluc3RhbmNlLm5ldygnQXR0YWNobWVudCcsIHdvcmtzcGFjZS5UZXJyYWluKQogICAgICAgICAgICBs",
+"b2NhbCB0QXR0YWNoMSA9IEluc3RhbmNlLm5ldygnQXR0YWNobWVudCcsIHdvcmtzcGFjZS5UZXJyYWluKQogICAgICAgICAgICAK",
+"ICAgICAgICAgICAgbG9jYWwgdEJlYW0gPSBJbnN0YW5jZS5uZXcoJ0JlYW0nKQogICAgICAgICAgICB0QmVhbS5BdHRhY2htZW50",
+"MCA9IHRBdHRhY2gwCiAgICAgICAgICAgIHRCZWFtLkF0dGFjaG1lbnQxID0gdEF0dGFjaDEKICAgICAgICAgICAgdEJlYW0uU2Vn",
+"bWVudHMgPSA3NTAwCiAgICAgICAgICAgIHRCZWFtLldpZHRoMCA9IDEKICAgICAgICAgICAgdEJlYW0uV2lkdGgxID0gMQogICAg",
+"ICAgICAgICB0QmVhbS5GYWNlQ2FtZXJhID0gdHJ1ZQogICAgICAgICAgICB0QmVhbS5Db2xvciA9IENvbG9yU2VxdWVuY2UubmV3",
+"KENvbG9yMy5mcm9tUkdCKDI1NSwgMjU1LCAyNTUpKQogICAgICAgICAgICB0QmVhbS5UcmFuc3BhcmVuY3kgPSBOdW1iZXJTZXF1",
+"ZW5jZS5uZXcoewogICAgICAgICAgICAgICAgTnVtYmVyU2VxdWVuY2VLZXlwb2ludC5uZXcoMCwgMSksCiAgICAgICAgICAgICAg",
+"ICBOdW1iZXJTZXF1ZW5jZUtleXBvaW50Lm5ldygwLjAxLCAwKSwKICAgICAgICAgICAgICAgIE51bWJlclNlcXVlbmNlS2V5cG9p",
+"bnQubmV3KDEsIDApCiAgICAgICAgICAgIH0pCiAgICAgICAgICAgIHRCZWFtLlBhcmVudCA9IHdvcmtzcGFjZS5UZXJyYWluCiAg",
+"ICAgICAgICAgIAogICAgICAgICAgICBsb2NhbCB0UG9zUGFydCA9IEluc3RhbmNlLm5ldygnUGFydCcsIHdvcmtzcGFjZS5UZXJy",
+"YWluKQogICAgICAgICAgICB0UG9zUGFydC5BbmNob3JlZCA9IHRydWUKICAgICAgICAgICAgdFBvc1BhcnQuQ2FuQ29sbGlkZSA9",
+"IGZhbHNlCiAgICAgICAgICAgIHRQb3NQYXJ0LkNhc3RTaGFkb3cgPSBmYWxzZQogICAgICAgICAgICB0UG9zUGFydC5TaXplID0g",
+"VmVjdG9yMy5uZXcoMywgMywgMykKICAgICAgICAgICAgdFBvc1BhcnQuU2hhcGUgPSBFbnVtLlBhcnRUeXBlLkJhbGwKICAgICAg",
+"ICAgICAgdFBvc1BhcnQuQ29sb3IgPSBDb2xvcjMuZnJvbVJHQigwLCAwLCAwKQogICAgICAgICAgICAKICAgICAgICAgICAgbG9j",
+"YWwgc2FmZURpcmVjdGlvbiA9IGRpcmVjdGlvbiBvciBWZWN0b3IzLm5ldygwLCAxLCAwKQogICAgICAgICAgICBsb2NhbCBzYWZl",
+"QWlydGltZSA9IG1hdGgubWF4KHRvbnVtYmVyKGFpcnRpbWUpIG9yIDAuMSwgMC4xKQogICAgICAgICAgICBsb2NhbCBjdXJ2ZTAs",
+"IGN1cnZlMSwgY2YxLCBjZjIgPSBiZWFtUHJvamVjdGlsZShWZWN0b3IzLm5ldygwLCAtMjgsIDApLCBzYWZlRGlyZWN0aW9uLCBs",
+"cEhlYWQuUG9zaXRpb24gKyAoc2FmZURpcmVjdGlvbi5Vbml0ICogNSksIHNhZmVBaXJ0aW1lKQogICAgICAgICAgICAKICAgICAg",
+"ICAgICAgdEJlYW0uQ3VydmVTaXplMCA9IGN1cnZlMAogICAgICAgICAgICB0QmVhbS5DdXJ2ZVNpemUxID0gY3VydmUxCiAgICAg",
+"ICAgICAgIAogICAgICAgICAgICB0QXR0YWNoMC5Xb3JsZENGcmFtZSA9IGNmMQogICAgICAgICAgICB0QXR0YWNoMS5Xb3JsZENG",
+"cmFtZSA9IGNmMgogICAgICAgICAgICAKICAgICAgICAgICAgdFBvc1BhcnQuUG9zaXRpb24gPSBWZWN0b3IzLm5ldyhjZjIuWCwg",
+"Y2YyLlksIGNmMi5aKQogICAgICAgICAgICAKICAgICAgICAgICAgdGFzay5kZWxheShzYWZlQWlydGltZSwgZnVuY3Rpb24oKQog",
+"ICAgICAgICAgICAgICAgdEJlYW06RGVzdHJveSgpCiAgICAgICAgICAgICAgICB0QXR0YWNoMDpEZXN0cm95KCkKICAgICAgICAg",
+"ICAgICAgIHRBdHRhY2gxOkRlc3Ryb3koKQogICAgICAgICAgICAgICAgdFBvc1BhcnQ6RGVzdHJveSgpCiAgICAgICAgICAgIGVu",
+"ZCkKICAgICAgICBlbmQKICAgIGVuZAplbmQpCgpydW5TZXJ2aWNlLlJlbmRlclN0ZXBwZWQ6Q29ubmVjdChmdW5jdGlvbigpCiAg",
+"ICBpZiBub3QgZW5hYmxlUWJBaW1ib3QuVmFsdWUgdGhlbgogICAgICAgIHVwZGF0ZUhVRFZpc2liaWxpdHkoZmFsc2UpCiAgICAg",
+"ICAgdXBkYXRlSGlnaGxpZ2h0cyhmYWxzZSkKICAgICAgICBpZiBiZWFtIHRoZW4gYmVhbS5FbmFibGVkID0gZmFsc2UgZW5kCiAg",
+"ICAgICAgaWYgcG9zUGFydCB0aGVuIHBvc1BhcnQuUG9zaXRpb24gPSBWZWN0b3IzLm5ldygwLCAtOTk5OSwgMCkgZW5kCiAgICAg",
+"ICAgaWYgYXR0YWNoMCB0aGVuIGF0dGFjaDAuV29ybGRQb3NpdGlvbiA9IFZlY3RvcjMubmV3KDAsIC05OTk5LCAwKSBlbmQKICAg",
+"ICAgICBpZiBhdHRhY2gxIHRoZW4gYXR0YWNoMS5Xb3JsZFBvc2l0aW9uID0gVmVjdG9yMy5uZXcoMCwgLTk5OTksIDApIGVuZAog",
+"ICAgICAgIHRhcmdldCA9IG5pbAogICAgICAgIHJldHVybgogICAgZW5kCgogICAgaWYgbm90IHNnIG9yIG5vdCBzZy5QYXJlbnQg",
+"dGhlbiByZXR1cm4gZW5kCgogICAgbG9jYWwgY2hhciA9IGxwLkNoYXJhY3RlcgogICAgaWYgbm90IGNoYXIgdGhlbiByZXR1cm4g",
+"ZW5kCiAgICAKICAgIGxvY2FsIGhlYWQgPSBjaGFyOkZpbmRGaXJzdENoaWxkKCdIZWFkJykKICAgIGxvY2FsIGhycCA9IGNoYXI6",
+"RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKQogICAgaWYgbm90IGhlYWQgb3Igbm90IGhycCB0aGVuIHJldHVybiBl",
+"bmQKCiAgICBsb2NhbCBmb290YmFsbCA9IGNoYXI6RmluZEZpcnN0Q2hpbGQoJ0Zvb3RiYWxsJykKICAgIGxvY2FsIGhhc0Zvb3Ri",
+"YWxsID0gKGZvb3RiYWxsIH49IG5pbCkKICAgIAogICAgaWYgaGFzRm9vdGJhbGwgdGhlbgogICAgICAgIGZvb3RiYWxsOlNldEF0",
+"dHJpYnV0ZSgnTG9jYWxBaW1ib3RCYWxsJywgdHJ1ZSkKICAgICAgICBsb2NhbCBmSGFuZGxlID0gZm9vdGJhbGw6RmluZEZpcnN0",
+"Q2hpbGQoJ0hhbmRsZScpCiAgICAgICAgaWYgZkhhbmRsZSB0aGVuIGZIYW5kbGU6U2V0QXR0cmlidXRlKCdMb2NhbEFpbWJvdEJh",
+"bGwnLCB0cnVlKSBlbmQKICAgIGVuZAogICAgCiAgICBsb2NhbCBwbGF5ZXJHdWkgPSBscDpXYWl0Rm9yQ2hpbGQoJ1BsYXllckd1",
+"aScsIDEwKQogICAgbG9jYWwgYmFsbEd1aSA9IHBsYXllckd1aSBhbmQgcGxheWVyR3VpOkZpbmRGaXJzdENoaWxkKCdCYWxsR3Vp",
+"JykKICAgIAogICAgaWYgYXV0b0p1a2UuVmFsdWUgYW5kIGhhc0Zvb3RiYWxsIGFuZCBiYWxsR3VpIHRoZW4KICAgICAgICBsb2Nh",
+"bCBmUG9zID0gVmVjdG9yMy56ZXJvCiAgICAgICAgbG9jYWwgZmllbGQgPSB3b3Jrc3BhY2U6RmluZEZpcnN0Q2hpbGQoJ01vZGVs",
+"cycpCiAgICAgICAgaWYgZmllbGQgdGhlbiBmaWVsZCA9IGZpZWxkOkZpbmRGaXJzdENoaWxkKCdGaWVsZCcpIGVuZAogICAgICAg",
+"IGlmIGZpZWxkIHRoZW4gZmllbGQgPSBmaWVsZDpGaW5kRmlyc3RDaGlsZCgnR3JvdW5kJykgZW5kCiAgICAgICAgaWYgZmllbGQg",
+"dGhlbiBmUG9zID0gZmllbGQuUG9zaXRpb24gZW5kCiAgICAgICAgCiAgICAgICAgbG9jYWwgbWluWCA9IGZQb3MuWCAtICgxNTUg",
+"LyAyKQogICAgICAgIGxvY2FsIG1heFggPSBmUG9zLlggKyAoMTU1IC8gMikKICAgICAgICBsb2NhbCBtaW5aID0gZlBvcy5aIC0g",
+"KDM1NSAvIDIpCiAgICAgICAgbG9jYWwgbWF4WiA9IGZQb3MuWiArICgzNTUgLyAyKQoKICAgICAgICBsb2NhbCBkb2RnZVZlYyA9",
+"IFZlY3RvcjMuemVybwogICAgICAgIGxvY2FsIHRocmVhdENvdW50ID0gMAoKICAgICAgICBsb2NhbCBwbHJzID0gcGxheWVyczpH",
+"ZXRQbGF5ZXJzKCkKICAgICAgICBsb2NhbCB0ZWFtQ291bnQgPSAwCiAgICAgICAgcGNhbGwoZnVuY3Rpb24oKSB0ZWFtQ291bnQg",
+"PSB0b251bWJlcigjZ2FtZTpHZXRTZXJ2aWNlKCdUZWFtcycpOkdldFRlYW1zKCkpIG9yIDAgZW5kKQogICAgICAgIAogICAgICAg",
+"IGZvciBpID0gMSwgI3BscnMgZG8KICAgICAgICAgICAgbG9jYWwgcGxyID0gcGxyc1tpXQogICAgICAgICAgICBpZiBwbHIgfj0g",
+"bHAgYW5kIHBsci5DaGFyYWN0ZXIgdGhlbgogICAgICAgICAgICAgICAgbG9jYWwgaXNFbmVteSA9IHRydWUKICAgICAgICAgICAg",
+"ICAgIGlmIHRlYW1Db3VudCA+IDEgYW5kIGxwLlRlYW0gfj0gbmlsIGFuZCBwbHIuVGVhbSB+PSBuaWwgYW5kIGxwLlRlYW0gPT0g",
+"cGxyLlRlYW0gdGhlbgogICAgICAgICAgICAgICAgICAgIGlzRW5lbXkgPSBmYWxzZQogICAgICAgICAgICAgICAgZW5kCiAgICAg",
+"ICAgICAgICAgICAKICAgICAgICAgICAgICAgIGlmIGlzRW5lbXkgdGhlbgogICAgICAgICAgICAgICAgICAgIGxvY2FsIGVIcnAg",
+"PSBwbHIuQ2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQYXJ0JykKICAgICAgICAgICAgICAgICAgICBpZiBl",
+"SHJwIHRoZW4KICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgZGlzdFRvTWUgPSB0b251bWJlcigoZUhycC5Qb3NpdGlvbiAt",
+"IGhycC5Qb3NpdGlvbikuTWFnbml0dWRlKSBvciAwCiAgICAgICAgICAgICAgICAgICAgICAgIGlmIGRpc3RUb01lIDwgNDUgdGhl",
+"bgogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgZVZlbCA9IGVIcnAuQXNzZW1ibHlMaW5lYXJWZWxvY2l0eSBvciBl",
+"SHJwLlZlbG9jaXR5IG9yIFZlY3RvcjMuemVybwogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgZVNwZWVkID0gdG9u",
+"dW1iZXIoVmVjdG9yMy5uZXcoZVZlbC5YLCAwLCBlVmVsLlopLk1hZ25pdHVkZSkgb3IgMAogICAgICAgICAgICAgICAgICAgICAg",
+"ICAgICAgbG9jYWwgdHRhID0gZGlzdFRvTWUgLyBtYXRoLm1heChlU3BlZWQsIDEpCiAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIGZ1dHVyZVRpbWUgPSBtYXRoLm1pbih0dGEsIDEpCiAgICAgICAg",
+"ICAgICAgICAgICAgICAgICAgICBsb2NhbCBlRnV0dXJlID0gZUhycC5Qb3NpdGlvbiArIChlVmVsICogZnV0dXJlVGltZSkKICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgIGxvY2FsIG15VmVsID0gaHJwLkFzc2VtYmx5TGluZWFyVmVsb2NpdHkgb3IgaHJwLlZl",
+"bG9jaXR5IG9yIFZlY3RvcjMuemVybwogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9jYWwgbXlGdXR1cmUgPSBocnAuUG9z",
+"aXRpb24gKyAobXlWZWwgKiBmdXR1cmVUaW1lKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAg",
+"ICAgICAgICAgICBsb2NhbCB0b1RocmVhdCA9IGVGdXR1cmUgLSBteUZ1dHVyZQogICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"bG9jYWwgZnV0dXJlRGlzdCA9IHRvbnVtYmVyKFZlY3RvcjMubmV3KHRvVGhyZWF0LlgsIDAsIHRvVGhyZWF0LlopLk1hZ25pdHVk",
+"ZSkgb3IgMAogICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBmdXR1cmVE",
+"aXN0IDwgMjAgb3IgZGlzdFRvTWUgPCAyNSB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgdGhyZWF0Q291bnQg",
+"PSB0aHJlYXRDb3VudCArIDEKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBsb2NhbCBhd2F5RGlyID0gbXlGdXR1cmUg",
+"LSBlRnV0dXJlCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgYXdheURpciA9IFZlY3RvcjMubmV3KGF3YXlEaXIuWCwg",
+"MCwgYXdheURpci5aKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIGF3YXlEaXIuTWFnbml0dWRlIDwgMC4xIHRo",
+"ZW4KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgYXdheURpciA9IGhycC5DRnJhbWUuUmlnaHRWZWN0b3IKICAg",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBhd2F5RGlyID0g",
+"YXdheURpci5Vbml0CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgbG9jYWwgd2VpZ2h0ID0gbWF0aC5jbGFtcCg0NSAtIGRpc3RUb01lLCAwLCA0NSkKICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgICAgICBkb2RnZVZlYyA9IGRvZGdlVmVjICsgKGF3YXlEaXIgKiB3ZWlnaHQpCiAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICBlbmQKICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICBl",
+"bmQKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCgogICAgICAgIGxvY2FsIGh1bSA9IGNoYXI6RmluZEZpcnN0Q2hpbGRPZkNs",
+"YXNzKCdIdW1hbm9pZCcpCiAgICAgICAgaWYgaHVtIHRoZW4KICAgICAgICAgICAgbG9jYWwgY2hlY2tQb3MgPSBocnAuUG9zaXRp",
+"b24KICAgICAgICAgICAgbG9jYWwgb3V0T2ZCb3VuZHNQdXNoID0gVmVjdG9yMy56ZXJvCiAgICAgICAgICAgIAogICAgICAgICAg",
+"ICBpZiBjaGVja1Bvcy5YIDwgbWluWCArIDUgdGhlbiBvdXRPZkJvdW5kc1B1c2ggPSBvdXRPZkJvdW5kc1B1c2ggKyBWZWN0b3Iz",
+"Lm5ldygxLCAwLCAwKSBlbmQKICAgICAgICAgICAgaWYgY2hlY2tQb3MuWCA+IG1heFggLSA1IHRoZW4gb3V0T2ZCb3VuZHNQdXNo",
+"ID0gb3V0T2ZCb3VuZHNQdXNoICsgVmVjdG9yMy5uZXcoLTEsIDAsIDApIGVuZAogICAgICAgICAgICBpZiBjaGVja1Bvcy5aIDwg",
+"bWluWiArIDUgdGhlbiBvdXRPZkJvdW5kc1B1c2ggPSBvdXRPZkJvdW5kc1B1c2ggKyBWZWN0b3IzLm5ldygwLCAwLCAxKSBlbmQK",
+"ICAgICAgICAgICAgaWYgY2hlY2tQb3MuWiA+IG1heFogLSA1IHRoZW4gb3V0T2ZCb3VuZHNQdXNoID0gb3V0T2ZCb3VuZHNQdXNo",
+"ICsgVmVjdG9yMy5uZXcoMCwgMCwgLTEpIGVuZAogICAgICAgICAgICAKICAgICAgICAgICAgbG9jYWwgdGFyZ2V0SnVrZURpciA9",
+"IFZlY3RvcjMuemVybwogICAgICAgICAgICBpZiB0aHJlYXRDb3VudCA+IDAgdGhlbgogICAgICAgICAgICAgICAgdGFyZ2V0SnVr",
+"ZURpciA9IGRvZGdlVmVjLlVuaXQKICAgICAgICAgICAgICAgIGlmIG91dE9mQm91bmRzUHVzaC5NYWduaXR1ZGUgPiAwIHRoZW4K",
+"ICAgICAgICAgICAgICAgICAgICB0YXJnZXRKdWtlRGlyID0gKHRhcmdldEp1a2VEaXIgKyBvdXRPZkJvdW5kc1B1c2ggKiAyKS5V",
+"bml0CiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZWxzZWlmIG91dE9mQm91bmRzUHVzaC5NYWduaXR1ZGUgPiAwIHRo",
+"ZW4KICAgICAgICAgICAgICAgIHRhcmdldEp1a2VEaXIgPSBvdXRPZkJvdW5kc1B1c2guVW5pdAogICAgICAgICAgICBlbmQKICAg",
+"ICAgICAgICAgCiAgICAgICAgICAgIGlmIHRhcmdldEp1a2VEaXIuTWFnbml0dWRlID4gMCB0aGVuCiAgICAgICAgICAgICAgICBz",
+"bW9vdGhlZEp1a2VEaXIgPSBzbW9vdGhlZEp1a2VEaXI6TGVycCh0YXJnZXRKdWtlRGlyLCAwLjI1KQogICAgICAgICAgICAgICAg",
+"aHVtOk1vdmUoc21vb3RoZWRKdWtlRGlyLCBmYWxzZSkKICAgICAgICAgICAgZWxzZQogICAgICAgICAgICAgICAgc21vb3RoZWRK",
+"dWtlRGlyID0gVmVjdG9yMy56ZXJvCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCgogICAgbG9jYWwgaXNUcmFj",
+"a2luZyA9IGhhc0Zvb3RiYWxsIGFuZCAoYmFsbEd1aSB+PSBuaWwpCgogICAgaWYgaXNUcmFja2luZyB0aGVuCiAgICAgICAgaWYg",
+"bm90IGhpZGVDYXJkcy5WYWx1ZSB0aGVuCiAgICAgICAgICAgIHVwZGF0ZUhVRFZpc2liaWxpdHkodHJ1ZSkKICAgICAgICBlbHNl",
+"CiAgICAgICAgICAgIHVwZGF0ZUhVRFZpc2liaWxpdHkoZmFsc2UpCiAgICAgICAgZW5kCiAgICAgICAgCiAgICAgICAgaWYgbm90",
+"IGlzVGhyb3dpbmdBd2F5IHRoZW4KICAgICAgICAgICAgbG9jYWwgbmV3VGFyZ2V0ID0gZ2V0VGFyZ2V0KCkKICAgICAgICAgICAg",
+"aWYgbmV3VGFyZ2V0IHRoZW4KICAgICAgICAgICAgICAgIGxhc3RWYWxpZFRhcmdldCA9IG5ld1RhcmdldAogICAgICAgICAgICBl",
+"bHNlaWYgbGFzdFZhbGlkVGFyZ2V0IGFuZCBub3QgbGFzdFZhbGlkVGFyZ2V0OkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQ",
+"YXJ0JykgdGhlbgogICAgICAgICAgICAgICAgbGFzdFZhbGlkVGFyZ2V0ID0gbmlsCiAgICAgICAgICAgIGVuZAogICAgICAgICAg",
+"ICAKICAgICAgICAgICAgaWYgdGhyb3dBaW1ib3QuVmFsdWUgdGhlbgogICAgICAgICAgICAgICAgdGFyZ2V0ID0gbGFzdFZhbGlk",
+"VGFyZ2V0CiAgICAgICAgICAgICAgICB1cGRhdGVIaWdobGlnaHRzKGZhbHNlKQogICAgICAgICAgICAgICAgCiAgICAgICAgICAg",
+"ICAgICBsb2NhbCB0YXJnZXRQb3MKICAgICAgICAgICAgICAgIGlmIGlzVGhyb3dpbmcgYW5kIGxvY2tlZE1vdXNlUG9zIHRoZW4K",
+"ICAgICAgICAgICAgICAgICAgICB0YXJnZXRQb3MgPSBsb2NrZWRNb3VzZVBvcwogICAgICAgICAgICAgICAgZWxzZQogICAgICAg",
+"ICAgICAgICAgICAgIHRhcmdldFBvcyA9IG1vdXNlLkhpdC5Qb3NpdGlvbgogICAgICAgICAgICAgICAgICAgIGxvY2tlZE1vdXNl",
+"UG9zID0gdGFyZ2V0UG9zCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgbG9jYWwg",
+"aGVhZFBvcyA9IGhlYWQuUG9zaXRpb24KICAgICAgICAgICAgICAgIGxvY2FsIGdNYWcgPSAyOAogICAgICAgICAgICAgICAgbG9j",
+"YWwgY2FsY1Bvd2VyLCBjYWxjQW5nbGUgPSBzb2x2ZUtpbmVtYXRpY3MoaGVhZFBvcywgdGFyZ2V0UG9zLCBnTWFnKQogICAgICAg",
+"ICAgICAgICAgY2FsY1Bvd2VyID0gdG9udW1iZXIoY2FsY1Bvd2VyKSBvciA5NQogICAgICAgICAgICAgICAgY2FsY0FuZ2xlID0g",
+"dG9udW1iZXIoY2FsY0FuZ2xlKSBvciA0NQogICAgICAgICAgICAgICAgCiAgICAgICAgICAgICAgICBpZiBhdXRvUG93ZXIuVmFs",
+"dWUgdGhlbgogICAgICAgICAgICAgICAgICAgIHBvd2VyID0gbWF0aC5jbGFtcChjYWxjUG93ZXIsIDAsIDk1KQogICAgICAgICAg",
+"ICAgICAgZW5kCiAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgIGlmIGF1dG9BbmdsZS5WYWx1ZSB0aGVuCiAgICAgICAg",
+"ICAgICAgICAgICAgYW5nbGUgPSBtYXRoLmNsYW1wKGNhbGNBbmdsZSwgLTE1LCA5MCkKICAgICAgICAgICAgICAgIGVsc2UKICAg",
+"ICAgICAgICAgICAgICAgICBhbmdsZSA9IG1hdGguY2xhbXAodG9udW1iZXIoY3VzdG9tSGVpZ2h0LlZhbHVlKSBvciAwLCAtMTUs",
+"IDkwKQogICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgIGxvY2FsIHNhZmVQb3dlciA9",
+"IHRvbnVtYmVyKHBvd2VyKSBvciA2MAogICAgICAgICAgICAgICAgbG9jYWwgc2FmZUFuZ2xlID0gdG9udW1iZXIoYW5nbGUpIG9y",
+"IDQ1CiAgICAgICAgICAgICAgICBsb2NhbCBhbmdsZVJhZCA9IHRvbnVtYmVyKG1hdGgucmFkKHNhZmVBbmdsZSkpIG9yIDAKICAg",
+"ICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgbG9jYWwgaERpclJhdyA9IFZlY3RvcjMubmV3KHRhcmdldFBvcy5YIC0gaGVh",
+"ZFBvcy5YLCAwLCB0YXJnZXRQb3MuWiAtIGhlYWRQb3MuWikKICAgICAgICAgICAgICAgIGxvY2FsIGhEaXIgPSBoRGlyUmF3Lk1h",
+"Z25pdHVkZSA+IDAuMDEgYW5kIGhEaXJSYXcuVW5pdCBvciBocnAuQ0ZyYW1lLkxvb2tWZWN0b3IKICAgICAgICAgICAgICAgIAog",
+"ICAgICAgICAgICAgICAgbG9jYWwgZGlyVmVsb2NpdHkgPSAoaERpciAqICh0b251bWJlcihtYXRoLmNvcyhhbmdsZVJhZCkpIG9y",
+"IDEpICsgVmVjdG9yMy5uZXcoMCwgdG9udW1iZXIobWF0aC5zaW4oYW5nbGVSYWQpKSBvciAwLCAwKSkgKiBzYWZlUG93ZXIKICAg",
+"ICAgICAgICAgICAgIGRpcmVjdGlvbiA9IGRpclZlbG9jaXR5LlVuaXQgKiBzYWZlUG93ZXIKICAgICAgICAgICAgICAgIAogICAg",
+"ICAgICAgICAgICAgbG9jYWwgaFZlbCA9IHNhZmVQb3dlciAqICh0b251bWJlcihtYXRoLmNvcyhhbmdsZVJhZCkpIG9yIDEpCiAg",
+"ICAgICAgICAgICAgICBpZiBoVmVsID4gMC4xIHRoZW4KICAgICAgICAgICAgICAgICAgICBsb2NhbCB4RGlzdCA9IHRvbnVtYmVy",
+"KFZlY3RvcjMubmV3KHRhcmdldFBvcy5YIC0gaGVhZFBvcy5YLCAwLCB0YXJnZXRQb3MuWiAtIGhlYWRQb3MuWikuTWFnbml0dWRl",
+"KSBvciAwCiAgICAgICAgICAgICAgICAgICAgYWlydGltZSA9IHhEaXN0IC8gaFZlbAogICAgICAgICAgICAgICAgZWxzZQogICAg",
+"ICAgICAgICAgICAgICAgIGFpcnRpbWUgPSAwCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIAogICAgICAgICAg",
+"ICAgICAgdGFyZ2V0TGVhZFBvcyA9IHRhcmdldFBvcwogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICB0YXJnZXQgPSBu",
+"ZXdUYXJnZXQgb3IgbGFzdFZhbGlkVGFyZ2V0CiAgICAgICAgICAgICAgICB1cGRhdGVIaWdobGlnaHRzKHRydWUpCiAgICAgICAg",
+"ICAgICAgICBpZiB0YXJnZXQgYW5kIGhycCB0aGVuCiAgICAgICAgICAgICAgICAgICAgbG9jYWwgdEhSUCA9IHRhcmdldDpGaW5k",
+"Rmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICAgICAgICAgICAgICAgICAgaWYgdEhSUCB0aGVuCiAgICAgICAgICAg",
+"ICAgICAgICAgICAgIGlmIGF1dG9TZWxlY3RUaHJvd01vZGUuVmFsdWUgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"bG9jYWwgbSA9IGNhbGN1bGF0ZVJvdXRlRGlyZWN0aW9uKHRhcmdldCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGZvciBp",
+"ID0gMSwgI01vZGVPcmRlciBkbwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGlmIE1vZGVPcmRlcltpXSA9PSBtIHRo",
+"ZW4KICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbW9kZUluZGV4ID0gaQogICAgICAgICAgICAgICAgICAgICAg",
+"ICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICAgICAgICAg",
+"ICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxvY2Fs",
+"IHRhcmdldEN1cnJlbnRSb3V0ZSA9IHNlbGVjdCgxLCBmaW5kUm91dGUodGFyZ2V0KSkKICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgIGlmIE1vZGVPcmRlclttb2RlSW5kZXhdID09ICdCdWxsZXQnIGFuZCAodGFyZ2V0Q3VycmVudFJvdXRlID09ICdnby9mYWRl",
+"JyBvciB0YXJnZXRDdXJyZW50Um91dGUgPT0gJ3Bvc3QvY29ybmVyJykgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgIGZvciBpID0gMSwgI01vZGVPcmRlciBkbwogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBpZiBNb2RlT3Jk",
+"ZXJbaV0gPT0gJ01hZycgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbW9kZUluZGV4ID0gaQog",
+"ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgYnJlYWsKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg",
+"ICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBl",
+"bmQKICAgICAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgICAg",
+"ICAgICBhdXRvQWltKHRIUlApCiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAg",
+"ZW5kCiAgICAgICAgZWxzZQogICAgICAgICAgICB0YXJnZXQgPSBuaWwKICAgICAgICAgICAgdXBkYXRlSGlnaGxpZ2h0cyhmYWxz",
+"ZSkKICAgICAgICBlbmQKICAgICAgICAKICAgICAgICBpZiBhdXRvQ2hhbmdlUG93ZXJVSS5WYWx1ZSB0aGVuCiAgICAgICAgICAg",
+"IGlmIGJhbGxHdWkgYW5kIGJhbGxHdWk6RmluZEZpcnN0Q2hpbGQoJ0ZyYW1lMCcpIHRoZW4KICAgICAgICAgICAgICAgIGxvY2Fs",
+"IGZyYW1lMCA9IGJhbGxHdWkuRnJhbWUwCiAgICAgICAgICAgICAgICBsb2NhbCBzYWZlUG93ZXIgPSB0b251bWJlcihwb3dlcikg",
+"b3IgNjAKICAgICAgICAgICAgICAgIGlmIHNhZmVQb3dlciB+PSBzYWZlUG93ZXIgdGhlbiBzYWZlUG93ZXIgPSA2MCBlbmQKICAg",
+"ICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgbG9jYWwgZGlzcGxheVBvd2VyID0gbWF0aC5yb3VuZChzYWZlUG93ZXIgLyA1",
+"KSAqIDUKICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgbG9jYWwgdHh0ID0gZnJhbWUwOkZpbmRGaXJzdENoaWxkT2ZD",
+"bGFzcygnVGV4dExhYmVsJykKICAgICAgICAgICAgICAgIGlmIHR4dCB0aGVuIHR4dC5UZXh0ID0gdG9zdHJpbmcobWF0aC5mbG9v",
+"cihkaXNwbGF5UG93ZXIpKSBlbmQKICAgICAgICAgICAgICAgIAogICAgICAgICAgICAgICAgbG9jYWwgZnJhbWVzID0gZnJhbWUw",
+"OkdldENoaWxkcmVuKCkKICAgICAgICAgICAgICAgIGZvciBpID0gMSwgI2ZyYW1lcyBkbwogICAgICAgICAgICAgICAgICAgIGxv",
+"Y2FsIGZyYW1lID0gZnJhbWVzW2ldCiAgICAgICAgICAgICAgICAgICAgaWYgZnJhbWUuTmFtZSB+PSAnRGlzcCcgdGhlbgogICAg",
+"ICAgICAgICAgICAgICAgICAgICBsb2NhbCBmcmFtZU51bSA9IHRvbnVtYmVyKGZyYW1lLk5hbWUpIG9yIDAKICAgICAgICAgICAg",
+"ICAgICAgICAgICAgZnJhbWUuQmFja2dyb3VuZFRyYW5zcGFyZW5jeSA9ICgodG9udW1iZXIoZnJhbWVOdW0pIG9yIDApIDw9ICh0",
+"b251bWJlcihkaXNwbGF5UG93ZXIpIG9yIDApKSBhbmQgMCBvciAwLjkKICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAg",
+"ICAgICAgIGVuZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgICAgICAKICAgICAgICBsb2NhbCBzYWZlUG93Rm9yQ2Fy",
+"ZCA9IHRvbnVtYmVyKHBvd2VyKSBvciA2MAogICAgICAgIGlmIHNhZmVQb3dGb3JDYXJkIH49IHNhZmVQb3dGb3JDYXJkIHRoZW4g",
+"c2FmZVBvd0ZvckNhcmQgPSA2MCBlbmQKICAgICAgICAKICAgICAgICBpZiBIVURDYXJkc1snQW5nbGUnXSB0aGVuIAogICAgICAg",
+"ICAgICBsb2NhbCBmb3JjZUF1dG9BbmdsZSA9IChNb2RlT3JkZXJbbW9kZUluZGV4XSA9PSAnQnVsbGV0JyBvciAodGFyZ2V0IGFu",
+"ZCBmaW5kUm91dGUodGFyZ2V0KSA9PSAnc2xhbnQnIG9yIGZpbmRSb3V0ZSh0YXJnZXQpID09ICdkcmFnJyBvciBmaW5kUm91dGUo",
+"dGFyZ2V0KSA9PSAnaW4vb3V0JyBvciBmaW5kUm91dGUodGFyZ2V0KSA9PSAnZmxhdCcgb3IgZmluZFJvdXRlKHRhcmdldCkgPT0g",
+"J2hpdGNoJyBvciBmaW5kUm91dGUodGFyZ2V0KSA9PSAnY3VybC9jb21lYmFjaycpIG9yICh0b251bWJlcihwb3dlcikgb3IgNjAp",
+"ID09IDk1IG9yIGhpZ2hQb3dlck9ubHkuVmFsdWUpCiAgICAgICAgICAgIGlmIG5vdCBhdXRvQW5nbGUuVmFsdWUgYW5kIG5vdCBm",
+"b3JjZUF1dG9BbmdsZSB0aGVuCiAgICAgICAgICAgICAgICBIVURDYXJkc1snQW5nbGUnXS5UZXh0ID0gdG9zdHJpbmcobWF0aC5m",
+"bG9vcih0b251bWJlcihjdXN0b21IZWlnaHQuVmFsdWUpIG9yIDApKQogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICBI",
+"VURDYXJkc1snQW5nbGUnXS5UZXh0ID0gdG9zdHJpbmcobWF0aC5mbG9vcih0b251bWJlcihhbmdsZSkgb3IgNDUpKSAKICAgICAg",
+"ICAgICAgZW5kCiAgICAgICAgZW5kCiAgICAgICAgCiAgICAgICAgaWYgSFVEQ2FyZHNbJ1Bvd2VyJ10gdGhlbiBIVURDYXJkc1sn",
+"UG93ZXInXS5UZXh0ID0gc3RyaW5nLmZvcm1hdCgnJS4wZicsIHNhZmVQb3dGb3JDYXJkKSBlbmQKICAgICAgICBpZiBIVURDYXJk",
+"c1snQWlydGltZSddIHRoZW4gSFVEQ2FyZHNbJ0FpcnRpbWUnXS5UZXh0ID0gc3RyaW5nLmZvcm1hdCgnJS4xZnMnLCB0b251bWJl",
+"cihhaXJ0aW1lKSBvciAwKSBlbmQKICAgICAgICBpZiBIVURDYXJkc1snVGhyb3cgVHlwZSddIHRoZW4gSFVEQ2FyZHNbJ1Rocm93",
+"IFR5cGUnXS5UZXh0ID0gdG9zdHJpbmcoTW9kZU9yZGVyW21vZGVJbmRleF0gb3IgJ04vQScpIGVuZAogICAgICAgIAogICAgICAg",
+"IGlmIEhVRENhcmRzWydQbGF5ZXInXSB0aGVuCiAgICAgICAgICAgIGlmIHRocm93QWltYm90LlZhbHVlIHRoZW4KICAgICAgICAg",
+"ICAgICAgIEhVRENhcmRzWydQbGF5ZXInXS5UZXh0ID0gJ01PVVNFJwogICAgICAgICAgICBlbHNlCiAgICAgICAgICAgICAgICBI",
+"VURDYXJkc1snUGxheWVyJ10uVGV4dCA9IHRvc3RyaW5nKCh0YXJnZXQgYW5kIHRhcmdldC5OYW1lKSBvciAnTk9ORScpCiAgICAg",
+"ICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZWxzZQogICAgICAgIHVwZGF0ZUhVRFZpc2liaWxpdHkoZmFsc2UpCiAgICAgICAg",
+"dXBkYXRlSGlnaGxpZ2h0cyhmYWxzZSkKICAgICAgICB0YXJnZXQgPSBuaWwKICAgICAgICBsYXN0VmFsaWRUYXJnZXQgPSBuaWwK",
+"ICAgIGVuZAoKICAgIGlmIGJlYW0gYW5kIGlzVHJhY2tpbmcgdGhlbgogICAgICAgIGJlYW0uRW5hYmxlZCA9IHRydWUKICAgICAg",
+"ICBsb2NhbCBzdGFydE9yaWdpbiA9IGhlYWQuUG9zaXRpb24KICAgICAgICBsb2NhbCBzYWZlUG93ZXJGb3JCZWFtID0gdG9udW1i",
+"ZXIocG93ZXIpIG9yIDYwCiAgICAgICAgbG9jYWwgZHJhd0RpciA9IGRpcmVjdGlvbiBvciBWZWN0b3IzLm5ldygwLCAxLCAwKQog",
+"ICAgICAgIAogICAgICAgIGlmIHRocm93QWltYm90LlZhbHVlIHRoZW4KICAgICAgICAgICAgaWYgKHRvbnVtYmVyKGRyYXdEaXIu",
+"TWFnbml0dWRlKSBvciAwKSA8IDAuMSB0aGVuCiAgICAgICAgICAgICAgICBkcmF3RGlyID0gVmVjdG9yMy5uZXcoMCwgMSwgMCkg",
+"KiBzYWZlUG93ZXJGb3JCZWFtCiAgICAgICAgICAgIGVuZAogICAgICAgIGVsc2VpZiBub3QgdGFyZ2V0IG9yIG5vdCB0YXJnZXRM",
+"ZWFkUG9zIHRoZW4KICAgICAgICAgICAgbG9jYWwgbW91c2VSYXkgPSBjYW1lcmE6U2NyZWVuUG9pbnRUb1JheShtb3VzZS5YLCBt",
+"b3VzZS5ZKQogICAgICAgICAgICBkcmF3RGlyID0gbW91c2VSYXkuRGlyZWN0aW9uLlVuaXQgKiBzYWZlUG93ZXJGb3JCZWFtCiAg",
+"ICAgICAgICAgIGRpcmVjdGlvbiA9IGRyYXdEaXIKICAgICAgICBlbHNlCiAgICAgICAgICAgIGlmICh0b251bWJlcihkcmF3RGly",
+"Lk1hZ25pdHVkZSkgb3IgMCkgPCAwLjEgdGhlbgogICAgICAgICAgICAgICAgZHJhd0RpciA9IFZlY3RvcjMubmV3KDAsIDEsIDAp",
+"ICogc2FmZVBvd2VyRm9yQmVhbQogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgICAgICAKICAgICAgICBsb2NhbCBzYWZl",
+"QWlydGltZSA9IG1hdGgubWF4KHRvbnVtYmVyKGFpcnRpbWUpIG9yIDAuMSwgMC4xKQogICAgICAgIAogICAgICAgIGxvY2FsIGN1",
+"cnZlMCwgY3VydmUxLCBjZjEsIGNmMiA9IGJlYW1Qcm9qZWN0aWxlKFZlY3RvcjMubmV3KDAsLTI4LDApLCBkcmF3RGlyLCBzdGFy",
+"dE9yaWdpbiArIChkcmF3RGlyLlVuaXQgKiA1KSwgc2FmZUFpcnRpbWUpCiAgICAgICAgCiAgICAgICAgYmVhbS5DdXJ2ZVNpemUw",
+"ID0gY3VydmUwCiAgICAgICAgYmVhbS5DdXJ2ZVNpemUxID0gY3VydmUxCiAgICAgICAgCiAgICAgICAgaWYgYXR0YWNoMCBhbmQg",
+"YXR0YWNoMSB0aGVuCiAgICAgICAgICAgIGF0dGFjaDAuV29ybGRDRnJhbWUgPSBjZjEKICAgICAgICAgICAgYXR0YWNoMS5Xb3Js",
+"ZENGcmFtZSA9IGNmMgogICAgICAgICAgICAKICAgICAgICAgICAgYXR0YWNoMC5Xb3JsZFBvc2l0aW9uID0gVmVjdG9yMy5uZXco",
+"Y2YxLlgsIGNmMS5ZLCBjZjEuWikKICAgICAgICAgICAgYXR0YWNoMS5Xb3JsZFBvc2l0aW9uID0gVmVjdG9yMy5uZXcoY2YyLlgs",
+"IGNmMi5ZLCBjZjIuWikKICAgICAgICAgICAgCiAgICAgICAgICAgIGlmIHBvc1BhcnQgdGhlbiBwb3NQYXJ0LlBvc2l0aW9uID0g",
+"VmVjdG9yMy5uZXcoYXR0YWNoMS5Xb3JsZFBvc2l0aW9uLlgsIGF0dGFjaDEuV29ybGRQb3NpdGlvbi5ZLCBhdHRhY2gxLldvcmxk",
+"UG9zaXRpb24uWikgZW5kCiAgICAgICAgZW5kCiAgICBlbHNlCiAgICAgICAgaWYgYmVhbSB0aGVuIGJlYW0uRW5hYmxlZCA9IGZh",
+"bHNlIGVuZAogICAgICAgIGlmIHBvc1BhcnQgdGhlbiBwb3NQYXJ0LlBvc2l0aW9uID0gVmVjdG9yMy5uZXcoMCwgLTk5OTksIDAp",
+"IGVuZAogICAgICAgIGlmIGF0dGFjaDAgdGhlbiBhdHRhY2gwLldvcmxkUG9zaXRpb24gPSBWZWN0b3IzLm5ldygwLCAtOTk5OSwg",
+"MCkgZW5kCiAgICAgICAgaWYgYXR0YWNoMSB0aGVuIGF0dGFjaDEuV29ybGRQb3NpdGlvbiA9IFZlY3RvcjMubmV3KDAsIC05OTk5",
+"LCAwKSBlbmQKICAgIGVuZAplbmQpCgpsb2NhbCBDYXRjaGluZ1RhYiA9IFdpbmRvdzpDcmVhdGVUYWIoeyBOYW1lID0gJ0NhdGNo",
+"aW5nJywgSWNvbiA9ICdyYnhhc3NldGlkOi8vNjAzNDIyNzA2NycgfSkKCmZvb3RiYWxsTWFnbmV0cyA9IENhdGNoaW5nVGFiOkNy",
+"ZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0VuYWJsZSBGb290YmFsbCBNYWduZXRzJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAg",
+"IFRpcCA9ICdBdXRvbWF0aWNhbGx5IHB1bGxzIG5lYXJieSBmb290YmFsbHMgaW50byBjYXRjaCByYW5nZS4nLAp9KQoKZnJlZUZh",
+"bGxDaGVjayA9IENhdGNoaW5nVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ01hZ25ldHMgRnJlZWZhbGwgQ2hlY2snLAog",
+"ICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ09ubHkgYWN0aXZhdGVzIGZvb3RiYWxsIG1hZ25ldHMgd2hpbGUgdGhlIGJh",
+"bGwgaXMgYWlyYm9ybmUuJywKfSkKCnNob3dDYXRjaEhpdGJveCA9IENhdGNoaW5nVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1l",
+"ID0gJ1Nob3cgTWFnbmV0cyBSYWRpdXMnLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ0Rpc3BsYXlzIHRoZSBmb290",
+"YmFsbCBtYWduZXRzIGNhdGNoIHJhZGl1cy4nLAp9KQoKbWFnbmV0c1JhZGl1cyA9IENhdGNoaW5nVGFiOkNyZWF0ZVNsaWRlcih7",
+"CiAgICBOYW1lID0gJ01hZ25ldHMgQ2F0Y2ggRGlzdGFuY2UnLAogICAgTWluID0gMCwKICAgIE1heCA9IDI1LAogICAgRGVmYXVs",
+"dCA9IDAsCiAgICBJbmNyZW1lbnQgPSAwLjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdTZXRzIHRoZSBtYXhpbXVtIGRp",
+"c3RhbmNlIGZvb3RiYWxscyBjYW4gYmUgY2F1Z2h0IGZyb20uJywKfSkKCm1hZ25ldHNEZWxheSA9IENhdGNoaW5nVGFiOkNyZWF0",
+"ZVNsaWRlcih7CiAgICBOYW1lID0gJ01hZ25ldHMgQ2F0Y2ggRGVsYXknLAogICAgTWluID0gMCwKICAgIE1heCA9IDEsCiAgICBE",
+"ZWZhdWx0ID0gMCwKICAgIEluY3JlbWVudCA9IDAuMSwKICAgIFN1ZmZpeCA9ICcnLAogICAgVGlwID0gJ1NldHMgdGhlIGRlbGF5",
+"IGJlZm9yZSBmb290YmFsbCBtYWduZXRzIGFjdGl2YXRlLicsCn0pCgptYWdzVHlwZSA9IENhdGNoaW5nVGFiOkNyZWF0ZURyb3Bk",
+"b3duKHsKICAgIE5hbWUgPSAnTWFnbmV0cyBUeXBlJywKICAgIE9wdGlvbnMgPSB7J0N1c3RvbScsICdCbGF0YW50JywgJ0xlYWd1",
+"ZScsICdMZWdpdCd9LAogICAgRGVmYXVsdCA9ICdDdXN0b20nLAogICAgVGlwID0gJ1NlbGVjdHMgdGhlIGZvb3RiYWxsIG1hZ25l",
+"dHMgYmVoYXZpb3IgcHJlc2V0LicsCn0pCgpsb2NhbCBwbGF5ZXIgPSBnYW1lOkdldFNlcnZpY2UoJ1BsYXllcnMnKS5Mb2NhbFBs",
+"YXllcgoKbG9jYWwgcGFydCA9IEluc3RhbmNlLm5ldygnUGFydCcpCnBhcnQuQ29sb3IgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1",
+"NSwgMjU1KQpwYXJ0LlNoYXBlID0gRW51bS5QYXJ0VHlwZS5CYWxsCnBhcnQuTWF0ZXJpYWwgPSBFbnVtLk1hdGVyaWFsLkZvcmNl",
+"RmllbGQKcGFydC5DYXN0U2hhZG93ID0gZmFsc2UKcGFydC5BbmNob3JlZCA9IHRydWUKcGFydC5DYW5Db2xsaWRlID0gZmFsc2UK",
+"CmxvY2FsIGZpbmRDbG9zZXN0QmFsbCA9IGZ1bmN0aW9uKCkKICAgIGxvY2FsIGNoYXJhY3RlciA9IHBsYXllci5DaGFyYWN0ZXIK",
+"ICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiByZXR1cm4gZW5kCgogICAgbG9jYWwgaHVtYW5vaWRSb290UGFydCA9IGNoYXJhY3Rl",
+"cjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICBpZiBub3QgaHVtYW5vaWRSb290UGFydCB0aGVuIHJldHVy",
+"biBlbmQKCiAgICBsb2NhbCBkaXN0ID0gbWF0aC5odWdlCiAgICBsb2NhbCBiYWxsID0gbmlsCgogICAgZm9yIF8sIHYgaW4gbmV4",
+"dCwgd29ya3NwYWNlOkdldENoaWxkcmVuKCkgZG8KICAgICAgICBpZiBub3QgdjpJc0EoJ0Jhc2VQYXJ0JykgdGhlbiBjb250aW51",
+"ZSBlbmQKICAgICAgICBpZiB2Lk5hbWUgfj0gJ0Zvb3RiYWxsJyB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2NhbCBkaXN0",
+"YW5jZSA9ICh2LlBvc2l0aW9uIC0gaHVtYW5vaWRSb290UGFydC5Qb3NpdGlvbikuTWFnbml0dWRlCgogICAgICAgIGlmIGRpc3Rh",
+"bmNlIDwgZGlzdCB0aGVuCiAgICAgICAgICAgIGRpc3QgPSBkaXN0YW5jZQogICAgICAgICAgICBiYWxsID0gdgogICAgICAgIGVu",
+"ZAogICAgZW5kCgogICAgcmV0dXJuIGJhbGwKZW5kCgpsb2NhbCBzZWxlY3RlZFJhbmdlID0gZnVuY3Rpb24oKQoJbG9jYWwgcmFu",
+"Z2UgPSB0b251bWJlcihtYWduZXRzUmFkaXVzLlZhbHVlKSBvciAwCglsb2NhbCBtb2RlID0gdG9zdHJpbmcobWFnc1R5cGUuVmFs",
+"dWUgb3IgJ0N1c3RvbScpOmxvd2VyKCkKCglpZiBtb2RlID09ICdsZWdpdCcgdGhlbgoJCXJldHVybiByYW5nZSAvIDIKCWVsc2Vp",
+"ZiBtb2RlID09ICdsZWFndWUnIHRoZW4KCQlyZXR1cm4gcmFuZ2UgLyAxLjQKCWVsc2VpZiBtb2RlID09ICdibGF0YW50JyB0aGVu",
+"CgkJcmV0dXJuIHJhbmdlICogMS41CgllbmQKCglyZXR1cm4gcmFuZ2UKZW5kCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgIHdo",
+"aWxlIHRydWUgZG8KICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICBsb2NhbCBjaGFyYWN0ZXIgPSBwbGF5ZXIuQ2hhcmFjdGVy",
+"CiAgICAgICAgaWYgbm90IGNoYXJhY3RlciB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2NhbCBodW1hbm9pZCA9IGNoYXJh",
+"Y3RlcjpGaW5kRmlyc3RDaGlsZE9mQ2xhc3MoJ0h1bWFub2lkJykKICAgICAgICBpZiBub3QgaHVtYW5vaWQgdGhlbiBjb250aW51",
+"ZSBlbmQKCiAgICAgICAgbG9jYWwgYmFsbCA9IGZpbmRDbG9zZXN0QmFsbCgpCiAgICAgICAgaWYgbm90IGJhbGwgdGhlbiBjb250",
+"aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgcmFuZ2UgPSBzZWxlY3RlZFJhbmdlKCkKCiAgICAgICAgcGFydC5TaXplID0gVmVjdG9y",
+"My5uZXcocmFuZ2UsIHJhbmdlLCByYW5nZSkKICAgICAgICBwYXJ0LkNGcmFtZSA9IENGcmFtZS5uZXcoYmFsbC5Qb3NpdGlvbikK",
+"ICAgICAgICBwYXJ0LlBhcmVudCA9IChmb290YmFsbE1hZ25ldHMuVmFsdWUgYW5kIHNob3dDYXRjaEhpdGJveC5WYWx1ZSkgYW5k",
+"IHdvcmtzcGFjZS5UZXJyYWluIG9yIG5pbAoKICAgICAgICBmb3IgXywgdiBpbiBuZXh0LCBjaGFyYWN0ZXI6R2V0Q2hpbGRyZW4o",
+"KSBkbwogICAgICAgICAgICBpZiBub3QgdjpJc0EoJ0Jhc2VQYXJ0JykgdGhlbiBjb250aW51ZSBlbmQKICAgICAgICAgICAgaWYg",
+"bm90IHYuTmFtZTpsb3dlcigpOmZpbmQoJ2NhdGNoJykgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgICAgIGxvY2FsIGRpc3Rh",
+"bmNlID0gKGJhbGwuUG9zaXRpb24gLSB2LlBvc2l0aW9uKS5NYWduaXR1ZGUKCiAgICAgICAgICAgIGlmIGZyZWVGYWxsQ2hlY2su",
+"VmFsdWUgYW5kIGh1bWFub2lkOkdldFN0YXRlKCkgfj0gRW51bS5IdW1hbm9pZFN0YXRlVHlwZS5GcmVlZmFsbCB0aGVuIGNvbnRp",
+"bnVlIGVuZAoKICAgICAgICAgICAgaWYgZm9vdGJhbGxNYWduZXRzLlZhbHVlIGFuZCBkaXN0YW5jZSA8IHJhbmdlIHRoZW4KICAg",
+"ICAgICAgICAgICAgIHBjYWxsKGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgICAgICBmaXJldG91Y2hpbnRlcmVzdCh2LCBiYWxs",
+"LCAwKQogICAgICAgICAgICAgICAgICAgIGZpcmV0b3VjaGludGVyZXN0KHYsIGJhbGwsIDEpCiAgICAgICAgICAgICAgICBlbmQp",
+"CiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCmVuZCkKCkNhdGNoaW5nVGFiOkNyZWF0ZURpdmlkZXIoKQoKbWFn",
+"RW5oYW5jZXIgPSBDYXRjaGluZ1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdFbmFibGUgTWFnIEVuaGFuY2VyJywKICAg",
+"IERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdFbmhhbmNlcyBjYXRjaGVzIG9uIGZvb3RiYWxscyBhbHJlYWR5IHdpdGhpbiBy",
+"YW5nZS4nLAp9KQoKbWFnRW5oYW5jZXJSYWRpdXMgPSBDYXRjaGluZ1RhYjpDcmVhdGVTbGlkZXIoewogICAgTmFtZSA9ICdNYWcg",
+"Q2F0Y2ggRGlzdGFuY2UnLAogICAgTWluID0gMCwKICAgIE1heCA9IDI1LAogICAgRGVmYXVsdCA9IDAsCiAgICBJbmNyZW1lbnQg",
+"PSAwLjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdTZXRzIHRoZSBtYXhpbXVtIGRpc3RhbmNlIHRoZSBlbmhhbmNlciBj",
+"YW4gYXNzaXN0IGNhdGNoZXMuJywKfSkKCm1hZ0VuaGFuY2VyTWF4QW5nbGUgPSBDYXRjaGluZ1RhYjpDcmVhdGVTbGlkZXIoewog",
+"ICAgTmFtZSA9ICdNYWcgTWF4IEFuZ2xlJywKICAgIE1pbiA9IDUwLAogICAgTWF4ID0gNzAsCiAgICBEZWZhdWx0ID0gNTAsCiAg",
+"ICBJbmNyZW1lbnQgPSAwLjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdTZXRzIHRoZSBtYXhpbXVtIGNhdGNoIGFuZ2xl",
+"IHRoZSBlbmhhbmNlciBjYW4gYXNzaXN0LicsCn0pCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgIHdoaWxlIHRydWUgZG8KICAg",
+"ICAgICB0YXNrLndhaXQoMC4xKQoKICAgICAgICBpZiBub3QgbWFnRW5oYW5jZXIuVmFsdWUgdGhlbiBjb250aW51ZSBlbmQKCiAg",
+"ICAgICAgbG9jYWwgY2hhcmFjdGVyID0gcGxheWVyLkNoYXJhY3RlcgogICAgICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiBjb250",
+"aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgaHVtYW5vaWRSb290UGFydCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5v",
+"aWRSb290UGFydCcpCiAgICAgICAgaWYgbm90IGh1bWFub2lkUm9vdFBhcnQgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9j",
+"YWwgYmFsbCA9IGZpbmRDbG9zZXN0QmFsbCgpCiAgICAgICAgaWYgbm90IGJhbGwgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAg",
+"bG9jYWwgdmVydGljYWxEaXN0YW5jZSA9IGJhbGwuUG9zaXRpb24uWSAtIGh1bWFub2lkUm9vdFBhcnQuUG9zaXRpb24uWQoKICAg",
+"ICAgICBpZiB2ZXJ0aWNhbERpc3RhbmNlID4gbWFnRW5oYW5jZXJNYXhBbmdsZS5WYWx1ZSB0aGVuCiAgICAgICAgICAgIGNvbnRp",
+"bnVlCiAgICAgICAgZW5kCgogICAgICAgIGxvY2FsIGxvb2tWZWN0b3IgPSBodW1hbm9pZFJvb3RQYXJ0LkNGcmFtZS5Mb29rVmVj",
+"dG9yCiAgICAgICAgbG9jYWwgZGlyZWN0aW9uID0gKGJhbGwuUG9zaXRpb24gLSBodW1hbm9pZFJvb3RQYXJ0LlBvc2l0aW9uKS5V",
+"bml0CiAgICAgICAgbG9jYWwgZG90ID0gbG9va1ZlY3RvcjpEb3QoZGlyZWN0aW9uKQoKICAgICAgICBmb3IgXywgdiBpbiBuZXh0",
+"LCBjaGFyYWN0ZXI6R2V0Q2hpbGRyZW4oKSBkbwogICAgICAgICAgICBpZiBub3QgdjpJc0EoJ0Jhc2VQYXJ0JykgdGhlbiBjb250",
+"aW51ZSBlbmQKICAgICAgICAgICAgaWYgbm90IHYuTmFtZTpsb3dlcigpOmZpbmQoJ2NhdGNoJykgdGhlbiBjb250aW51ZSBlbmQK",
+"CiAgICAgICAgICAgIGxvY2FsIGRpc3RhbmNlID0gKGJhbGwuUG9zaXRpb24gLSB2LlBvc2l0aW9uKS5NYWduaXR1ZGUKCiAgICAg",
+"ICAgICAgIGlmIGRvdCA+IDAgYW5kIGRpc3RhbmNlIDw9IG1hZ0VuaGFuY2VyUmFkaXVzLlZhbHVlIHRoZW4KICAgICAgICAgICAg",
+"ICAgIHBjYWxsKGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgICAgICBmaXJldG91Y2hpbnRlcmVzdCh2LCBiYWxsLCAwKQogICAg",
+"ICAgICAgICAgICAgICAgIGZpcmV0b3VjaGludGVyZXN0KHYsIGJhbGwsIDEpCiAgICAgICAgICAgICAgICBlbmQpCiAgICAgICAg",
+"ICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCmVuZCkKICAgIApDYXRjaGluZ1RhYjpDcmVhdGVEaXZpZGVyKCkKCnB1bGxWZWN0",
+"b3IgPSBDYXRjaGluZ1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdFbmFibGUgUHVsbCBWZWN0b3InLAogICAgRGVmYXVs",
+"dCA9IGZhbHNlLAogICAgVGlwID0gJ1B1bGxzIG5lYXJieSBmb290YmFsbHMgdG93YXJkIHlvdXIgY2F0Y2ggcG9zaXRpb24uJywK",
+"fSkKCnB1bGxWZWN0b3JSYWRpdXMgPSBDYXRjaGluZ1RhYjpDcmVhdGVTbGlkZXIoewogICAgTmFtZSA9ICdQdWxsIFZlY3RvciBS",
+"YWRpdXMnLAogICAgTWluID0gMCwKICAgIE1heCA9IDQ1LAogICAgRGVmYXVsdCA9IDAsCiAgICBJbmNyZW1lbnQgPSAwLjEsCiAg",
+"ICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdTZXRzIHRoZSBtYXhpbXVtIGRpc3RhbmNlIGZvb3RiYWxscyBjYW4gYmUgcHVsbGVk",
+"IGZyb20uJywKfSkKCnB1bGxWZWN0b3JQb3dlciA9IENhdGNoaW5nVGFiOkNyZWF0ZVNsaWRlcih7CiAgICBOYW1lID0gJ1B1bGwg",
+"VmVjdG9yIFBvd2VyJywKICAgIE1pbiA9IDAsCiAgICBNYXggPSA1LAogICAgRGVmYXVsdCA9IDAsCiAgICBJbmNyZW1lbnQgPSAw",
+"LjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdDb250cm9scyBob3cgc3Ryb25nbHkgZm9vdGJhbGxzIGFyZSBwdWxsZWQg",
+"dG93YXJkIHlvdS4nLAp9KQoKdGFzay5zcGF3bihmdW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0",
+"KCkKCiAgICAgICAgaWYgbm90IHB1bGxWZWN0b3IuVmFsdWUgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgY2hhcmFj",
+"dGVyID0gcGxheWVyLkNoYXJhY3RlcgogICAgICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAg",
+"bG9jYWwgaHVtYW5vaWRSb290UGFydCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICAg",
+"ICAgaWYgbm90IGh1bWFub2lkUm9vdFBhcnQgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgYmFsbCA9IGZpbmRDbG9z",
+"ZXN0QmFsbCgpCiAgICAgICAgaWYgbm90IGJhbGwgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgZGlzdGFuY2UgPSAo",
+"YmFsbC5Qb3NpdGlvbiAtIGh1bWFub2lkUm9vdFBhcnQuUG9zaXRpb24pLk1hZ25pdHVkZQogICAgICAgIGlmIGRpc3RhbmNlID4g",
+"cHVsbFZlY3RvclJhZGl1cy5WYWx1ZSB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2NhbCBkaXJlY3Rpb24gPSAoYmFsbC5Q",
+"b3NpdGlvbiAtIGh1bWFub2lkUm9vdFBhcnQuUG9zaXRpb24pLlVuaXQKICAgICAgICBodW1hbm9pZFJvb3RQYXJ0LkFzc2VtYmx5",
+"TGluZWFyVmVsb2NpdHkgPSBkaXJlY3Rpb24gKiAocHVsbFZlY3RvclBvd2VyLlZhbHVlICogMjUpCiAgICBlbmQKZW5kKQoKQ2F0",
+"Y2hpbmdUYWI6Q3JlYXRlRGl2aWRlcigpCgppbmNyZWFzZUFybVNpemUgPSBDYXRjaGluZ1RhYjpDcmVhdGVUb2dnbGUoewogICAg",
+"TmFtZSA9ICdJbmNyZWFzZSBBcm0gU2l6ZScsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAnSW5jcmVhc2VzIGFybSBz",
+"aXplIHRvIGltcHJvdmUgY2F0Y2ggcmVhY2guJywKfSkKCmFybVNpemVWYWx1ZSA9IENhdGNoaW5nVGFiOkNyZWF0ZVNsaWRlcih7",
+"CiAgICBOYW1lID0gJ0FybSBTaXplIFZhbHVlJywKICAgIE1pbiA9IDIsCiAgICBNYXggPSAyNSwKICAgIERlZmF1bHQgPSAyLAog",
+"ICAgSW5jcmVtZW50ID0gMC4xLAogICAgU3VmZml4ID0gJycsCiAgICBUaXAgPSAnU2V0cyB0aGUgc2l6ZSBhcHBsaWVkIHRvIGJv",
+"dGggYXJtcy4nLAp9KQoKdGFzay5zcGF3bihmdW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0KCkK",
+"CiAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gcGxheWVyLkNoYXJhY3RlcgogICAgICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiBj",
+"b250aW51ZSBlbmQKCiAgICAgICAgZm9yIF8sIHYgaW4gbmV4dCwgY2hhcmFjdGVyOkdldENoaWxkcmVuKCkgZG8KICAgICAgICAg",
+"ICAgaWYgbm90IHY6SXNBKCdCYXNlUGFydCcpIHRoZW4gY29udGludWUgZW5kCiAgICAgICAgICAgIGlmIG5vdCB2Lk5hbWU6bG93",
+"ZXIoKTpmaW5kKCd0IGFybScpIHRoZW4gY29udGludWUgZW5kCgogICAgICAgICAgICB2LlNpemUgPSBWZWN0b3IzLm5ldyh2LlNp",
+"emUuWCwgaW5jcmVhc2VBcm1TaXplLlZhbHVlIGFuZCBhcm1TaXplVmFsdWUuVmFsdWUgb3IgMiwgdi5TaXplLlopCiAgICAgICAg",
+"ZW5kCiAgICBlbmQKZW5kKQogICAgCmxvY2FsIFBsYXllclRhYiA9IFdpbmRvdzpDcmVhdGVUYWIoeyBOYW1lID0gJ1BsYXllcics",
+"IEljb24gPSAncmJ4YXNzZXRpZDovLzEwMzgwNzU0ODM1NTEyNicgfSkKCmN1c3RvbVdhbGtTcGVlZCA9IFBsYXllclRhYjpDcmVh",
+"dGVUb2dnbGUoewogICAgTmFtZSA9ICdDdXN0b20gV2Fsa1NwZWVkJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdP",
+"dmVycmlkZXMgeW91ciBjaGFyYWN0ZXIgbW92ZW1lbnQgc3BlZWQuJywKfSkKCndhbGtTcGVlZFZhbHVlID0gUGxheWVyVGFiOkNy",
+"ZWF0ZVNsaWRlcih7CiAgICBOYW1lID0gJ1dhbGtTcGVlZCBWYWx1ZScsCiAgICBNaW4gPSAyMCwKICAgIE1heCA9IDIzLAogICAg",
+"RGVmYXVsdCA9IDIwLAogICAgSW5jcmVtZW50ID0gMC4xLAogICAgU3VmZml4ID0gJycsCiAgICBUaXAgPSAnU2V0cyB0aGUgbW92",
+"ZW1lbnQgc3BlZWQgdmFsdWUuJywKfSkKCndhbGtzcGVlZFR5cGUgPSBQbGF5ZXJUYWI6Q3JlYXRlRHJvcGRvd24oewogICAgTmFt",
+"ZSA9ICdXYWxrU3BlZWQgVHlwZScsCiAgICBPcHRpb25zID0geydOb3JtYWwnLCAnQ0ZyYW1lJ30sCiAgICBEZWZhdWx0ID0gJ05v",
+"cm1hbCcsCiAgICBUaXAgPSAnU2VsZWN0cyBob3cgbW92ZW1lbnQgc3BlZWQgaXMgYXBwbGllZC4nLAp9KQoKdGFzay5zcGF3bihm",
+"dW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0KCkKICAgICAgICAKICAgICAgICBpZiBub3QgY3Vz",
+"dG9tV2Fsa1NwZWVkLlZhbHVlIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxvY2FsIGNoYXJhY3RlciA9IHBsYXllci5DaGFy",
+"YWN0ZXIKICAgICAgICBpZiBub3QgY2hhcmFjdGVyIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxvY2FsIGh1bWFub2lkID0g",
+"Y2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkT2ZDbGFzcygnSHVtYW5vaWQnKQogICAgICAgIGlmIG5vdCBodW1hbm9pZCB0aGVuIGNv",
+"bnRpbnVlIGVuZAogICAgICAgIGlmIGh1bWFub2lkLlBsYXRmb3JtU3RhbmQgdGhlbiBjb250aW51ZSBlbmQKICAgICAgICBpZiBo",
+"dW1hbm9pZC5XYWxrU3BlZWQgPT0gMCB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2NhbCByb290ID0gY2hhcmFjdGVyOkZp",
+"bmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQYXJ0JykKICAgICAgICBpZiBub3Qgcm9vdCB0aGVuIGNvbnRpbnVlIGVuZAoKICAg",
+"ICAgICBsb2NhbCBkaXJlY3Rpb24gPSBWZWN0b3IzLm5ldyhodW1hbm9pZC5Nb3ZlRGlyZWN0aW9uLlgsIDAsIGh1bWFub2lkLk1v",
+"dmVEaXJlY3Rpb24uWikKICAgICAgICBpZiBkaXJlY3Rpb24uTWFnbml0dWRlIDw9IDAgdGhlbiBjb250aW51ZSBlbmQKCiAgICAg",
+"ICAgbG9jYWwgdmVsb2NpdHkgPSBkaXJlY3Rpb24uVW5pdCAqICh3YWxrc3BlZWRUeXBlLlZhbHVlID09ICdDRnJhbWUnIGFuZCAo",
+"d2Fsa1NwZWVkVmFsdWUuVmFsdWUgLyA3NSkgb3Igd2Fsa1NwZWVkVmFsdWUuVmFsdWUpCgogICAgICAgIGlmIGh1bWFub2lkOkdl",
+"dFN0YXRlKCkgPT0gRW51bS5IdW1hbm9pZFN0YXRlVHlwZS5SdW5uaW5nIHRoZW4KICAgICAgICAgICAgbG9jYWwgc2NhbGUgPSB3",
+"YWxrU3BlZWRWYWx1ZS5WYWx1ZSAvIG1hdGgubWF4KGh1bWFub2lkLldhbGtTcGVlZCwgMSkKCiAgICAgICAgICAgIGxvY2FsIGFu",
+"aW1hdG9yID0gaHVtYW5vaWQ6RmluZEZpcnN0Q2hpbGRPZkNsYXNzKCdBbmltYXRvcicpCiAgICAgICAgICAgIGlmIGFuaW1hdG9y",
+"IHRoZW4KICAgICAgICAgICAgICAgIGZvciBfLCB0cmFjayBpbiBuZXh0LCBhbmltYXRvcjpHZXRQbGF5aW5nQW5pbWF0aW9uVHJh",
+"Y2tzKCkgZG8KICAgICAgICAgICAgICAgICAgICB0cmFjazpBZGp1c3RTcGVlZChzY2FsZSkKICAgICAgICAgICAgICAgIGVuZAog",
+"ICAgICAgICAgICBlbmQKICAgICAgICBlbmQKCiAgICAgICAgaWYgd2Fsa3NwZWVkVHlwZS5WYWx1ZSB+PSAnQ0ZyYW1lJyB0aGVu",
+"CiAgICAgICAgICAgIHJvb3QuQXNzZW1ibHlMaW5lYXJWZWxvY2l0eSA9IFZlY3RvcjMubmV3KHZlbG9jaXR5LlgsIHJvb3QuQXNz",
+"ZW1ibHlMaW5lYXJWZWxvY2l0eS5ZLCB2ZWxvY2l0eS5aKQogICAgICAgIGVsc2UKICAgICAgICAgICAgcm9vdC5DRnJhbWUgPSBy",
+"b290LkNGcmFtZSArIHZlbG9jaXR5CiAgICAgICAgZW5kCiAgICBlbmQKZW5kKQoKUGxheWVyVGFiOkNyZWF0ZURpdmlkZXIoKQoK",
+"Y3VzdG9tSnVtcFBvd2VyID0gUGxheWVyVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0N1c3RvbSBKdW1wUG93ZXInLAog",
+"ICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ092ZXJyaWRlcyB5b3VyIGNoYXJhY3RlciBqdW1wIHBvd2VyLicsCn0pCgpq",
+"dW1wUG93ZXJWYWx1ZSA9IFBsYXllclRhYjpDcmVhdGVTbGlkZXIoewogICAgTmFtZSA9ICdKdW1wUG93ZXIgVmFsdWUnLAogICAg",
+"TWluID0gNTAsCiAgICBNYXggPSA3MCwKICAgIERlZmF1bHQgPSA1MCwKICAgIEluY3JlbWVudCA9IDAuMSwKICAgIFN1ZmZpeCA9",
+"ICcnLAogICAgVGlwID0gJ1NldHMgdGhlIGN1c3RvbSBqdW1wIHBvd2VyLicsCn0pCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAg",
+"IHdoaWxlIHRydWUgZG8KICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICBpZiBub3QgY3VzdG9tSnVtcFBvd2VyLlZhbHVlIHRo",
+"ZW4gY29udGludWUgZW5kCiAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gcGxheWVyLkNoYXJhY3RlcgogICAgICAgIGlmIG5vdCBj",
+"aGFyYWN0ZXIgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgaHVtYW5vaWQgPSBjaGFyYWN0ZXI6RmluZEZpcnN0Q2hp",
+"bGRPZkNsYXNzKCdIdW1hbm9pZCcpCiAgICAgICAgaWYgbm90IGh1bWFub2lkIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxv",
+"Y2FsIHJvb3QgPSBjaGFyYWN0ZXI6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKQogICAgICAgIGlmIG5vdCByb290",
+"IHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGlmIGh1bWFub2lkOkdldFN0YXRlKCkgfj0gRW51bS5IdW1hbm9pZFN0YXRlVHlw",
+"ZS5KdW1waW5nIHRoZW4gY29udGludWUgZW5kCiAgICAgICAgCiAgICAgICAgdGFzay53YWl0KCkKICAgICAgICByb290LkFzc2Vt",
+"Ymx5TGluZWFyVmVsb2NpdHkgPSBWZWN0b3IzLm5ldyhyb290LkFzc2VtYmx5TGluZWFyVmVsb2NpdHkuWCwganVtcFBvd2VyVmFs",
+"dWUuVmFsdWUsIHJvb3QuQXNzZW1ibHlMaW5lYXJWZWxvY2l0eS5aKQogICAgZW5kCmVuZCkKICAgIApQbGF5ZXJUYWI6Q3JlYXRl",
+"RGl2aWRlcigpCgphbmdsZUVuaGFuY2VyID0gUGxheWVyVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0FuZ2xlIEVuaGFu",
+"Y2VyJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdCb29zdHMganVtcCBoZWlnaHQgd2hlbiBkaXJlY3Rpb25hbCBs",
+"b29rIGNoYW5nZXMgd2hpbGUganVtcGluZy4nLAp9KQoKYW5nbGVFbmhhbmNlckluZGljYXRvciA9IFBsYXllclRhYjpDcmVhdGVU",
+"b2dnbGUoewogICAgTmFtZSA9ICdBbmdsZSBFbmhhbmNlciBJbmRpY2F0b3InLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlw",
+"ID0gJ1Nob3dzYSBub3RpZmljYXRpb24gd2hlbiBhbiBhbmdsZSBib29zdCBpcyB0cmlnZ2VyZWQuJywKfSkKICAgIAogICAgYXV0",
+"b0ZsaXAgPSBQbGF5ZXJUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnQXV0byBGbGlwIEJlZm9yZSBMYW5kaW5nJywKICAg",
+"IERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdBdXRvbWF0aWNhbGx5IGFkanVzdHMgcGxheWVyIG9yaWVudGF0aW9uIGJlZm9y",
+"ZSBsYW5kaW5nLicsCn0pCgphbmdsZUVuaGFuY2VCb29zdCA9IFBsYXllclRhYjpDcmVhdGVTbGlkZXIoewogICAgTmFtZSA9ICdB",
+"bmdsZSBCb29zdCBWYWx1ZScsCiAgICBNaW4gPSA1MCwKICAgIE1heCA9IDcwLAogICAgRGVmYXVsdCA9IDUwLAogICAgSW5jcmVt",
+"ZW50ID0gMC4xLAogICAgU3VmZml4ID0gJycsCiAgICBUaXAgPSAnU2V0cyB0aGUgdmVydGljYWwgdmVsb2NpdHkgYXBwbGllZCBk",
+"dXJpbmcgYW5nbGUgYm9vc3QuJywKfSkKICAgIApsb2NhbCBsYXN0VGljayA9IDAKbG9jYWwgb2xkTG9va1ZlY3RvciA9IG5pbAoK",
+"dGFzay5zcGF3bihmdW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0KCkKCiAgICAgICAgaWYgbm90",
+"IGFuZ2xlRW5oYW5jZXIuVmFsdWUgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gcGxheWVyLkNo",
+"YXJhY3RlcgogICAgICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiBvbGRMb29rVmVjdG9yID0gbmlsIGNvbnRpbnVlIGVuZAoKICAg",
+"ICAgICBsb2NhbCBodW1hbm9pZCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZE9mQ2xhc3MoJ0h1bWFub2lkJykKICAgICAgICBs",
+"b2NhbCBocnAgPSBjaGFyYWN0ZXI6RmluZEZpcnN0Q2hpbGQoJ0h1bWFub2lkUm9vdFBhcnQnKQogICAgICAgIGlmIG5vdCBodW1h",
+"bm9pZCBvciBub3QgaHJwIHRoZW4gb2xkTG9va1ZlY3RvciA9IG5pbCBjb250aW51ZSBlbmQKCiAgICAgICAgaWYgaHVtYW5vaWQ6",
+"R2V0U3RhdGUoKSB+PSBFbnVtLkh1bWFub2lkU3RhdGVUeXBlLkp1bXBpbmcgdGhlbgogICAgICAgICAgICBjb250aW51ZQogICAg",
+"ICAgIGVuZAoKICAgICAgICBsb2NhbCBjdXJyZW50VGltZSA9IHRpY2soKQogICAgICAgIGxvY2FsIG5ld0xvb2tWZWN0b3IgPSBo",
+"cnAuQ0ZyYW1lLkxvb2tWZWN0b3IKCiAgICAgICAgaWYgbm90IG9sZExvb2tWZWN0b3IgdGhlbgogICAgICAgICAgICBvbGRMb29r",
+"VmVjdG9yID0gbmV3TG9va1ZlY3RvcgogICAgICAgICAgICBsYXN0VGljayA9IGN1cnJlbnRUaW1lCiAgICAgICAgICAgIGNvbnRp",
+"bnVlCiAgICAgICAgZW5kCgogICAgICAgIGxvY2FsIGFuZ2xlQ2hhbmdlID0gbWF0aC5hY29zKG1hdGguY2xhbXAob2xkTG9va1Zl",
+"Y3RvcjpEb3QobmV3TG9va1ZlY3RvciksIC0xLCAxKSkKICAgICAgICBsb2NhbCBzaGlmdExvY2tFbmFibGVkID0gdXNlcklucHV0",
+"U2VydmljZS5Nb3VzZUJlaGF2aW9yID09IEVudW0uTW91c2VCZWhhdmlvci5Mb2NrQ2VudGVyCgogICAgICAgIGlmIGN1cnJlbnRU",
+"aW1lIC0gbGFzdFRpY2sgPj0gMC4yIGFuZCBhbmdsZUNoYW5nZSA+IG1hdGgucmFkKDUpIHRoZW4KICAgICAgICAgICAgbGFzdFRp",
+"Y2sgPSBjdXJyZW50VGltZQogICAgICAgICAgICBvbGRMb29rVmVjdG9yID0gbmV3TG9va1ZlY3RvcgogICAgICAgIGVuZAoKICAg",
+"ICAgICBpZiBhbmdsZUNoYW5nZSA+IG1hdGgucmFkKDI1KSBhbmQgY3VycmVudFRpbWUgLSBsYXN0VGljayA8PSAyLjUgdGhlbgog",
+"ICAgICAgICAgICBsYXN0VGljayA9IGN1cnJlbnRUaW1lCiAgICAgICAgICAgIG9sZExvb2tWZWN0b3IgPSBuZXdMb29rVmVjdG9y",
+"CgogICAgICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICAgICAgbG9jYWwgdmVsID0gaHJwLkFzc2VtYmx5TGluZWFyVmVsb2Np",
+"dHkKICAgICAgICAgICAgaHJwLkFzc2VtYmx5TGluZWFyVmVsb2NpdHkgPSBWZWN0b3IzLm5ldyh2ZWwuWCwgYW5nbGVFbmhhbmNl",
+"Qm9vc3QuVmFsdWUsIHZlbC5aKQoKICAgICAgICAgICAgaWYgYW5nbGVFbmhhbmNlckluZGljYXRvci5WYWx1ZSBhbmQgKHNoaWZ0",
+"TG9ja0VuYWJsZWQgb3IgdHJ1ZSkgdGhlbgogICAgICAgICAgICAgICAgbG9jYWwgaGludCA9IEluc3RhbmNlLm5ldygnSGludCcp",
+"CiAgICAgICAgICAgICAgICBoaW50LlRleHQgPSAnQW5nbGVkIScKICAgICAgICAgICAgICAgIGhpbnQuUGFyZW50ID0gd29ya3Nw",
+"YWNlLlRlcnJhaW4KCiAgICAgICAgICAgICAgICB0YXNrLmRlbGF5KDIuNSwgZnVuY3Rpb24oKQogICAgICAgICAgICAgICAgICAg",
+"IGlmIGhpbnQgdGhlbgogICAgICAgICAgICAgICAgICAgICAgICBoaW50OkRlc3Ryb3koKQogICAgICAgICAgICAgICAgICAgIGVu",
+"ZAogICAgICAgICAgICAgICAgZW5kKQogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKICAgIGVuZAplbmQpCiAgICAKbG9jYWwg",
+"cnVudGltZSwganVtcHRpbWUsIGhpdHRpbWUgPSAwLCAwLCAwCmxvY2FsIGFybSwgdkxpbmUsIHVzZWQsIHByZXZQcyA9IGZhbHNl",
+"LCBuaWwsIGZhbHNlLCBmYWxzZQpsb2NhbCBzZXEgPSAwCmxvY2FsIHBhY2sgPSBuaWwKCmxvY2FsIHh6ID0gZnVuY3Rpb24odjog",
+"VmVjdG9yMykKCWxvY2FsIGYgPSBWZWN0b3IzLm5ldyh2LlgsIDAsIHYuWikKCXJldHVybiBmLk1hZ25pdHVkZSA+IDAuMDAxIGFu",
+"ZCBmLlVuaXQgb3IgbmlsCmVuZAoKbG9jYWwgcmVzZXQgPSBmdW5jdGlvbigpCglpZiBub3QgcGFjayB0aGVuIHJldHVybiBlbmQK",
+"CWZvciBfLCBvIGluIG5leHQsIHsgcGFjay5zcGluLCBwYWNrLnJhLCBwYWNrLnBpdm90LCBwYWNrLmhhIH0gZG8KCQlpZiBvIHRo",
+"ZW4gbzpEZXN0cm95KCkgZW5kCgllbmQKCXBhY2sgPSBuaWwKZW5kCgpsb2NhbCBmbGlwID0gZnVuY3Rpb24ocm9vdDogQmFzZVBh",
+"cnQsIGhlYWQ6IEJhc2VQYXJ0KQoJcmVzZXQoKQoKCWxvY2FsIG0gPSBtYXRoLm1heChyb290LkFzc2VtYmx5TWFzcywgMSkKCgls",
+"b2NhbCBoYSA9IEluc3RhbmNlLm5ldygiQXR0YWNobWVudCIpCgloYS5QYXJlbnQgPSBoZWFkCgoJbG9jYWwgcGl2b3QgPSBJbnN0",
+"YW5jZS5uZXcoIkFsaWduUG9zaXRpb24iKQoJcGl2b3QuTW9kZSA9IEVudW0uUG9zaXRpb25BbGlnbm1lbnRNb2RlLk9uZUF0dGFj",
+"aG1lbnQKCXBpdm90LkF0dGFjaG1lbnQwID0gaGEKCXBpdm90LlBvc2l0aW9uID0gaGVhZC5Qb3NpdGlvbiArIFZlY3RvcjMubmV3",
+"KDAsIDAuMTUsIDApCglwaXZvdC5NYXhGb3JjZSA9IDE4MDAwMAoJcGl2b3QuUmVzcG9uc2l2ZW5lc3MgPSAxMjAKCXBpdm90LlJp",
+"Z2lkaXR5RW5hYmxlZCA9IGZhbHNlCglwaXZvdC5BcHBseUF0Q2VudGVyT2ZNYXNzID0gZmFsc2UKCXBpdm90LlBhcmVudCA9IGhl",
+"YWQKCglsb2NhbCByYSA9IEluc3RhbmNlLm5ldygiQXR0YWNobWVudCIpCglyYS5QYXJlbnQgPSByb290CgoJbG9jYWwgc3BpbiA9",
+"IEluc3RhbmNlLm5ldygiQW5ndWxhclZlbG9jaXR5IikKCXNwaW4uQXR0YWNobWVudDAgPSByYQoJc3Bpbi5SZWxhdGl2ZVRvID0g",
+"RW51bS5BY3R1YXRvclJlbGF0aXZlVG8uQXR0YWNobWVudDAKCXNwaW4uQW5ndWxhclZlbG9jaXR5ID0gVmVjdG9yMy5uZXcoLTks",
+"IDAsIDApCglzcGluLk1heFRvcnF1ZSA9IDUwMDAwCglzcGluLlBhcmVudCA9IHJvb3QKCglyb290OkFwcGx5QW5ndWxhckltcHVs",
+"c2Uocm9vdC5DRnJhbWUuUmlnaHRWZWN0b3IgKiAoLTE2ICogbSkpCgoJcGFjayA9IHsgaGEgPSBoYSwgcGl2b3QgPSBwaXZvdCwg",
+"cmEgPSByYSwgc3BpbiA9IHNwaW4gfQplbmQKCnRhc2suc3Bhd24oZnVuY3Rpb24oKQoJd2hpbGUgdHJ1ZSBkbwoJCXRhc2sud2Fp",
+"dCgpCgkgICAgCgkgICAgaWYgbm90IGF1dG9GbGlwLlZhbHVlIHRoZW4gY29udGludWUgZW5kCgkgICAgCgkJbG9jYWwgY2hhciA9",
+"IHBsYXllci5DaGFyYWN0ZXIKCQlpZiBub3QgY2hhciB0aGVuCgkJCXJlc2V0KCkKCQkJYXJtLCB2TGluZSwgdXNlZCwgcHJldlBz",
+"ID0gZmFsc2UsIG5pbCwgZmFsc2UsIGZhbHNlCgkJCWNvbnRpbnVlCgkJZW5kCgoJCWxvY2FsIGh1bSA9IGNoYXI6RmluZEZpcnN0",
+"Q2hpbGRPZkNsYXNzKCJIdW1hbm9pZCIpCgkJbG9jYWwgaHJwID0gY2hhcjpGaW5kRmlyc3RDaGlsZCgiSHVtYW5vaWRSb290UGFy",
+"dCIpCgkJbG9jYWwgaGVhZCA9IGNoYXI6RmluZEZpcnN0Q2hpbGQoIkhlYWQiKQoKCQlpZiBub3QgaHVtIG9yIG5vdCBocnAgb3Ig",
+"bm90IGhlYWQgdGhlbiBjb250aW51ZSBlbmQKCgkJbG9jYWwgbm93ID0gdGljaygpCgoJCWlmIGh1bTpHZXRTdGF0ZSgpID09IEVu",
+"dW0uSHVtYW5vaWRTdGF0ZVR5cGUuUnVubmluZyB0aGVuIHJ1bnRpbWUgPSBub3cgZW5kCgkJaWYgaHVtOkdldFN0YXRlKCkgPT0g",
+"RW51bS5IdW1hbm9pZFN0YXRlVHlwZS5KdW1waW5nIHRoZW4ganVtcHRpbWUgPSBub3cgZW5kCgoJCWxvY2FsIHBzID0gaHVtLlBs",
+"YXRmb3JtU3RhbmQKCQlpZiBwcyB+PSBwcmV2UHMgdGhlbgoJCQlpZiBwcyB0aGVuCgkJCQlhcm0gPSAobm93IC0gcnVudGltZSA8",
+"PSAwLjUpIGFuZCAobm93IC0ganVtcHRpbWUgPD0gMC43KQoJCQkJdkxpbmUgPSB4eihocnAuQXNzZW1ibHlMaW5lYXJWZWxvY2l0",
+"eSkgb3IgeHooaHJwLkNGcmFtZS5Mb29rVmVjdG9yKQoJCQkJdXNlZCA9IGZhbHNlCgkJCWVsc2UKCQkJCWFybSwgdkxpbmUsIHVz",
+"ZWQgPSBmYWxzZSwgbmlsLCBmYWxzZQoJCQkJc2VxICs9IDEKCQkJCXJlc2V0KCkKCQkJZW5kCgkJCXByZXZQcyA9IHBzCgkJZW5k",
+"CgoJCWlmIG5vdCBwcyBvciBub3QgYXJtIG9yIHBhY2sgdGhlbiBjb250aW51ZSBlbmQKCgkJbG9jYWwgcGFyYW1zID0gUmF5Y2Fz",
+"dFBhcmFtcy5uZXcoKQoJCXBhcmFtcy5GaWx0ZXJUeXBlID0gRW51bS5SYXljYXN0RmlsdGVyVHlwZS5FeGNsdWRlCgkJcGFyYW1z",
+"LkZpbHRlckRlc2NlbmRhbnRzSW5zdGFuY2VzID0geyBjaGFyIH0KCgkJbG9jYWwgcmVzdWx0ID0gd29ya3NwYWNlOlJheWNhc3Qo",
+"aGVhZC5Qb3NpdGlvbiwgVmVjdG9yMy5uZXcoMCwgLTMsIDApLCBwYXJhbXMpCgkJbG9jYWwgZ3JvdW5kID0gcmVzdWx0IGFuZCBy",
+"ZXN1bHQuSW5zdGFuY2Ugfj0gbmlsCgoJCWlmIHVzZWQgb3Igbm90IGdyb3VuZCBvciBub3cgLSBoaXR0aW1lIDwgMC4xMiB0aGVu",
+"IGNvbnRpbnVlIGVuZAoKCQlsb2NhbCBkaXN0ID0gcmVzdWx0IGFuZCAoaGVhZC5Qb3NpdGlvbiAtIHJlc3VsdC5Qb3NpdGlvbiku",
+"TWFnbml0dWRlIG9yIG1hdGguaHVnZQoJCWlmIGRpc3QgPiAxLjYgdGhlbiBjb250aW51ZSBlbmQKCgkJbG9jYWwgbW92ZSA9IHh6",
+"KGhycC5Bc3NlbWJseUxpbmVhclZlbG9jaXR5KSBvciB2TGluZQoJCWxvY2FsIGZhY2UgPSB4eihocnAuQ0ZyYW1lLkxvb2tWZWN0",
+"b3IpCgoJCWlmIG5vdCBtb3ZlIG9yIG5vdCBmYWNlIG9yIGZhY2U6RG90KG1vdmUpIDwgMC43OCB0aGVuIGNvbnRpbnVlIGVuZAoK",
+"CQloaXR0aW1lID0gbm93CgkJdXNlZCA9IHRydWUKCQlzZXEgKz0gMQoJCWxvY2FsIGsgPSBzZXEKCgkJZmxpcChocnAsIGhlYWQp",
+"CgoJCXRhc2suZGVsYXkoMC4yNCwgZnVuY3Rpb24oKQoJCQlpZiBrID09IHNlcSB0aGVuCgkJCQlyZXNldCgpCgkJCWVuZAoJCWVu",
+"ZCkKCWVuZAplbmQpCgpQbGF5ZXJUYWI6Q3JlYXRlRGl2aWRlcigpCgpQbGF5ZXJUYWI6Q3JlYXRlQnV0dG9uKHsKICAgIE5hbWUg",
+"PSAnVW5sb2NrIEFsbCBHYW1lcGFzcycsCiAgICBUaXAgPSAnRW5hYmxlcyBhbGwgZ2FtZXBhc3MtcmVsYXRlZCBjaGVja3MgbG9j",
+"YWxseS4nLAogICAgQ2FsbGJhY2sgPSBmdW5jdGlvbigpCiAgICAgICAgbG9jYWwgcmVwbGljYXRlZEZpcnN0ID0gZ2FtZTpHZXRT",
+"ZXJ2aWNlKCdSZXBsaWNhdGVkRmlyc3QnKQoKICAgICAgICBsb2NhbCBtb2R1bGUKICAgICAgICBsb2NhbCBzdWNjZXNzID0gcGNh",
+"bGwoZnVuY3Rpb24oKQogICAgICAgICAgICBtb2R1bGUgPSByZXF1aXJlKHJlcGxpY2F0ZWRGaXJzdDpGaW5kRmlyc3RDaGlsZCgn",
+"TG9jYWxTYXZlJykpCiAgICAgICAgZW5kKQoKICAgICAgICBpZiBub3Qgc3VjY2VzcyBvciBub3QgbW9kdWxlIHRoZW4KICAgICAg",
+"ICAgICAgcmV0dXJuCiAgICAgICAgZW5kCgogICAgICAgIG1vZHVsZS5QbGF5ZXJPd25zUGFzcyA9IGZ1bmN0aW9uKGEsIGIpCiAg",
+"ICAgICAgICAgIHJldHVybiB0cnVlCiAgICAgICAgZW5kCiAgICBlbmQKfSkKCmxvY2FsIFBoeXNpY3NUYWIgPSBXaW5kb3c6Q3Jl",
+"YXRlVGFiKHsgTmFtZSA9ICdQaHlzaWNzJywgSWNvbiA9ICdyYnhhc3NldGlkOi8vMTE1Mzc0OTA5NjYnIH0pCiAgICAKbG9jYWwg",
+"Ym91bmRhcmllcyA9IHt9CgppZiBub3QgaXNQcmFjdGljZSB0aGVuCiAgICBmb3IgaSwgdiBpbiBuZXh0LCB3b3Jrc3BhY2UuTW9k",
+"ZWxzLkJvdW5kYXJpZXM6R2V0Q2hpbGRyZW4oKSBkbwogICAgICAgIGJvdW5kYXJpZXNbI2JvdW5kYXJpZXMgKyAxXSA9IHYKICAg",
+"IGVuZAplbmQKCmFudGlCb3VuZGFyaWVzID0gUGh5c2ljc1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdBbnRpIE9PQics",
+"CiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAnUHJldmVudHMgcGxheWVycyBmcm9tIHRyaWdnZXJpbmcgb3V0LW9mLWJv",
+"dW5kcyB6b25lcy4nLAogICAgQ2FsbGJhY2sgPSBmdW5jdGlvbih2KQogICAgICAgIGZvciBpLCBiIGluIG5leHQsIGJvdW5kYXJp",
+"ZXMgZG8KICAgICAgICAgICAgaWYgYiB0aGVuCiAgICAgICAgICAgICAgICBiLlBhcmVudCA9IG5vdCB2IGFuZCB3b3Jrc3BhY2Uu",
+"TW9kZWxzLkJvdW5kYXJpZXMgb3IgbmlsCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCn0pCiAgICAKICAgIGFu",
+"dGlCZW5jaCA9IFBoeXNpY3NUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnQW50aSBCZW5jaCcsCiAgICBEZWZhdWx0ID0g",
+"ZmFsc2UsCiAgICBUaXAgPSAnUHJldmVudHMgYXV0b21hdGljIGJlbmNoaW5nLicsCn0pCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkK",
+"ICAgIHdoaWxlIHRydWUgZG8KICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICBpZiBub3QgYW50aUJlbmNoLlZhbHVlIHRoZW4g",
+"Y29udGludWUgZW5kCgogICAgICAgIGxvY2FsIHBsYXllckd1aSA9IHBsYXllcjpGaW5kRmlyc3RDaGlsZCgnUGxheWVyR3VpJykK",
+"ICAgICAgICBpZiBub3QgcGxheWVyR3VpIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxvY2FsIGJlbmNoQnV0dG9uID0gcGxh",
+"eWVyR3VpOkZpbmRGaXJzdENoaWxkKCdCZW5jaGVkJywgdHJ1ZSkKICAgICAgICBpZiBub3QgYmVuY2hCdXR0b24gdGhlbiBjb250",
+"aW51ZSBlbmQKCiAgICAgICAgaWYgYmVuY2hCdXR0b24uQmFja2dyb3VuZENvbG9yMyA9PSBDb2xvcjMuZnJvbVJHQigxMjAsIDEy",
+"MCwgMTIwKSB0aGVuCiAgICAgICAgICAgIHJlcGxpY2F0ZWRTdG9yYWdlLlJlbW90ZXMuQ2hhcmFjdGVyU291bmRFdmVudDpGaXJl",
+"U2VydmVyKCdHYW1lJywgJ1RvZ2dsZUJlbmNoJykKICAgICAgICBlbmQKICAgIGVuZAplbmQpCi0tW1sKbG9jYWwgc2NyYW1ibGVX",
+"YWxsID0gd29ya3NwYWNlOkZpbmRGaXJzdENoaWxkKCdTY3JhbWJsZVdhbGwnKQoKYW50aVFiQm91bmRhcmllcyA9IFBoeXNpY3NU",
+"YWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnQW50aSBRQiBCb3VuZGFyaWVzJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAg",
+"IFRpcCA9ICdEaXNhYmxlcyBpbnZpc2libGUgUUIgYm91bmRhcnkgd2FsbHMuJywKICAgIENhbGxiYWNrID0gZnVuY3Rpb24odikK",
+"ICAgICAgICBpZiBub3Qgc2NyYW1ibGVXYWxsIHRoZW4gcmV0dXJuIGVuZAogICAgICAgIHNjcmFtYmxlV2FsbC5QYXJlbnQgPSB2",
+"IGFuZCBuaWwgb3Igd29ya3NwYWNlCiAgICBlbmQKfSkKICAgIF1dClBoeXNpY3NUYWI6Q3JlYXRlRGl2aWRlcigpCgphbnRpSmFt",
+"ID0gUGh5c2ljc1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdBbnRpIEphbScsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAg",
+"ICBUaXAgPSAnUmVkdWNlcyBwbGF5ZXIgY29sbGlzaW9uIHdoaWxlIG1vdmluZy4nLAp9KQoKYW50aUp1bXBDb29sZG93biA9IFBo",
+"eXNpY3NUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnQW50aSBKdW1wIENvb2xkb3duJywKICAgIERlZmF1bHQgPSBmYWxz",
+"ZSwKICAgIFRpcCA9ICdSZW1vdmVzIHRoZSBkZWxheSBiZXR3ZWVuIGp1bXBzLicsCn0pCgphbnRpRnJlZXplID0gUGh5c2ljc1Rh",
+"YjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdBbnRpIEZyZWV6ZScsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAn",
+"UHJldmVudHMgbW92ZW1lbnQgc3BlZWQgZnJvbSBiZWluZyByZWR1Y2VkLicsCn0pCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAg",
+"IHdoaWxlIHRydWUgZG8KICAgICAgICB0YXNrLndhaXQoKQogICAgICAgIAogICAgICAgIGlmIGFudGlKdW1wQ29vbGRvd24uVmFs",
+"dWUgdGhlbgogICAgICAgICAgICBwbGF5ZXIuQ2hhcmFjdGVyLkh1bWFub2lkOlNldFN0YXRlRW5hYmxlZChFbnVtLkh1bWFub2lk",
+"U3RhdGVUeXBlLkp1bXBpbmcsIHRydWUpCiAgICAgICAgZW5kCiAgICAgICAgCiAgICAgICAgaWYgYW50aUZyZWV6ZS5WYWx1ZSB0",
+"aGVuCiAgICAgICAgICAgIGlmIHBsYXllci5DaGFyYWN0ZXIuSHVtYW5vaWQuV2Fsa1NwZWVkIH49IDIwIHRoZW4KICAgICAgICAg",
+"ICAgICAgIHBsYXllci5DaGFyYWN0ZXIuSHVtYW5vaWQuV2Fsa1NwZWVkID0gMjAKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5k",
+"CgogICAgICAgIGZvciBfLCB2IGluIG5leHQsIHBsYXllcnM6R2V0UGxheWVycygpIGRvCiAgICAgICAgICAgIGlmIHYgPT0gcGxh",
+"eWVyIHRoZW4gY29udGludWUgZW5kCgogICAgICAgICAgICBsb2NhbCBjaGFyYWN0ZXIgPSB2LkNoYXJhY3RlcgogICAgICAgICAg",
+"ICBpZiBub3QgY2hhcmFjdGVyIHRoZW4gY29udGludWUgZW5kCgogICAgICAgICAgICBsb2NhbCBodW0gPSBjaGFyYWN0ZXI6Rmlu",
+"ZEZpcnN0Q2hpbGRPZkNsYXNzKCdIdW1hbm9pZCcpCiAgICAgICAgICAgIGlmIG5vdCBodW0gdGhlbiBjb250aW51ZSBlbmQKCiAg",
+"ICAgICAgICAgIGZvciBfLCBwYXJ0IGluIG5leHQsIGNoYXJhY3RlcjpHZXRDaGlsZHJlbigpIGRvCiAgICAgICAgICAgICAgICBp",
+"ZiBub3QgcGFydDpJc0EoJ0Jhc2VQYXJ0JykgdGhlbiBjb250aW51ZSBlbmQKICAgICAgICAgICAgICAgIGlmIHBhcnQuTmFtZSA9",
+"PSAnSGVhZCcgb3IgcGFydC5OYW1lID09ICdUb3JzbycgdGhlbgogICAgICAgICAgICAgICAgICAgIGlmIGh1bTpHZXRTdGF0ZSgp",
+"ID09IEVudW0uSHVtYW5vaWRTdGF0ZVR5cGUuUnVubmluZyB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIHBhcnQuQ2FuQ29s",
+"bGlkZSA9IG5vdCBhbnRpSmFtLlZhbHVlCiAgICAgICAgICAgICAgICAgICAgZWxzZQogICAgICAgICAgICAgICAgICAgICAgICBw",
+"YXJ0LkNhbkNvbGxpZGUgPSB0cnVlCiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAg",
+"ICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKZW5kKQoKYW50aUJsb2NrID0gUGh5c2ljc1RhYjpDcmVhdGVUb2dnbGUoewogICAg",
+"TmFtZSA9ICdBbnRpIEJsb2NrJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdSZWR1Y2VzIHBsYXllciBjb2xsaXNp",
+"b24gd2hpbGUgbW92aW5nLicsCn0pCiAgICAKdGFzay5zcGF3bihmdW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAg",
+"dGFzay53YWl0KCkKCiAgICAgICAgaWYgbm90IGFudGlCbG9jay5WYWx1ZSB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2Nh",
+"bCBjaGFyYWN0ZXIgPSBwbGF5ZXIuQ2hhcmFjdGVyCiAgICAgICAgaWYgbm90IGNoYXJhY3RlciB0aGVuIGNvbnRpbnVlIGVuZAoK",
+"ICAgICAgICBsb2NhbCBodW1hbm9pZCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZE9mQ2xhc3MoJ0h1bWFub2lkJykKICAgICAg",
+"ICBpZiBub3QgaHVtYW5vaWQgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgZm9yIF8sIHYgaW4gbmV4dCwgY2hhcmFjdGVyOkdl",
+"dERlc2NlbmRhbnRzKCkgZG8KICAgICAgICAgICAgaWYgbm90IHY6SXNBKCdCb2R5VmVsb2NpdHknKSB0aGVuIGNvbnRpbnVlIGVu",
+"ZAogICAgICAgICAgICAtLSBpZiBub3Qgdi5OYW1lOmxvd2VyKCk6ZmluZCgnZmZtb3ZlcicpIHRoZW4gY29udGludWUgZW5kCgog",
+"ICAgICAgICAgICB2LlZlbG9jaXR5ID0gVmVjdG9yMy56ZXJvCiAgICAgICAgICAgIHYuTWF4Rm9yY2UgPSBWZWN0b3IzLnplcm8K",
+"ICAgICAgICAgICAgaHVtYW5vaWQuV2Fsa1NwZWVkID0gMjAKCiAgICAgICAgICAgIHBjYWxsKGZ1bmN0aW9uKCkKICAgICAgICAg",
+"ICAgICAgIHY6RGVzdHJveSgpCiAgICAgICAgICAgIGVuZCkKICAgICAgICBlbmQKICAgIGVuZAplbmQpCgpQaHlzaWNzVGFiOkNy",
+"ZWF0ZURpdmlkZXIoKQoKcXVpY2tUUCA9IFBoeXNpY3NUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnUXVpY2sgVFAnLAog",
+"ICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ1RlbGVwb3J0cyBmb3J3YXJkIGluIHRoZSBkaXJlY3Rpb24geW91IGFyZSBm",
+"YWNpbmcuJywKfSkKCnF1aWNrVFBQb3dlciA9IFBoeXNpY3NUYWI6Q3JlYXRlU2xpZGVyKHsKICAgIE5hbWUgPSAnUXVpY2sgVFAg",
+"UG93ZXInLAogICAgTWluID0gMCwKICAgIE1heCA9IDUsCiAgICBEZWZhdWx0ID0gMCwKICAgIEluY3JlbWVudCA9IDAuMSwKICAg",
+"IFN1ZmZpeCA9ICcnLAogICAgVGlwID0gJ1NldHMgdGhlIHRlbGVwb3J0IGRpc3RhbmNlLicsCn0pCgpIaWRlS2V5YmluZCA9IFBo",
+"eXNpY3NUYWI6Q3JlYXRlS2V5YmluZCh7CiAgICBOYW1lID0gJ1F1aWNrIFRQIEtleWJpbmQnLAogICAgRGVmYXVsdCA9IEVudW0u",
+"S2V5Q29kZS5RLAogICAgVGlwID0gJ0tleSB1c2VkIHRvIGFjdGl2YXRlIFF1aWNrIFRQLicsCn0pCgp1c2VySW5wdXRTZXJ2aWNl",
+"LklucHV0QmVnYW46Q29ubmVjdChmdW5jdGlvbihpbnB1dCwgZ3BlKQogICAgaWYgZ3BlIHRoZW4gcmV0dXJuIGVuZAogICAgaWYg",
+"bm90IHF1aWNrVFAuVmFsdWUgdGhlbiByZXR1cm4gZW5kCiAgICBpZiBpbnB1dC5LZXlDb2RlIH49IEhpZGVLZXliaW5kLlZhbHVl",
+"IGFuZCBpbnB1dC5Vc2VySW5wdXRUeXBlIH49IEVudW0uVXNlcklucHV0VHlwZS5Ub3VjaCB0aGVuIHJldHVybiBlbmQKCiAgICBs",
+"b2NhbCBjaGFyYWN0ZXIgPSBwbGF5ZXIuQ2hhcmFjdGVyCiAgICBpZiBub3QgY2hhcmFjdGVyIHRoZW4gcmV0dXJuIGVuZAoKICAg",
+"IGxvY2FsIGhycCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICBpZiBub3QgaHJwIHRo",
+"ZW4gcmV0dXJuIGVuZAoKICAgIGhycC5DRnJhbWUgKz0gaHJwLkNGcmFtZS5Mb29rVmVjdG9yICogcXVpY2tUUFBvd2VyLlZhbHVl",
+"CmVuZCkKICAgIApQaHlzaWNzVGFiOkNyZWF0ZURpdmlkZXIoKQoKYmlnSGVhZCA9IFBoeXNpY3NUYWI6Q3JlYXRlVG9nZ2xlKHsK",
+"ICAgIE5hbWUgPSAnQmlnIEhlYWQgUGxheWVycycsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAnSW5jcmVhc2VzIHRo",
+"ZSBzaXplIG9mIG90aGVyIHBsYXllcnMgaGVhZHMuJywKfSkKCmJpZ0hlYWRTaXplID0gUGh5c2ljc1RhYjpDcmVhdGVTbGlkZXIo",
+"ewogICAgTmFtZSA9ICdCaWcgSGVhZCBTaXplJywKICAgIE1pbiA9IDEsCiAgICBNYXggPSA2LAogICAgRGVmYXVsdCA9IDEsCiAg",
+"ICBJbmNyZW1lbnQgPSAwLjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdTZXRzIHRoZSBzaXplIGFwcGxpZWQgdG8gcGxh",
+"eWVyIGhlYWRzLicsCn0pCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgIHdoaWxlIHRydWUgZG8KICAgICAgICB0YXNrLndhaXQo",
+"KQoKICAgICAgICBmb3IgXywgdiBpbiBuZXh0LCBwbGF5ZXJzOkdldFBsYXllcnMoKSBkbwogICAgICAgICAgICBpZiB2ID09IHBs",
+"YXllciB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gdi5DaGFyYWN0ZXIKICAgICAgICAg",
+"ICAgaWYgbm90IGNoYXJhY3RlciB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICAgICAgbG9jYWwgaGVhZCA9IGNoYXJhY3RlcjpG",
+"aW5kRmlyc3RDaGlsZCgnSGVhZCcpCiAgICAgICAgICAgIGlmIG5vdCBoZWFkIHRoZW4gY29udGludWUgZW5kCgogICAgICAgICAg",
+"ICBoZWFkLlNpemUgPSBWZWN0b3IzLm5ldyhiaWdIZWFkLlZhbHVlIGFuZCBiaWdIZWFkU2l6ZS5WYWx1ZSBvciAxLCBiaWdIZWFk",
+"LlZhbHVlIGFuZCBiaWdIZWFkU2l6ZS5WYWx1ZSBvciAxLCBiaWdIZWFkLlZhbHVlIGFuZCBiaWdIZWFkU2l6ZS5WYWx1ZSBvciAx",
+"KQogICAgICAgIGVuZAogICAgZW5kCmVuZCkKICAgIApsb2NhbCBWaXN1YWxUYWIgPSBXaW5kb3c6Q3JlYXRlVGFiKHsgTmFtZSA9",
+"ICdWaXN1YWwnLCBJY29uID0gJ3JieGFzc2V0aWQ6Ly84ODYxMDA3NzUzNzQ2OCcgfSkKCmp1bXBTcG90ID0gVmlzdWFsVGFiOkNy",
+"ZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ1Zpc3VhbGlzZSBGb290YmFsbCBKdW1wIFNwb3QnLAogICAgRGVmYXVsdCA9IGZhbHNl",
+"LAogICAgVGlwID0gJ0Rpc3BsYXlzIHRoZSBwcmVkaWN0ZWQganVtcCBsb2NhdGlvbiBvZiBpbmNvbWluZyBmb290YmFsbHMuJywK",
+"fSkKCndvcmtzcGFjZS5DaGlsZEFkZGVkOkNvbm5lY3QoZnVuY3Rpb24odikKICAgIGlmIG5vdCBqdW1wU3BvdC5WYWx1ZSB0aGVu",
+"IHJldHVybiBlbmQKICAgIGlmIG5vdCB2OklzQSgnQmFzZVBhcnQnKSBvciB2Lk5hbWUgfj0gJ0Zvb3RiYWxsJyB0aGVuIHJldHVy",
+"biBlbmQKCiAgICB0YXNrLndhaXQoKQoKICAgIGxvY2FsIHBvc2l0aW9uID0gdi5Qb3NpdGlvbgogICAgbG9jYWwgdmVsb2NpdHkg",
+"PSB2LkFzc2VtYmx5TGluZWFyVmVsb2NpdHkKICAgIGxvY2FsIGdyYXZpdHkgPSBWZWN0b3IzLm5ldygwLCAtMjgsIDApCiAgICBs",
+"b2NhbCBkZWx0YVRpbWUgPSAxIC8gMzAKCiAgICBsb2NhbCBwb3NpdGlvbnMgPSB7cG9zaXRpb259CgogICAgbG9jYWwgcmF5Y2Fz",
+"dFBhcmFtcyA9IFJheWNhc3RQYXJhbXMubmV3KCkKICAgIHJheWNhc3RQYXJhbXMuRmlsdGVyVHlwZSA9IEVudW0uUmF5Y2FzdEZp",
+"bHRlclR5cGUuRXhjbHVkZQogICAgcmF5Y2FzdFBhcmFtcy5GaWx0ZXJEZXNjZW5kYW50c0luc3RhbmNlcyA9IHt2fQogICAgcmF5",
+"Y2FzdFBhcmFtcy5JZ25vcmVXYXRlciA9IHRydWUKCiAgICBmb3IgXyA9IDEsIDMwMCBkbwogICAgICAgIGxvY2FsIG5leHRQb3Np",
+"dGlvbiA9IHBvc2l0aW9uICsgdmVsb2NpdHkgKiBkZWx0YVRpbWUgKyAwLjUgKiBncmF2aXR5ICogZGVsdGFUaW1lIF4gMgogICAg",
+"ICAgIHZlbG9jaXR5ICs9IGdyYXZpdHkgKiBkZWx0YVRpbWUKCiAgICAgICAgaWYgdmVsb2NpdHkuWSA8IDAgdGhlbgogICAgICAg",
+"ICAgICBsb2NhbCBkaXJlY3Rpb24gPSBuZXh0UG9zaXRpb24gLSBwb3NpdGlvbgogICAgICAgICAgICBsb2NhbCByZXN1bHQgPSB3",
+"b3Jrc3BhY2U6UmF5Y2FzdChwb3NpdGlvbiwgZGlyZWN0aW9uICsgVmVjdG9yMy5uZXcoMCwgLTE0LjQsIDApLCByYXljYXN0UGFy",
+"YW1zKQoKICAgICAgICAgICAgaWYgcmVzdWx0IHRoZW4KICAgICAgICAgICAgICAgIG5leHRQb3NpdGlvbiA9IHJlc3VsdC5Qb3Np",
+"dGlvbgogICAgICAgICAgICAgICAgdGFibGUuaW5zZXJ0KHBvc2l0aW9ucywgbmV4dFBvc2l0aW9uKQogICAgICAgICAgICAgICAg",
+"YnJlYWsKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCgogICAgICAgIHRhYmxlLmluc2VydChwb3NpdGlvbnMsIG5leHRQb3Np",
+"dGlvbikKICAgICAgICBwb3NpdGlvbiA9IG5leHRQb3NpdGlvbgogICAgZW5kCgogICAgbG9jYWwgb3B0aW1hbFBvaW50ID0gcG9z",
+"aXRpb25zWyNwb3NpdGlvbnNdCiAgICAKICAgIGxvY2FsIG1vZGVsID0gSW5zdGFuY2UubmV3KCdNb2RlbCcpCiAgICBtb2RlbC5Q",
+"YXJlbnQgPSB3b3Jrc3BhY2UKCiAgICBsb2NhbCBiYXNlWSA9IG9wdGltYWxQb2ludC5ZIC0gMS41CiAgICBsb2NhbCB1bmRlcmdy",
+"b3VuZFkgPSBiYXNlWSAtIDYKCiAgICBsb2NhbCBncmFkaWVudEN5bGluZGVyID0gSW5zdGFuY2UubmV3KCdNZXNoUGFydCcpCiAg",
+"ICBncmFkaWVudEN5bGluZGVyLk1lc2hJZCA9ICdyYnhhc3NldGlkOi8vODA5MTc3OTM2MycKICAgIGdyYWRpZW50Q3lsaW5kZXIu",
+"TWF0ZXJpYWwgPSBFbnVtLk1hdGVyaWFsLlBsYXN0aWMKICAgIGdyYWRpZW50Q3lsaW5kZXIuU2l6ZSA9IFZlY3RvcjMubmV3KDIs",
+"IDQsIDIpCiAgICBncmFkaWVudEN5bGluZGVyLlJvdGF0aW9uID0gVmVjdG9yMy5uZXcoMTgwLCAwLCAxODApCiAgICBncmFkaWVu",
+"dEN5bGluZGVyLlRyYW5zcGFyZW5jeSA9IDEKICAgIGdyYWRpZW50Q3lsaW5kZXIuQW5jaG9yZWQgPSB0cnVlCiAgICBncmFkaWVu",
+"dEN5bGluZGVyLkNhbkNvbGxpZGUgPSBmYWxzZQogICAgZ3JhZGllbnRDeWxpbmRlci5Qb3NpdGlvbiA9IFZlY3RvcjMubmV3KG9w",
+"dGltYWxQb2ludC5YLCB1bmRlcmdyb3VuZFksIG9wdGltYWxQb2ludC5aKQogICAgZ3JhZGllbnRDeWxpbmRlci5QYXJlbnQgPSBt",
+"b2RlbAoKICAgIGxvY2FsIGZhY2VzID0gewogICAgICAgIEVudW0uTm9ybWFsSWQuRnJvbnQsCiAgICAgICAgRW51bS5Ob3JtYWxJ",
+"ZC5CYWNrLAogICAgICAgIEVudW0uTm9ybWFsSWQuTGVmdCwKICAgICAgICBFbnVtLk5vcm1hbElkLlJpZ2h0CiAgICB9CgogICAg",
+"Zm9yIF8sIGZhY2UgaW4gbmV4dCwgZmFjZXMgZG8KICAgICAgICBsb2NhbCBkZWNhbCA9IEluc3RhbmNlLm5ldygnRGVjYWwnKQog",
+"ICAgICAgIGRlY2FsLkZhY2UgPSBmYWNlCiAgICAgICAgZGVjYWwuVGV4dHVyZSA9ICdyYnhhc3NldGlkOi8vODA5NzE4NTk1NCcK",
+"ICAgICAgICBkZWNhbC5UcmFuc3BhcmVuY3kgPSAwCiAgICAgICAgZGVjYWwuQ29sb3IzID0gQ29sb3IzLmZyb21SR0IoMjU1LCAy",
+"NTUsIDI1NSkKICAgICAgICBkZWNhbC5QYXJlbnQgPSBncmFkaWVudEN5bGluZGVyCiAgICBlbmQKCiAgICBsb2NhbCBnbG93Q2ly",
+"Y2xlID0gSW5zdGFuY2UubmV3KCdNZXNoUGFydCcpCiAgICBnbG93Q2lyY2xlLk1lc2hJZCA9ICdyYnhhc3NldGlkOi8vODA5MTg0",
+"ODI4NScKICAgIGdsb3dDaXJjbGUuTWF0ZXJpYWwgPSBFbnVtLk1hdGVyaWFsLk5lb24KICAgIGdsb3dDaXJjbGUuQ29sb3IgPSBD",
+"b2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KQogICAgZ2xvd0NpcmNsZS5TaXplID0gVmVjdG9yMy5uZXcoMy43MzEsIDAuMDMx",
+"LCAzLjczMSkKICAgIGdsb3dDaXJjbGUuUm90YXRpb24gPSBWZWN0b3IzLm5ldygxODAsIDAsIDE4MCkKICAgIGdsb3dDaXJjbGUu",
+"VHJhbnNwYXJlbmN5ID0gMQogICAgZ2xvd0NpcmNsZS5BbmNob3JlZCA9IHRydWUKICAgIGdsb3dDaXJjbGUuQ2FuQ29sbGlkZSA9",
+"IGZhbHNlCiAgICBnbG93Q2lyY2xlLlBvc2l0aW9uID0gVmVjdG9yMy5uZXcob3B0aW1hbFBvaW50LlgsIHVuZGVyZ3JvdW5kWSwg",
+"b3B0aW1hbFBvaW50LlopCiAgICBnbG93Q2lyY2xlLlBhcmVudCA9IG1vZGVsCgogICAgbG9jYWwgZW1pdHRlciA9IEluc3RhbmNl",
+"Lm5ldygnUGFydGljbGVFbWl0dGVyJykKICAgIGVtaXR0ZXIuVGV4dHVyZSA9ICdyYnhhc3NldDovL3RleHR1cmVzL3BhcnRpY2xl",
+"cy9zcGFya2xlc19tYWluLmRkcycKICAgIGVtaXR0ZXIuUmF0ZSA9IDUKICAgIGVtaXR0ZXIuU3BlZWQgPSBOdW1iZXJSYW5nZS5u",
+"ZXcoNSwgNSkKICAgIGVtaXR0ZXIuTGlmZXRpbWUgPSBOdW1iZXJSYW5nZS5uZXcoMC41LCAwLjUpCiAgICBlbWl0dGVyLkVtaXNz",
+"aW9uRGlyZWN0aW9uID0gRW51bS5Ob3JtYWxJZC5Ub3AKICAgIGVtaXR0ZXIuVGltZVNjYWxlID0gMC4zCiAgICBlbWl0dGVyLkNv",
+"bG9yID0gQ29sb3JTZXF1ZW5jZS5uZXcoQ29sb3IzLmZyb21SR0IoMjU1LCAyNTUsIDI1NSkpCiAgICBlbWl0dGVyLlBhcmVudCA9",
+"IGdyYWRpZW50Q3lsaW5kZXIKCiAgICBsb2NhbCBib3R0b21QYXJ0ID0gSW5zdGFuY2UubmV3KCdQYXJ0JykKICAgIGJvdHRvbVBh",
+"cnQuU2l6ZSA9IFZlY3RvcjMubmV3KDAuMzExLCAwLjMxMSwgMC4zMTEpCiAgICBib3R0b21QYXJ0LlRyYW5zcGFyZW5jeSA9IDEK",
+"ICAgIGJvdHRvbVBhcnQuTWF0ZXJpYWwgPSBFbnVtLk1hdGVyaWFsLlBsYXN0aWMKICAgIGJvdHRvbVBhcnQuQW5jaG9yZWQgPSB0",
+"cnVlCiAgICBib3R0b21QYXJ0LkNhbkNvbGxpZGUgPSBmYWxzZQogICAgYm90dG9tUGFydC5Qb3NpdGlvbiA9IFZlY3RvcjMubmV3",
+"KG9wdGltYWxQb2ludC5YLCB1bmRlcmdyb3VuZFksIG9wdGltYWxQb2ludC5aKQogICAgYm90dG9tUGFydC5QYXJlbnQgPSBtb2Rl",
+"bAoKICAgIGxvY2FsIHBvaW50TGlnaHQgPSBJbnN0YW5jZS5uZXcoJ1BvaW50TGlnaHQnKQogICAgcG9pbnRMaWdodC5Db2xvciA9",
+"IENvbG9yMy5mcm9tUkdCKDI1NSwgMjU1LCAyNTUpCiAgICBwb2ludExpZ2h0LlJhbmdlID0gMTIKICAgIHBvaW50TGlnaHQuQnJp",
+"Z2h0bmVzcyA9IDIKICAgIHBvaW50TGlnaHQuUGFyZW50ID0gYm90dG9tUGFydAoKICAgIGxvY2FsIHR3ZWVuSW5mbyA9IFR3ZWVu",
+"SW5mby5uZXcoMC41NSwgRW51bS5FYXNpbmdTdHlsZS5RdWFkLCBFbnVtLkVhc2luZ0RpcmVjdGlvbi5PdXQpCgogICAgbG9jYWwg",
+"dXBHb2FsID0gewogICAgICAgIFBvc2l0aW9uID0gVmVjdG9yMy5uZXcob3B0aW1hbFBvaW50LlgsIGJhc2VZLCBvcHRpbWFsUG9p",
+"bnQuWikKICAgIH0KCiAgICBsb2NhbCBkb3duR29hbCA9IHsKICAgICAgICBQb3NpdGlvbiA9IFZlY3RvcjMubmV3KG9wdGltYWxQ",
+"b2ludC5YLCB1bmRlcmdyb3VuZFksIG9wdGltYWxQb2ludC5aKQogICAgfQoKICAgIGxvY2FsIHVwVHdlZW5zID0gewogICAgICAg",
+"IHR3ZWVuU2VydmljZTpDcmVhdGUoZ3JhZGllbnRDeWxpbmRlciwgdHdlZW5JbmZvLCB1cEdvYWwpLAogICAgICAgIHR3ZWVuU2Vy",
+"dmljZTpDcmVhdGUoZ2xvd0NpcmNsZSwgdHdlZW5JbmZvLCB1cEdvYWwpLAogICAgICAgIHR3ZWVuU2VydmljZTpDcmVhdGUoYm90",
+"dG9tUGFydCwgdHdlZW5JbmZvLCB1cEdvYWwpCiAgICB9CgogICAgZm9yIF8sIHQgaW4gbmV4dCwgdXBUd2VlbnMgZG8KICAgICAg",
+"ICB0OlBsYXkoKQogICAgZW5kCgogICAgdGFzay5zcGF3bihmdW5jdGlvbigpCiAgICAgICAgd2hpbGUgdiBhbmQgdi5QYXJlbnQg",
+"YW5kIHYuQXNzZW1ibHlMaW5lYXJWZWxvY2l0eS5NYWduaXR1ZGUgPiAxIGRvCiAgICAgICAgICAgIHRhc2sud2FpdCgpCiAgICAg",
+"ICAgZW5kCgogICAgICAgIGxvY2FsIGRvd25Ud2VlbnMgPSB7CiAgICAgICAgICAgIHR3ZWVuU2VydmljZTpDcmVhdGUoZ3JhZGll",
+"bnRDeWxpbmRlciwgdHdlZW5JbmZvLCBkb3duR29hbCksCiAgICAgICAgICAgIHR3ZWVuU2VydmljZTpDcmVhdGUoZ2xvd0NpcmNs",
+"ZSwgdHdlZW5JbmZvLCBkb3duR29hbCksCiAgICAgICAgICAgIHR3ZWVuU2VydmljZTpDcmVhdGUoYm90dG9tUGFydCwgdHdlZW5J",
+"bmZvLCBkb3duR29hbCkKICAgICAgICB9CgogICAgICAgIGZvciBfLCB0IGluIG5leHQsIGRvd25Ud2VlbnMgZG8KICAgICAgICAg",
+"ICAgdDpQbGF5KCkKICAgICAgICBlbmQKCiAgICAgICAgdGFzay53YWl0KDAuNCkKCiAgICAgICAgaWYgbW9kZWwuUGFyZW50IHRo",
+"ZW4KICAgICAgICAgICAgbW9kZWw6RGVzdHJveSgpCiAgICAgICAgZW5kCiAgICBlbmQpCmVuZCkKICAgIAogICAgdGhyb3dTcG90",
+"ID0gVmlzdWFsVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ1Zpc3VhbGlzZSBGb290YmFsbCBUaHJvdyBTcG90JywKICAg",
+"IERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdTaG93cyB0aGUgcHJlZGljdGVkIGxhbmRpbmcgcG9pbnQgb2YgdGhyb3duIGZv",
+"b3RiYWxscy4nLAp9KQogICAgCiAgICB3b3Jrc3BhY2UuQ2hpbGRBZGRlZDpDb25uZWN0KGZ1bmN0aW9uKHYpCiAgICAgICAgaWYg",
+"bm90IHRocm93U3BvdC5WYWx1ZSB0aGVuIHJldHVybiBlbmQKICAgIGlmIG5vdCB2OklzQSgnQmFzZVBhcnQnKSBvciB2Lk5hbWUg",
+"fj0gJ0Zvb3RiYWxsJyB0aGVuIHJldHVybiBlbmQKCiAgICB0YXNrLndhaXQoKQoKICAgIGxvY2FsIHBvcyA9IHYuUG9zaXRpb24K",
+"ICAgIGxvY2FsIHZlbCA9IHYuQXNzZW1ibHlMaW5lYXJWZWxvY2l0eQogICAgbG9jYWwgZ3Jhdml0eSA9IFZlY3RvcjMubmV3KDAs",
+"IC0yOCwgMCkKCiAgICBsb2NhbCBwb3NpdGlvbnMgPSB7fQogICAgbG9jYWwgcGFydHMgPSB7fQoKICAgIGxvY2FsIGR0ID0gMC4w",
+"NQogICAgbG9jYWwgbWF4VGltZSA9IDgKCiAgICBsb2NhbCBsYXN0UG9zID0gcG9zCiAgICBsb2NhbCBzcGF3blkgPSBwb3MuWQoK",
+"ICAgIGZvciB0ID0gMCwgbWF4VGltZSwgZHQgZG8KICAgICAgICBsb2NhbCBwcm9qZWN0aWxlUG9zID0gcG9zICsgKHZlbCAqIHQp",
+"ICsgKDAuNSAqIGdyYXZpdHkgKiB0ICogdCkKCiAgICAgICAgdGFibGUuaW5zZXJ0KHBvc2l0aW9ucywgcHJvamVjdGlsZVBvcykK",
+"CiAgICAgICAgaWYgcHJvamVjdGlsZVBvcy5ZIDwgc3Bhd25ZIHRoZW4KICAgICAgICAgICAgYnJlYWsKICAgICAgICBlbmQKCiAg",
+"ICAgICAgbG9jYWwgcmF5ID0gd29ya3NwYWNlOlJheWNhc3QobGFzdFBvcywgcHJvamVjdGlsZVBvcyAtIGxhc3RQb3MpCiAgICAg",
+"ICAgaWYgcmF5IHRoZW4KICAgICAgICAgICAgcG9zaXRpb25zWyNwb3NpdGlvbnNdID0gcmF5LlBvc2l0aW9uCiAgICAgICAgICAg",
+"IGJyZWFrCiAgICAgICAgZW5kCgogICAgICAgIGxhc3RQb3MgPSBwcm9qZWN0aWxlUG9zCiAgICBlbmQKCiAgICBsb2NhbCBlbmRQ",
+"b3MgPSBwb3NpdGlvbnNbI3Bvc2l0aW9uc10KICAgIGlmIG5vdCBlbmRQb3MgdGhlbiByZXR1cm4gZW5kCgogICAgbG9jYWwgcG9z",
+"UGFydCA9IEluc3RhbmNlLm5ldygnUGFydCcsIHdvcmtzcGFjZS5UZXJyYWluKQogICAgcG9zUGFydC5BbmNob3JlZCA9IHRydWUK",
+"ICAgIHBvc1BhcnQuQ2FuQ29sbGlkZSA9IGZhbHNlCiAgICBwb3NQYXJ0LkNhc3RTaGFkb3cgPSBmYWxzZQogICAgcG9zUGFydC5T",
+"aXplID0gVmVjdG9yMy5uZXcoMywgMywgMykKICAgIHBvc1BhcnQuU2hhcGUgPSBFbnVtLlBhcnRUeXBlLkJhbGwKICAgIHBvc1Bh",
+"cnQuQ29sb3IgPSBDb2xvcjMuZnJvbVJHQigwLCAwLCAwKQogICAgcG9zUGFydC5Qb3NpdGlvbiA9IGVuZFBvcwoKICAgIGZvciBp",
+"ID0gMSwgI3Bvc2l0aW9ucyAtIDEgZG8KICAgICAgICBsb2NhbCBwMCA9IHBvc2l0aW9uc1tpXQogICAgICAgIGxvY2FsIHAxID0g",
+"cG9zaXRpb25zW2kgKyAxXQoKICAgICAgICBsb2NhbCBiZWFtUGFydCA9IEluc3RhbmNlLm5ldygnUGFydCcsIHdvcmtzcGFjZS5U",
+"ZXJyYWluKQogICAgICAgIGJlYW1QYXJ0LkFuY2hvcmVkID0gdHJ1ZQogICAgICAgIGJlYW1QYXJ0LkNhbkNvbGxpZGUgPSBmYWxz",
+"ZQogICAgICAgIGJlYW1QYXJ0LkNhc3RTaGFkb3cgPSBmYWxzZQogICAgICAgIGJlYW1QYXJ0Lk1hdGVyaWFsID0gRW51bS5NYXRl",
+"cmlhbC5OZW9uCiAgICAgICAgYmVhbVBhcnQuQ29sb3IgPSBDb2xvcjMuZnJvbVJHQigyNTUsIDI1NSwgMjU1KQoKICAgICAgICBs",
+"b2NhbCBkaXN0ID0gKHAxIC0gcDApLk1hZ25pdHVkZQoKICAgICAgICBiZWFtUGFydC5TaXplID0gVmVjdG9yMy5uZXcoMC40LCAw",
+"LjQsIGRpc3QpCiAgICAgICAgYmVhbVBhcnQuQ0ZyYW1lID0gQ0ZyYW1lLmxvb2tBdCgocDAgKyBwMSkgLyAyLCBwMSkKCiAgICAg",
+"ICAgdGFibGUuaW5zZXJ0KHBhcnRzLCBiZWFtUGFydCkKICAgIGVuZAoKICAgIHRhc2suc3Bhd24oZnVuY3Rpb24oKQogICAgICAg",
+"IGxvY2FsIHNwZWVkID0gbWF0aC5tYXgodmVsLk1hZ25pdHVkZSwgMSkKICAgICAgICBsb2NhbCBkZWxheVRpbWUgPSBtYXRoLmNs",
+"YW1wKDMwMCAvIHNwZWVkLCAwLjAxLCAwLjA0KQoKICAgICAgICBmb3IgXywgcGFydCBpbiBuZXh0LCBwYXJ0cyBkbwogICAgICAg",
+"ICAgICB0YXNrLndhaXQoZGVsYXlUaW1lKQoKICAgICAgICAgICAgaWYgcGFydC5QYXJlbnQgdGhlbgogICAgICAgICAgICAgICAg",
+"cGFydDpEZXN0cm95KCkKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCgogICAgICAgIGlmIHBvc1BhcnQuUGFyZW50IHRoZW4K",
+"ICAgICAgICAgICAgcG9zUGFydDpEZXN0cm95KCkKICAgICAgICBlbmQKICAgIGVuZCkKZW5kKQogICAgClZpc3VhbFRhYjpDcmVh",
+"dGVEaXZpZGVyKCkKICAgIAplbmFibGVHbG92ZXMgPSBWaXN1YWxUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnRW5hYmxl",
+"IFVuaWZvcm0gR2xvdmVzJywKICAgIERlZmF1bHQgPSB0cnVlLAogICAgVGlwID0gJ1RvZ2dsZXMgdmlzaWJpbGl0eSBvZiB1bmlm",
+"b3JtIGdsb3Zlcy4nLAp9KQoKdGFzay5zcGF3bihmdW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0",
+"KCkKCiAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gcGxheWVyLkNoYXJhY3RlcgogICAgICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhl",
+"biBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgdW5pZm9ybSA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnVW5pZm9ybScp",
+"CiAgICAgICAgaWYgbm90IHVuaWZvcm0gdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgZ2xvdmVWaXNpYmxlCgogICAg",
+"ICAgIGZvciBfLCB2IGluIG5leHQsIHVuaWZvcm06R2V0RGVzY2VuZGFudHMoKSBkbwogICAgICAgICAgICBpZiBub3QgdjpJc0Eo",
+"J0Jhc2VQYXJ0JykgdGhlbiBjb250aW51ZSBlbmQKICAgICAgICAgICAgaWYgbm90IHYuTmFtZTpsb3dlcigpOmZpbmQoJ2dsb3Zl",
+"JykgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgICAgIGdsb3ZlVmlzaWJsZSA9IHYuVHJhbnNwYXJlbmN5ID09IDAKICAgICAg",
+"ICAgICAgYnJlYWsKICAgICAgICBlbmQKCiAgICAgICAgaWYgZ2xvdmVWaXNpYmxlID09IG5pbCB0aGVuIGNvbnRpbnVlIGVuZAoK",
+"ICAgICAgICBpZiBlbmFibGVHbG92ZXMuVmFsdWUgYW5kIG5vdCBnbG92ZVZpc2libGUgdGhlbgogICAgICAgICAgICByZXBsaWNh",
+"dGVkU3RvcmFnZS5SZW1vdGVzLkNoYXJhY3RlclNvdW5kRXZlbnQ6RmlyZVNlcnZlcignR2FtZScsICdDdXN0b21pemF0aW9uJywg",
+"J1RvZ2dsZScsICdMZWZ0R2xvdmUnKQogICAgICAgICAgICByZXBsaWNhdGVkU3RvcmFnZS5SZW1vdGVzLkNoYXJhY3RlclNvdW5k",
+"RXZlbnQ6RmlyZVNlcnZlcignR2FtZScsICdDdXN0b21pemF0aW9uJywgJ1RvZ2dsZScsICdSaWdodEdsb3ZlJykKICAgICAgICBl",
+"bHNlaWYgbm90IGVuYWJsZUdsb3Zlcy5WYWx1ZSBhbmQgZ2xvdmVWaXNpYmxlIHRoZW4KICAgICAgICAgICAgcmVwbGljYXRlZFN0",
+"b3JhZ2UuUmVtb3Rlcy5DaGFyYWN0ZXJTb3VuZEV2ZW50OkZpcmVTZXJ2ZXIoJ0dhbWUnLCAnQ3VzdG9taXphdGlvbicsICdUb2dn",
+"bGUnLCAnTGVmdEdsb3ZlJykKICAgICAgICAgICAgcmVwbGljYXRlZFN0b3JhZ2UuUmVtb3Rlcy5DaGFyYWN0ZXJTb3VuZEV2ZW50",
+"OkZpcmVTZXJ2ZXIoJ0dhbWUnLCAnQ3VzdG9taXphdGlvbicsICdUb2dnbGUnLCAnUmlnaHRHbG92ZScpCiAgICAgICAgZW5kCiAg",
+"ICBlbmQKZW5kKQoKVmlzdWFsVGFiOkNyZWF0ZURpdmlkZXIoKQogICAgCm5vQmFsbFRyYWlsID0gVmlzdWFsVGFiOkNyZWF0ZVRv",
+"Z2dsZSh7CiAgICBOYW1lID0gJ05vIEJhbGwgVHJhaWwnLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ1JlbW92ZXMg",
+"Zm9vdGJhbGwgdHJhaWwgZWZmZWN0cy4nLAp9KQoKd29ya3NwYWNlLkNoaWxkQWRkZWQ6Q29ubmVjdChmdW5jdGlvbih2KQogICAg",
+"aWYgbm90IG5vQmFsbFRyYWlsLlZhbHVlIHRoZW4gcmV0dXJuIGVuZAoKICAgIGlmIHY6SXNBKCdCYXNlUGFydCcpIGFuZCB2Lk5h",
+"bWUgPT0gJ0Zvb3RiYWxsJyB0aGVuCiAgICAgICAgbG9jYWwgdHJhaWwgPSB2OkZpbmRGaXJzdENoaWxkT2ZDbGFzcygnVHJhaWwn",
+"KQogICAgICAgIGlmIHRyYWlsIHRoZW4KICAgICAgICAgICAgdHJhaWw6RGVzdHJveSgpCiAgICAgICAgZW5kCiAgICBlbmQKZW5k",
+"KQoKbG9jYWwgc3RhZGl1bVBhcnRzID0ge30KCmZvciBfLCB2IGluIG5leHQsIHdvcmtzcGFjZS5Nb2RlbHMuU3RhZGl1bTpHZXRE",
+"ZXNjZW5kYW50cygpIGRvCiAgICBpZiBub3QgdjpJc0EoJ0Jhc2VQYXJ0JykgdGhlbiBjb250aW51ZSBlbmQKCiAgICBzdGFkaXVt",
+"UGFydHNbI3N0YWRpdW1QYXJ0cyArIDFdID0gewogICAgICAgIFBhcnQgPSB2LAogICAgICAgIFRyYW5zcGFyZW5jeSA9IHYuVHJh",
+"bnNwYXJlbmN5LAogICAgICAgIENhbkNvbGxpZGUgPSB2LkNhbkNvbGxpZGUKICAgIH0KZW5kCgpoaWRlU3RhZGl1bSA9IFZpc3Vh",
+"bFRhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdIaWRlIFN0YWRpdW0nLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlw",
+"ID0gJ0hpZGVzIHZpc2libGUgc3RhZGl1bSBzdHJ1Y3R1cmVzLicsCiAgICBDYWxsYmFjayA9IGZ1bmN0aW9uKHYpCiAgICAgICAg",
+"Zm9yIF8sIHAgaW4gbmV4dCwgc3RhZGl1bVBhcnRzIGRvCiAgICAgICAgICAgIHAuUGFydC5UcmFuc3BhcmVuY3kgPSB2IGFuZCAx",
+"IG9yIHAuVHJhbnNwYXJlbmN5CiAgICAgICAgICAgIHAuUGFydC5DYW5Db2xsaWRlID0gdiBhbmQgZmFsc2Ugb3IgcC5DYW5Db2xs",
+"aWRlCiAgICAgICAgZW5kCiAgICBlbmQKfSkKClZpc3VhbFRhYjpDcmVhdGVEaXZpZGVyKCkKCmxvY2FsIGxpZ2h0aW5nID0gZ2Ft",
+"ZTpHZXRTZXJ2aWNlKCdMaWdodGluZycpCgpsb2NhbCBmdW5jdGlvbiBBcHBseVNreUJveChuYW1lKQogICAgZm9yIF8sIHYgaW4g",
+"bmV4dCwgbGlnaHRpbmc6R2V0Q2hpbGRyZW4oKSBkbwogICAgICAgIGlmIHY6SXNBKCJTa3kiKSBvciB2OklzQSgiUG9zdEVmZmVj",
+"dCIpIG9yIHY6SXNBKCJBdG1vc3BoZXJlIikgdGhlbgogICAgICAgICAgICB2OkRlc3Ryb3koKQogICAgICAgIGVuZAogICAgZW5k",
+"CgogICAgaWYgbmFtZSA9PSAiR29sZGVuIFR3aWxpZ2h0IiB0aGVuCiAgICAgICAgbG9jYWwgU2t5ID0gSW5zdGFuY2UubmV3KCJT",
+"a3kiKQogICAgICAgIFNreS5OYW1lID0gbmFtZQogICAgICAgIFNreS5QYXJlbnQgPSBsaWdodGluZwogICAgICAgIFNreS5Ta3li",
+"b3hCayA9ICJyYnhhc3NldGlkOi8vNTQxNzQzNDUzIgogICAgICAgIFNreS5Ta3lib3hEbiA9ICJyYnhhc3NldGlkOi8vNTQxNzQz",
+"NDQzIgogICAgICAgIFNreS5Ta3lib3hGdCA9ICJyYnhhc3NldGlkOi8vNTQxNzQzNDQ2IgogICAgICAgIFNreS5Ta3lib3hMZiA9",
+"ICJyYnhhc3NldGlkOi8vNTQxNzQzNDM2IgogICAgICAgIFNreS5Ta3lib3hSdCA9ICJyYnhhc3NldGlkOi8vNTQxNzQzNDM1Igog",
+"ICAgICAgIFNreS5Ta3lib3hVcCA9ICJyYnhhc3NldGlkOi8vNTQxNzQzNDQxIgoKICAgIGVsc2VpZiBuYW1lID09ICJJbmZlcm5h",
+"bCBIb3Jpem9uIiB0aGVuCiAgICAgICAgbG9jYWwgU2t5ID0gSW5zdGFuY2UubmV3KCJTa3kiKQogICAgICAgIFNreS5OYW1lID0g",
+"bmFtZQogICAgICAgIFNreS5QYXJlbnQgPSBsaWdodGluZwogICAgICAgIFNreS5Ta3lib3hCayA9ICJodHRwOi8vd3d3LnJvYmxv",
+"eC5jb20vYXNzZXQvP2lkPTE2OTIxMDA5MCIKICAgICAgICBTa3kuU2t5Ym94RG4gPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fz",
+"c2V0Lz9pZD0xNjkyMTAxMDgiCiAgICAgICAgU2t5LlNreWJveEZ0ID0gImh0dHA6Ly93d3cucm9ibG94LmNvbS9hc3NldC8/aWQ9",
+"MTY5MjEwMTIxIgogICAgICAgIFNreS5Ta3lib3hMZiA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTE2OTIxMDEz",
+"MyIKICAgICAgICBTa3kuU2t5Ym94UnQgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xNjkyMTAxNDMiCiAgICAg",
+"ICAgU2t5LlNreWJveFVwID0gImh0dHA6Ly93d3cucm9ibG94LmNvbS9hc3NldC8/aWQ9MTY5MjEwMTQ5IgogICAgICAgIFNreS5T",
+"dGFyQ291bnQgPSAxMDAKICAgICAgICBTa3kuU3VuVGV4dHVyZUlkID0gIiAiCgogICAgICAgIGxvY2FsIEJsdXJFZmZlY3QgPSBJ",
+"bnN0YW5jZS5uZXcoIkJsdXJFZmZlY3QiKQogICAgICAgIEJsdXJFZmZlY3QuUGFyZW50ID0gbGlnaHRpbmcKICAgICAgICBCbHVy",
+"RWZmZWN0LlNpemUgPSA2CgogICAgICAgIGxvY2FsIENvbG9yQ29ycmVjdGlvbkVmZmVjdCA9IEluc3RhbmNlLm5ldygiQ29sb3JD",
+"b3JyZWN0aW9uRWZmZWN0IikKICAgICAgICBDb2xvckNvcnJlY3Rpb25FZmZlY3QuUGFyZW50ID0gbGlnaHRpbmcKICAgICAgICBD",
+"b2xvckNvcnJlY3Rpb25FZmZlY3QuQnJpZ2h0bmVzcyA9IDAuMDEKICAgICAgICBDb2xvckNvcnJlY3Rpb25FZmZlY3QuQ29udHJh",
+"c3QgPSAwLjE1CiAgICAgICAgQ29sb3JDb3JyZWN0aW9uRWZmZWN0LlNhdHVyYXRpb24gPSAwLjQKICAgICAgICBDb2xvckNvcnJl",
+"Y3Rpb25FZmZlY3QuVGludENvbG9yID0gQ29sb3IzLm5ldygwLjgxNTY4NiwgMC43NzY0NzEsIDAuNjkwMTk2KQoKICAgIGVsc2Vp",
+"ZiBuYW1lID09ICJOZWJ1bGEgUGVha3MiIHRoZW4KICAgICAgICBsb2NhbCBTa3kgPSBJbnN0YW5jZS5uZXcoIlNreSIpCiAgICAg",
+"ICAgU2t5Lk5hbWUgPSBuYW1lCiAgICAgICAgU2t5LlBhcmVudCA9IGxpZ2h0aW5nCiAgICAgICAgU2t5LkNlbGVzdGlhbEJvZGll",
+"c1Nob3duID0gZmFsc2UKICAgICAgICBTa3kuU2t5Ym94QmsgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xNzEy",
+"NDM1NzQ2NyIKICAgICAgICBTa3kuU2t5Ym94RG4gPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xNzEyNDM1OTc5",
+"NyIKICAgICAgICBTa3kuU2t5Ym94RnQgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xNzEyNDM2MjA5MyIKICAg",
+"ICAgICBTa3kuU2t5Ym94TGYgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xNzEyNDM2NTEyNyIKICAgICAgICBT",
+"a3kuU2t5Ym94UnQgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xNzEyNDM2NzIwMCIKICAgICAgICBTa3kuU2t5",
+"Ym94VXAgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xNzEyNDM2OTY1NyIKCiAgICAgICAgbG9jYWwgY2MgPSBJ",
+"bnN0YW5jZS5uZXcoIkNvbG9yQ29ycmVjdGlvbkVmZmVjdCIpCiAgICAgICAgY2MuUGFyZW50ID0gbGlnaHRpbmcKICAgICAgICBj",
+"Yy5CcmlnaHRuZXNzID0gMC4xCiAgICAgICAgY2MuQ29udHJhc3QgPSAwLjMKICAgICAgICBjYy5TYXR1cmF0aW9uID0gMC4yCiAg",
+"ICAgICAgY2MuVGludENvbG9yID0gQ29sb3IzLmZyb21SR0IoMTQwLCAxOTAsIDI1NSkKCiAgICAgICAgbG9jYWwgYmxvb20gPSBJ",
+"bnN0YW5jZS5uZXcoIkJsb29tRWZmZWN0IikKICAgICAgICBibG9vbS5QYXJlbnQgPSBsaWdodGluZwogICAgICAgIGJsb29tLklu",
+"dGVuc2l0eSA9IDEuMgogICAgICAgIGJsb29tLlRocmVzaG9sZCA9IDAuOAogICAgICAgIGJsb29tLlNpemUgPSA1NgoKICAgICAg",
+"ICBsb2NhbCBhdG1vc3BoZXJlID0gSW5zdGFuY2UubmV3KCJBdG1vc3BoZXJlIikKICAgICAgICBhdG1vc3BoZXJlLlBhcmVudCA9",
+"IGxpZ2h0aW5nCiAgICAgICAgYXRtb3NwaGVyZS5EZW5zaXR5ID0gMC4yNQogICAgICAgIGF0bW9zcGhlcmUuT2Zmc2V0ID0gMC4y",
+"CiAgICAgICAgYXRtb3NwaGVyZS5HbGFyZSA9IDAuMwogICAgICAgIGF0bW9zcGhlcmUuSGF6ZSA9IDEKICAgICAgICBhdG1vc3Bo",
+"ZXJlLkNvbG9yID0gQ29sb3IzLmZyb21SR0IoODAsIDExMCwgMTUwKQogICAgICAgIGF0bW9zcGhlcmUuRGVjYXkgPSBDb2xvcjMu",
+"ZnJvbVJHQigyNSwgMzAsIDM1KQoKICAgIGVsc2VpZiBuYW1lID09ICJSb3NlIEdsb3ciIHRoZW4KICAgICAgICBsb2NhbCBTa3kg",
+"PSBJbnN0YW5jZS5uZXcoIlNreSIpCiAgICAgICAgU2t5Lk5hbWUgPSBuYW1lCiAgICAgICAgU2t5LlBhcmVudCA9IGxpZ2h0aW5n",
+"CiAgICAgICAgU2t5LkNlbGVzdGlhbEJvZGllc1Nob3duID0gZmFsc2UKICAgICAgICBTa3kuU2t5Ym94QmsgPSAiaHR0cDovL3d3",
+"dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xMDkzMDUxOTMiCiAgICAgICAgU2t5LlNreWJveERuID0gImh0dHA6Ly93d3cucm9ibG94",
+"LmNvbS9hc3NldD9pZD01ODM3MjcyMiIKICAgICAgICBTa3kuU2t5Ym94RnQgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0",
+"Lz9pZD0xMDkzMDUyMDAiCiAgICAgICAgU2t5LlNreWJveExmID0gImh0dHA6Ly93d3cucm9ibG94LmNvbS9hc3NldC8/aWQ9MTA5",
+"MzA1MTg1IgogICAgICAgIFNreS5Ta3lib3hSdCA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTEwOTMwNTE4OSIK",
+"ICAgICAgICBTa3kuU2t5Ym94VXAgPSAiaHR0cDovL3d3dy5yb2Jsb3guY29tL2Fzc2V0Lz9pZD0xMDkzMDUyMDciCgogICAgZWxz",
+"ZWlmIG5hbWUgPT0gIk5pZ2h0IFNreSIgdGhlbgogICAgICAgIGxvY2FsIFNreSA9IEluc3RhbmNlLm5ldygiU2t5IikKICAgICAg",
+"ICBTa3kuTmFtZSA9IG5hbWUKICAgICAgICBTa3kuUGFyZW50ID0gbGlnaHRpbmcKICAgICAgICBTa3kuQ2VsZXN0aWFsQm9kaWVz",
+"U2hvd24gPSBmYWxzZQogICAgICAgIFNreS5Ta3lib3hCayA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vQXNzZXQvP0lEPTEyMDY0",
+"MTA3IgogICAgICAgIFNreS5Ta3lib3hEbiA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vQXNzZXQvP0lEPTEyMDY0MTUyIgogICAg",
+"ICAgIFNreS5Ta3lib3hGdCA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vQXNzZXQvP0lEPTEyMDY0MTIxIgogICAgICAgIFNreS5T",
+"a3lib3hMZiA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vQXNzZXQvP0lEPTEyMDYzOTg0IgogICAgICAgIFNreS5Ta3lib3hSdCA9",
+"ICJodHRwOi8vd3d3LnJvYmxveC5jb20vQXNzZXQvP0lEPTEyMDY0MTE1IgogICAgICAgIFNreS5Ta3lib3hVcCA9ICJodHRwOi8v",
+"d3d3LnJvYmxveC5jb20vQXNzZXQvP0lEPTEyMDY0MTMxIgogICAgICAgIFNreS5TdGFyQ291bnQgPSAwCgogICAgZWxzZWlmIG5h",
+"bWUgPT0gIk5vcnRoZXJuIExpZ2h0cyIgdGhlbgogICAgICAgIGxvY2FsIFNreSA9IEluc3RhbmNlLm5ldygiU2t5IikKICAgICAg",
+"ICBTa3kuTmFtZSA9IG5hbWUKICAgICAgICBTa3kuUGFyZW50ID0gbGlnaHRpbmcKICAgICAgICBTa3kuQ2VsZXN0aWFsQm9kaWVz",
+"U2hvd24gPSBmYWxzZQogICAgICAgIFNreS5Ta3lib3hCayA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTE2NTYz",
+"NDc4OTgzIgogICAgICAgIFNreS5Ta3lib3hEbiA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTE2NTYzNDgxMzAy",
+"IgogICAgICAgIFNreS5Ta3lib3hGdCA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTE2NTYzNDg0MDg0IgogICAg",
+"ICAgIFNreS5Ta3lib3hMZiA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTE2NTYzNDg1MzYyIgogICAgICAgIFNr",
+"eS5Ta3lib3hSdCA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTE2NTYzNDg3MDc4IgogICAgICAgIFNreS5Ta3li",
+"b3hVcCA9ICJodHRwOi8vd3d3LnJvYmxveC5jb20vYXNzZXQvP2lkPTE2NTYzNDg5ODIxIgogICAgZW5kCmVuZAoKbG9jYWwgc2t5",
+"TmFtZXMgPSB7J0dvbGRlbiBUd2lsaWdodCcsICdJbmZlcm5hbCBIb3Jpem9uJywgJ05lYnVsYSBQZWFrcycsICdSb3NlIEdsb3cn",
+"LCAnTmlnaHQgU2t5JywgJ05vcnRoZXJuIExpZ2h0cyd9Cgpmb3IgXywgc2t5TmFtZSBpbiBuZXh0LCBza3lOYW1lcyBkbwogICAg",
+"VmlzdWFsVGFiOkNyZWF0ZUJ1dHRvbih7CiAgICAgICAgTmFtZSA9IHNreU5hbWUsCiAgICAgICAgVGlwID0gJ0FwcGxpZXMgdGhl",
+"ICcgLi4gc2t5TmFtZSAuLiAnIHNreWJveC4nLAogICAgICAgIENhbGxiYWNrID0gZnVuY3Rpb24oKQogICAgICAgICAgICBBcHBs",
+"eVNreUJveChza3lOYW1lKQogICAgICAgIGVuZAogICAgfSkKZW5kCgpsb2NhbCBEZWZlbnNlVGFiID0gV2luZG93OkNyZWF0ZVRh",
+"Yih7IE5hbWUgPSAnRGVmZW5zZScsIEljb24gPSAncmJ4YXNzZXRpZDovLzE0OTM5MDIzODYyJyB9KQoKc3dhdFJlYWNoID0gRGVm",
+"ZW5zZVRhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdTd2F0IFJlYWNoJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRp",
+"cCA9ICdFeHRlbmRzIHN3YXQgcmFuZ2Ugb24gbmVhcmJ5IGZvb3RiYWxscy4nLAp9KQoKc3dhdFJlYWNoRGlzdGFuY2UgPSBEZWZl",
+"bnNlVGFiOkNyZWF0ZVNsaWRlcih7CiAgICBOYW1lID0gJ1N3YXQgUmVhY2ggUmFkaXVzJywKICAgIE1pbiA9IDAsCiAgICBNYXgg",
+"PSAyNSwKICAgIERlZmF1bHQgPSAwLAogICAgSW5jcmVtZW50ID0gMC4xLAogICAgU3VmZml4ID0gJycsCiAgICBUaXAgPSAnU2V0",
+"cyB0aGUgbWF4aW11bSBzd2F0IGRpc3RhbmNlLicsCn0pCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgIHdoaWxlIHRydWUgZG8K",
+"ICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICBpZiBub3Qgc3dhdFJlYWNoLlZhbHVlIHRoZW4gY29udGludWUgZW5kCgogICAg",
+"ICAgIGxvY2FsIGNoYXJhY3RlciA9IHBsYXllci5DaGFyYWN0ZXIKICAgICAgICBpZiBub3QgY2hhcmFjdGVyIHRoZW4gY29udGlu",
+"dWUgZW5kCgogICAgICAgIGxvY2FsIGJhbGwgPSBmaW5kQ2xvc2VzdEJhbGwoKQogICAgICAgIGlmIG5vdCBiYWxsIHRoZW4gY29u",
+"dGludWUgZW5kCgogICAgICAgIGZvciBfLCB2IGluIG5leHQsIGNoYXJhY3RlcjpHZXRDaGlsZHJlbigpIGRvCiAgICAgICAgICAg",
+"IGlmIHY6SXNBKCdCYXNlUGFydCcpIGFuZCB2Lk5hbWU6bG93ZXIoKTpmaW5kKCdjYXRjaCcpIHRoZW4KICAgICAgICAgICAgICAg",
+"IGxvY2FsIGRpc3RhbmNlID0gKGJhbGwuUG9zaXRpb24gLSB2LlBvc2l0aW9uKS5NYWduaXR1ZGUKICAgICAgICAgICAgICAgIGlm",
+"IGRpc3RhbmNlIDwgc3dhdFJlYWNoRGlzdGFuY2UuVmFsdWUgdGhlbgogICAgICAgICAgICAgICAgICAgIGlmIHYuU2l6ZS5YID4g",
+"MiB0aGVuCiAgICAgICAgICAgICAgICAgICAgICAgIGZpcmV0b3VjaGludGVyZXN0KHYsIGJhbGwsIDApCiAgICAgICAgICAgICAg",
+"ICAgICAgICAgIGZpcmV0b3VjaGludGVyZXN0KHYsIGJhbGwsIDEpCiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAg",
+"ICAgICBlbmQKICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCiAgICBlbmQKZW5kKQoKRGVmZW5zZVRhYjpDcmVhdGVEaXZpZGVy",
+"KCkKCnRhY2tsZVJlYWNoID0gRGVmZW5zZVRhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdFeHRlbmQgVGFja2xlIFJlYWNo",
+"JywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdFeHRlbmRzIHRhY2tsZSByYW5nZSBhZ2FpbnN0IGJhbGwgY2Fycmll",
+"cnMuJywKfSkKCnRhY2tsZUFpbWJvdCA9IERlZmVuc2VUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnVGFja2xlIEFpbWJv",
+"dCcsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAnQXV0b21hdGljYWxseSB0YXJnZXRzIG5lYXJieSBiYWxsIGNhcnJp",
+"ZXJzLicsCn0pCgp0YWNrbGVBaW1ib3RSYW5nZSA9IERlZmVuc2VUYWI6Q3JlYXRlU2xpZGVyKHsKICAgIE5hbWUgPSAnVGFja2xl",
+"IEFpbWJvdCBEaXN0YW5jZScsCiAgICBNaW4gPSAwLAogICAgTWF4ID0gMjUsCiAgICBEZWZhdWx0ID0gMCwKICAgIEluY3JlbWVu",
+"dCA9IDAuMSwKICAgIFN1ZmZpeCA9ICcnLAogICAgVGlwID0gJ1NldHMgdGhlIG1heGltdW0gdGFyZ2V0aW5nIGRpc3RhbmNlLics",
+"Cn0pCgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgIHdoaWxlIHRydWUgZG8KICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICBs",
+"b2NhbCBjaGFyYWN0ZXIgPSBwbGF5ZXIuQ2hhcmFjdGVyCiAgICAgICAgaWYgbm90IGNoYXJhY3RlciB0aGVuIGNvbnRpbnVlIGVu",
+"ZAoKICAgICAgICBpZiB0YWNrbGVSZWFjaC5WYWx1ZSB0aGVuCiAgICAgICAgICAgIGZvciBfLCB2IGluIG5leHQsIHBsYXllcnM6",
+"R2V0UGxheWVycygpIGRvCiAgICAgICAgICAgICAgICBpZiB2IH49IHBsYXllciBhbmQgdi5UZWFtIH49IHBsYXllci5UZWFtIGFu",
+"ZCB2LkNoYXJhY3RlciBhbmQgdi5DaGFyYWN0ZXI6RmluZEZpcnN0Q2hpbGQoJ0Zvb3RiYWxsJykgdGhlbgogICAgICAgICAgICAg",
+"ICAgICAgIGxvY2FsIGJvZHlQYXJ0cyA9IHsnVG9yc28nLCAnSGVhZCcsICdIdW1hbm9pZFJvb3RQYXJ0JywgJ0xlZnQgQXJtJywg",
+"J0xlZnQgTGVnJywgJ1JpZ2h0IEFybScsICdSaWdodCBMZWcnfQogICAgICAgICAgICAgICAgICAgIGxvY2FsIHJhbmRvbVBhcnQg",
+"PSBib2R5UGFydHNbbWF0aC5yYW5kb20oMSwgI2JvZHlQYXJ0cyldCgogICAgICAgICAgICAgICAgICAgIHJlcGxpY2F0ZWRTdG9y",
+"YWdlLlJlbW90ZXMuQ2hhcmFjdGVyU291bmRFdmVudDpGaXJlU2VydmVyKCdHYW1lJywgJ1RhY2tsZVRvdWNoJywgcmFuZG9tUGFy",
+"dCwgcmFuZG9tUGFydCkKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBlbmQKICAgICAgICBlbmQKCiAgICAgICAgaWYg",
+"dGFja2xlQWltYm90LlZhbHVlIHRoZW4KICAgICAgICAgICAgZm9yIF8sIHYgaW4gbmV4dCwgcGxheWVyczpHZXRQbGF5ZXJzKCkg",
+"ZG8KICAgICAgICAgICAgICAgIGlmIHYgfj0gcGxheWVyIGFuZCB2LlRlYW0gfj0gcGxheWVyLlRlYW0gYW5kIHYuQ2hhcmFjdGVy",
+"IGFuZCB2LkNoYXJhY3Rlci5IdW1hbm9pZC5XYWxrU3BlZWQgPiAwIGFuZCB2LkNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnRm9v",
+"dGJhbGwnKSB0aGVuCiAgICAgICAgICAgICAgICAgICAgbG9jYWwgZGlzdGFuY2UgPSAodi5DaGFyYWN0ZXIuSHVtYW5vaWRSb290",
+"UGFydC5Qb3NpdGlvbiAtIGNoYXJhY3Rlci5IdW1hbm9pZFJvb3RQYXJ0LlBvc2l0aW9uKS5NYWduaXR1ZGUKICAgICAgICAgICAg",
+"ICAgICAgICBpZiBkaXN0YW5jZSA8IHRhY2tsZUFpbWJvdFJhbmdlLlZhbHVlIHRoZW4KICAgICAgICAgICAgICAgICAgICAgICAg",
+"Y2hhcmFjdGVyLkh1bWFub2lkUm9vdFBhcnQuQ0ZyYW1lID0gdi5DaGFyYWN0ZXIuSHVtYW5vaWRSb290UGFydC5DRnJhbWUKICAg",
+"ICAgICAgICAgICAgICAgICAgICAgY2hhcmFjdGVyLkh1bWFub2lkUm9vdFBhcnQuQ0ZyYW1lID0gdi5DaGFyYWN0ZXIuSHVtYW5v",
+"aWRSb290UGFydC5DRnJhbWUKICAgICAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAgICBl",
+"bmQKICAgICAgICBlbmQKICAgIGVuZAplbmQpCgpsb2NhbCBBdXRvbWF0aWNzVGFiID0gV2luZG93OkNyZWF0ZVRhYih7IE5hbWUg",
+"PSAnQXV0b21hdGljcycsIEljb24gPSAncmJ4YXNzZXRpZDovLzg2MDg0ODgyNTgyMjc3JyB9KQoKYXV0b1J1c2ggPSBBdXRvbWF0",
+"aWNzVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0F1dG8gUnVzaCcsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAg",
+"PSAnQXV0b21hdGljYWxseSBtb3ZlcyB0b3dhcmQgdGhlIG9wcG9zaW5nIGJhbGwgY2FycmllciBpbiByYW5nZS4nLAp9KQoKd2Fs",
+"a1RvTGluZSA9IEF1dG9tYXRpY3NUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnV2FsayBUbyBMaW5lJywKICAgIERlZmF1",
+"bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdNb3ZlcyB0aGUgcGxheWVyIHRvIHRoZSBsaW5lIGJlZm9yZSBwbGF5IHN0YXJ0cy4nLAp9",
+"KQoKYXV0b1J1c2hSZWFjdGlvblRpbWUgPSBBdXRvbWF0aWNzVGFiOkNyZWF0ZVNsaWRlcih7CiAgICBOYW1lID0gJ1JlYWN0aW9u",
+"IFRpbWUnLAogICAgTWluID0gMCwKICAgIE1heCA9IDEsCiAgICBEZWZhdWx0ID0gMC4xNSwKICAgIEluY3JlbWVudCA9IDAuMDEs",
+"CiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdBZGp1c3RzIGhvdyBxdWlja2x5IHRoZSBmZWF0dXJlIHJlc3BvbmRzLicsCn0p",
+"Cgp0YXNrLnNwYXduKGZ1bmN0aW9uKCkKICAgIHdoaWxlIHRydWUgZG8KICAgICAgICB0YXNrLndhaXQoKQoKICAgICAgICBpZiBu",
+"b3QgYXV0b1J1c2guVmFsdWUgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gcGxheWVyLkNoYXJh",
+"Y3RlcgogICAgICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgaHVtYW5vaWQgPSBj",
+"aGFyYWN0ZXI6RmluZEZpcnN0Q2hpbGRPZkNsYXNzKCdIdW1hbm9pZCcpCiAgICAgICAgaWYgbm90IGh1bWFub2lkIHRoZW4gY29u",
+"dGludWUgZW5kCgogICAgICAgIGxvY2FsIGhycCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcp",
+"CiAgICAgICAgaWYgbm90IGhycCB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBpZiB3YWxrVG9MaW5lLlZhbHVlIHRoZW4KICAg",
+"ICAgICAgICAgaWYgcmVwbGljYXRlZFN0b3JhZ2U6RmluZEZpcnN0Q2hpbGQoJ0ZsYWdzJykKICAgICAgICAgICAgICAgIGFuZCBy",
+"ZXBsaWNhdGVkU3RvcmFnZS5GbGFnczpGaW5kRmlyc3RDaGlsZCgnUG9zc2Vzc2lvblRhZycpCiAgICAgICAgICAgICAgICBhbmQg",
+"cmVwbGljYXRlZFN0b3JhZ2UuRmxhZ3M6RmluZEZpcnN0Q2hpbGQoJ1N0YXR1cycpCiAgICAgICAgICAgICAgICBhbmQgcmVwbGlj",
+"YXRlZFN0b3JhZ2UuRmxhZ3MuUG9zc2Vzc2lvblRhZy5WYWx1ZSB+PSBwbGF5ZXIuVGVhbS5OYW1lCiAgICAgICAgICAgICAgICBh",
+"bmQgcmVwbGljYXRlZFN0b3JhZ2UuRmxhZ3MuU3RhdHVzLlZhbHVlID09ICdQcmVQbGF5JyB0aGVuCgogICAgICAgICAgICAgICAg",
+"bG9jYWwgbGluZSA9IHdvcmtzcGFjZTpGaW5kRmlyc3RDaGlsZCgnTGluZURvd24nKQogICAgICAgICAgICAgICAgaWYgbGluZSB0",
+"aGVuCiAgICAgICAgICAgICAgICAgICAgaHVtYW5vaWQ6TW92ZVRvKGxpbmUuUG9zaXRpb24pCiAgICAgICAgICAgICAgICBlbmQK",
+"ICAgICAgICAgICAgZW5kCiAgICAgICAgZW5kCgogICAgICAgIGZvciBfLCB2IGluIG5leHQsIHBsYXllcnM6R2V0UGxheWVycygp",
+"IGRvCiAgICAgICAgICAgIGlmIHYgPT0gcGxheWVyIHRoZW4gY29udGludWUgZW5kCiAgICAgICAgICAgIGlmIHYuVGVhbSA9PSBw",
+"bGF5ZXIuVGVhbSB0aGVuIGNvbnRpbnVlIGVuZAogICAgICAgICAgICBpZiBub3Qgdi5DaGFyYWN0ZXIgdGhlbiBjb250aW51ZSBl",
+"bmQKCiAgICAgICAgICAgIGxvY2FsIGVuZW15Q2hhciA9IHYuQ2hhcmFjdGVyCiAgICAgICAgICAgIGxvY2FsIGVuZW15SHVtYW5v",
+"aWQgPSBlbmVteUNoYXI6RmluZEZpcnN0Q2hpbGRPZkNsYXNzKCdIdW1hbm9pZCcpCiAgICAgICAgICAgIGxvY2FsIGVuZW15SHJw",
+"ID0gZW5lbXlDaGFyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQYXJ0JykKICAgICAgICAgICAgaWYgbm90IGVuZW15SHVt",
+"YW5vaWQgb3Igbm90IGVuZW15SHJwIHRoZW4gY29udGludWUgZW5kCgogICAgICAgICAgICBsb2NhbCBmb290YmFsbCA9IGVuZW15",
+"Q2hhcjpGaW5kRmlyc3RDaGlsZCgnRm9vdGJhbGwnKQogICAgICAgICAgICBpZiBub3QgZm9vdGJhbGwgdGhlbiBjb250aW51ZSBl",
+"bmQKCiAgICAgICAgICAgIGxvY2FsIGZvb3RiYWxsUGFydCA9IGZvb3RiYWxsOkZpbmRGaXJzdENoaWxkV2hpY2hJc0EoJ0Jhc2VQ",
+"YXJ0JykKICAgICAgICAgICAgaWYgbm90IGZvb3RiYWxsUGFydCB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICAgICAgaWYgZW5l",
+"bXlIdW1hbm9pZC5XYWxrU3BlZWQgPD0gMCB0aGVuIGNvbnRpbnVlIGVuZAogICAgICAgICAgICBpZiBlbmVteUh1bWFub2lkLlBs",
+"YXRmb3JtU3RhbmQgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgICAgIGxvY2FsIHBpbmcgPSAwCiAgICAgICAgICAgIGlmIHN0",
+"YXRzIGFuZCBzdGF0czpGaW5kRmlyc3RDaGlsZCgnTmV0d29yaycpIAogICAgICAgICAgICAgICAgYW5kIHN0YXRzLk5ldHdvcms6",
+"RmluZEZpcnN0Q2hpbGQoJ1NlcnZlclN0YXRzSXRlbScpCiAgICAgICAgICAgICAgICBhbmQgc3RhdHMuTmV0d29yay5TZXJ2ZXJT",
+"dGF0c0l0ZW06RmluZEZpcnN0Q2hpbGQoJ0RhdGEgUGluZycpIHRoZW4KICAgICAgICAgICAgICAgIHBpbmcgPSBzdGF0cy5OZXR3",
+"b3JrLlNlcnZlclN0YXRzSXRlbVsnRGF0YSBQaW5nJ106R2V0VmFsdWUoKSAvIDEwMDAKICAgICAgICAgICAgZW5kCgogICAgICAg",
+"ICAgICBsb2NhbCBzcGVlZCA9IGVuZW15SHVtYW5vaWQuTW92ZURpcmVjdGlvbi5NYWduaXR1ZGUgPiAwIGFuZCBlbmVteUh1bWFu",
+"b2lkLldhbGtTcGVlZCBvciAwCiAgICAgICAgICAgIGxvY2FsIHByZWRpY3Rpb25UaW1lID0gcGluZyArIGF1dG9SdXNoUmVhY3Rp",
+"b25UaW1lLlZhbHVlCgogICAgICAgICAgICBsb2NhbCBwb3MgPSBmb290YmFsbFBhcnQuUG9zaXRpb24gKyAoZW5lbXlIdW1hbm9p",
+"ZC5Nb3ZlRGlyZWN0aW9uICogc3BlZWQgKiBwcmVkaWN0aW9uVGltZSAqIDIwKQoKICAgICAgICAgICAgbG9jYWwgZGlyZWN0aW9u",
+"ID0gcG9zIC0gZW5lbXlIcnAuUG9zaXRpb24KICAgICAgICAgICAgaWYgZGlyZWN0aW9uLk1hZ25pdHVkZSA+IDAgdGhlbgogICAg",
+"ICAgICAgICAgICAgcG9zICs9IGRpcmVjdGlvbi5Vbml0ICogKChocnAuUG9zaXRpb24gLSBwb3MpLk1hZ25pdHVkZSAvIDIwKQog",
+"ICAgICAgICAgICBlbmQKCiAgICAgICAgICAgIGh1bWFub2lkOk1vdmVUbyhwb3MpCiAgICAgICAgZW5kCiAgICBlbmQKZW5kKQoK",
+"QXV0b21hdGljc1RhYjpDcmVhdGVEaXZpZGVyKCkKCmF1dG9DYXRjaCA9IEF1dG9tYXRpY3NUYWI6Q3JlYXRlVG9nZ2xlKHsKICAg",
+"IE5hbWUgPSAnQXV0byBDYXRjaCcsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAnQXV0b21hdGljYWxseSBtb3ZlcyB0",
+"b3dhcmQgbmVhcmJ5IGNhdGNoIG9wcG9ydHVuaXRpZXMuJywKfSkKCmF1dG9DYXRjaFJhZGl1cyA9IEF1dG9tYXRpY3NUYWI6Q3Jl",
+"YXRlU2xpZGVyKHsKICAgIE5hbWUgPSAnQXV0byBDYXRjaCBEaXN0YW5jZScsCiAgICBNaW4gPSAwLAogICAgTWF4ID0gMjUsCiAg",
+"ICBEZWZhdWx0ID0gMCwKICAgIEluY3JlbWVudCA9IDAuMSwKICAgIFN1ZmZpeCA9ICcnLAogICAgVGlwID0gJ1NldHMgaG93IGZh",
+"ciB0aGUgYXV0byBjYXRjaCBkZXRlY3Rpb24gY2FuIHJlYWNoLicsCn0pCiAgICAKQXV0b21hdGljc1RhYjpDcmVhdGVEaXZpZGVy",
+"KCkKCmF1dG9Td2F0ID0gQXV0b21hdGljc1RhYjpDcmVhdGVUb2dnbGUoewogICAgTmFtZSA9ICdBdXRvIFN3YXQnLAogICAgRGVm",
+"YXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ0F1dG9tYXRpY2FsbHkgcmVhY3RzIHRvIG5lYXJieSBpbmNvbWluZyBiYWxscy4nLAp9",
+"KQoKYXV0b1N3YXRSYWRpdXMgPSBBdXRvbWF0aWNzVGFiOkNyZWF0ZVNsaWRlcih7CiAgICBOYW1lID0gJ0F1dG8gU3dhdCBEaXN0",
+"YW5jZScsCiAgICBNaW4gPSAwLAogICAgTWF4ID0gMjUsCiAgICBEZWZhdWx0ID0gMCwKICAgIEluY3JlbWVudCA9IDAuMSwKICAg",
+"IFN1ZmZpeCA9ICcnLAogICAgVGlwID0gJ1NldHMgaG93IGZhciB0aGUgYXV0byBzd2F0IGRldGVjdGlvbiBjYW4gcmVhY2guJywK",
+"fSkKCnRhc2suc3Bhd24oZnVuY3Rpb24oKQogICAgd2hpbGUgdHJ1ZSBkbwogICAgICAgIHRhc2sud2FpdCgpCgogICAgICAgIGlm",
+"IG5vdCBhdXRvQ2F0Y2guVmFsdWUgYW5kIG5vdCBhdXRvU3dhdC5WYWx1ZSB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2Nh",
+"bCBjaGFyYWN0ZXIgPSBwbGF5ZXIuQ2hhcmFjdGVyCiAgICAgICAgaWYgbm90IGNoYXJhY3RlciB0aGVuIGNvbnRpbnVlIGVuZAoK",
+"ICAgICAgICBsb2NhbCBodW1hbm9pZFJvb3RQYXJ0ID0gY2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkKCdIdW1hbm9pZFJvb3RQYXJ0",
+"JykKICAgICAgICBpZiBub3QgaHVtYW5vaWRSb290UGFydCB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2NhbCBiYWxsID0g",
+"ZmluZENsb3Nlc3RCYWxsKCkKICAgICAgICBpZiBub3QgYmFsbCB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2NhbCBkaXN0",
+"YW5jZSA9IChiYWxsLlBvc2l0aW9uIC0gaHVtYW5vaWRSb290UGFydC5Qb3NpdGlvbikuTWFnbml0dWRlCgogICAgICAgIGlmIGF1",
+"dG9DYXRjaC5WYWx1ZSBhbmQgZGlzdGFuY2UgPD0gYXV0b0NhdGNoUmFkaXVzLlZhbHVlIHRoZW4KICAgICAgICAgICAgcmVwbGlj",
+"YXRlZFN0b3JhZ2UuUmVtb3Rlcy5DaGFyYWN0ZXJTb3VuZEV2ZW50OkZpcmVTZXJ2ZXIoJ1BsYXllckFjdGlvbnMnLCBpc1ByYWN0",
+"aWNlIGFuZCAnY2F0Y2ggJyBvciAnY2F0Y2gnKQogICAgICAgIGVuZAoKICAgICAgICBpZiBhdXRvU3dhdC5WYWx1ZSBhbmQgZGlz",
+"dGFuY2UgPD0gYXV0b1N3YXRSYWRpdXMuVmFsdWUgdGhlbgogICAgICAgICAgICByZXBsaWNhdGVkU3RvcmFnZS5SZW1vdGVzLkNo",
+"YXJhY3RlclNvdW5kRXZlbnQ6RmlyZVNlcnZlcignUGxheWVyQWN0aW9ucycsICdzd2F0JykKICAgICAgICBlbmQKICAgIGVuZApl",
+"bmQpCiAgICAKQXV0b21hdGljc1RhYjpDcmVhdGVEaXZpZGVyKCkKICAgIAphdXRvQ2FwdGFpbiA9IEF1dG9tYXRpY3NUYWI6Q3Jl",
+"YXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnQXV0byBXaW4gQ2FwdGFpbicsCiAgICBEZWZhdWx0ID0gZmFsc2UsCiAgICBUaXAgPSAn",
+"QXV0b21hdGljYWxseSBtb3ZlcyB0b3dhcmQgdGhlIGZpbmlzaCBsaW5lIGR1cmluZyBjYXB0YWluIHNlbGVjdGlvbi4nLAp9KQoK",
+"dGFzay5zcGF3bihmdW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0KCkKCiAgICAgICAgaWYgbm90",
+"IGF1dG9DYXB0YWluLlZhbHVlIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxvY2FsIGNoYXJhY3RlciA9IHBsYXllci5DaGFy",
+"YWN0ZXIKICAgICAgICBpZiBub3QgY2hhcmFjdGVyIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxvY2FsIGhycCA9IGNoYXJh",
+"Y3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICAgICAgaWYgbm90IGhycCB0aGVuIGNvbnRpbnVlIGVu",
+"ZAoKICAgICAgICBmb3IgXywgdiBpbiBuZXh0LCB3b3Jrc3BhY2UuTW9kZWxzLkxvY2tlclJvb21BOkdldENoaWxkcmVuKCkgZG8K",
+"ICAgICAgICAgICAgaWYgdi5OYW1lOmxvd2VyKCk6ZmluZCgnZmluaXNobGluZScpIGFuZCBub3QgcGxheWVyLlRlYW0gdGhlbgog",
+"ICAgICAgICAgICAgICAgdjpHZXRQcm9wZXJ0eUNoYW5nZWRTaWduYWwoJ0NGcmFtZScpOkNvbm5lY3QoZnVuY3Rpb24oKQogICAg",
+"ICAgICAgICAgICAgICAgIGZvciBpID0gMSwgNCBkbwogICAgICAgICAgICAgICAgICAgICAgICB0YXNrLndhaXQoKQoKICAgICAg",
+"ICAgICAgICAgICAgICAgICAgaHJwLkNGcmFtZSA9IHYuQ0ZyYW1lCiAgICAgICAgICAgICAgICAgICAgZW5kCiAgICAgICAgICAg",
+"ICAgICBlbmQpCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCmVuZCkKICAgIApBdXRvbWF0aWNzVGFiOkNyZWF0",
+"ZURpdmlkZXIoKQogICAgCmF1dG9GcmVlemUgPSBBdXRvbWF0aWNzVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0F1dG8g",
+"RnJlZXplJywKICAgIERlZmF1bHQgPSBmYWxzZSwKICAgIFRpcCA9ICdUZW1wb3JhcmlseSBhbmNob3JzIHlvdXIgY2hhcmFjdGVy",
+"IG9uIGlucHV0LicsCn0pCgpmcmVlemVEdXJhdGlvbiA9IEF1dG9tYXRpY3NUYWI6Q3JlYXRlU2xpZGVyKHsKICAgIE5hbWUgPSAn",
+"RnJlZXplIER1cmF0aW9uJywKICAgIE1pbiA9IDAsCiAgICBNYXggPSAzLAogICAgRGVmYXVsdCA9IDAsCiAgICBJbmNyZW1lbnQg",
+"PSAwLjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdEdXJhdGlvbiB0aGUgZnJlZXplIHN0YXRlIGxhc3RzLicsCn0pCgpm",
+"cmVlemVLZXliaW5kID0gQXV0b21hdGljc1RhYjpDcmVhdGVLZXliaW5kKHsKICAgIE5hbWUgPSAnRnJlZXplIEtleWJpbmQnLAog",
+"ICAgRGVmYXVsdCA9IG5pbCwKICAgIFRpcCA9ICdLZXkgdXNlZCB0byB0cmlnZ2VyIGZyZWV6ZS4nLAp9KQoKdXNlcklucHV0U2Vy",
+"dmljZS5JbnB1dEJlZ2FuOkNvbm5lY3QoZnVuY3Rpb24oaW5wdXQpCiAgICBpZiBub3QgYXV0b0ZyZWV6ZS5WYWx1ZSB0aGVuIHJl",
+"dHVybiBlbmQKICAgIGlmIGZyZWV6ZUtleWJpbmQuVmFsdWUgYW5kIGlucHV0LktleUNvZGUgfj0gZnJlZXplS2V5YmluZC5WYWx1",
+"ZSB0aGVuIHJldHVybiBlbmQKCiAgICBsb2NhbCBjaGFyYWN0ZXIgPSBwbGF5ZXIuQ2hhcmFjdGVyCiAgICBpZiBub3QgY2hhcmFj",
+"dGVyIHRoZW4gcmV0dXJuIGVuZAoKICAgIGxvY2FsIGhycCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZCgnSHVtYW5vaWRSb290",
+"UGFydCcpCiAgICBpZiBub3QgaHJwIHRoZW4gcmV0dXJuIGVuZAoKICAgIGhycC5BbmNob3JlZCA9IHRydWUKCiAgICB0YXNrLmRl",
+"bGF5KGZyZWV6ZUR1cmF0aW9uLlZhbHVlLCBmdW5jdGlvbigpCiAgICAgICAgaWYgaHJwIHRoZW4KICAgICAgICAgICAgaHJwLkFu",
+"Y2hvcmVkID0gZmFsc2UKICAgICAgICBlbmQKICAgIGVuZCkKZW5kKQoKQXV0b21hdGljc1RhYjpDcmVhdGVEaXZpZGVyKCkKCmF1",
+"dG9RYiA9IEF1dG9tYXRpY3NUYWI6Q3JlYXRlVG9nZ2xlKHsKICAgIE5hbWUgPSAnQXV0byBRQicsCiAgICBEZWZhdWx0ID0gZmFs",
+"c2UsCiAgICBUaXAgPSAnQXV0b21hdGljYWxseSBwb3NpdGlvbnMgeW91ciBjaGFyYWN0ZXIgZm9yIHF1YXJ0ZXJiYWNrIHBsYXku",
+"JywKfSkKCmF1dG9RYk1ldGhvZCA9IEF1dG9tYXRpY3NUYWI6Q3JlYXRlRHJvcGRvd24oewogICAgTmFtZSA9ICdBdXRvIFFCIE1l",
+"dGhvZCcsCiAgICBPcHRpb25zID0geydXYWxrJywgJ1RlbGVwb3J0J30sCiAgICBEZWZhdWx0ID0gJ1dhbGsnLAogICAgVGlwID0g",
+"J1NlbGVjdHMgaG93IGF1dG9tYXRpYyBwb3NpdGlvbmluZyBpcyBwZXJmb3JtZWQuJywKfSkKCnRhc2suc3Bhd24oZnVuY3Rpb24o",
+"KQogICAgd2hpbGUgdHJ1ZSBkbwogICAgICAgIHRhc2sud2FpdCgpCgogICAgICAgIGlmIG5vdCBhdXRvUWIuVmFsdWUgdGhlbiBj",
+"b250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gcGxheWVyLkNoYXJhY3RlcgogICAgICAgIGlmIG5vdCBjaGFy",
+"YWN0ZXIgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgaHVtYW5vaWQgPSBjaGFyYWN0ZXI6RmluZEZpcnN0Q2hpbGRP",
+"ZkNsYXNzKCdIdW1hbm9pZCcpCiAgICAgICAgbG9jYWwgaHVtYW5vaWRSb290UGFydCA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGls",
+"ZCgnSHVtYW5vaWRSb290UGFydCcpCiAgICAgICAgaWYgbm90IGh1bWFub2lkIG9yIG5vdCBodW1hbm9pZFJvb3RQYXJ0IHRoZW4g",
+"Y29udGludWUgZW5kCgogICAgICAgIGxvY2FsIGJhbGwgPSBmaW5kQ2xvc2VzdEJhbGwoKQogICAgICAgIGlmIG5vdCBiYWxsIHRo",
+"ZW4gY29udGludWUgZW5kCgogICAgICAgIGlmIHJlcGxpY2F0ZWRTdG9yYWdlOkZpbmRGaXJzdENoaWxkKCdGbGFncycpCiAgICAg",
+"ICAgICAgIGFuZCByZXBsaWNhdGVkU3RvcmFnZS5GbGFnczpGaW5kRmlyc3RDaGlsZCgnUG9zc2Vzc2lvblRhZycpCiAgICAgICAg",
+"ICAgIGFuZCByZXBsaWNhdGVkU3RvcmFnZS5GbGFnczpGaW5kRmlyc3RDaGlsZCgnU3RhdHVzJykKICAgICAgICAgICAgYW5kIHJl",
+"cGxpY2F0ZWRTdG9yYWdlLkZsYWdzLlBvc3Nlc3Npb25UYWcuVmFsdWUgPT0gcGxheWVyLlRlYW0uTmFtZQogICAgICAgICAgICBh",
+"bmQgcmVwbGljYXRlZFN0b3JhZ2UuRmxhZ3MuU3RhdHVzLlZhbHVlID09ICdQcmVQbGF5JyB0aGVuCgogICAgICAgICAgICBpZiBh",
+"dXRvUWJNZXRob2QuVmFsdWUgPT0gJ1dhbGsnIHRoZW4KICAgICAgICAgICAgICAgIGh1bWFub2lkOk1vdmVUbyhiYWxsLlBvc2l0",
+"aW9uKQogICAgICAgICAgICBlbHNlaWYgYXV0b1FiTWV0aG9kLlZhbHVlID09ICdUZWxlcG9ydCcgdGhlbgogICAgICAgICAgICAg",
+"ICAgaHVtYW5vaWRSb290UGFydC5DRnJhbWUgPSBiYWxsLkNGcmFtZQogICAgICAgICAgICBlbmQKICAgICAgICBlbHNlCiAgICAg",
+"ICAgICAgIHBjYWxsKGZ1bmN0aW9uKCkKICAgICAgICAgICAgICAgIGJhbGwuQ0ZyYW1lID0gaHVtYW5vaWRSb290UGFydC5DRnJh",
+"bWUKICAgICAgICAgICAgZW5kKQogICAgICAgIGVuZAogICAgZW5kCmVuZCkKICAgIApBdXRvbWF0aWNzVGFiOkNyZWF0ZURpdmlk",
+"ZXIoKQogICAgCiAgICBhdXRvQm9vc3QgPSBBdXRvbWF0aWNzVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0F1dG8gQm9v",
+"c3QnLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ0F1dG9tYXRpY2FsbHkgYXNzaXN0cyBhZXJpYWwgbW92ZW1lbnQg",
+"bmVhciBpbmNvbWluZyBmb290YmFsbHMuJywKfSkKCnRhcmdldENsb3Nlc3RQbGF5ZXIgPSBBdXRvbWF0aWNzVGFiOkNyZWF0ZVRv",
+"Z2dsZSh7CiAgICBOYW1lID0gJ1RhcmdldCBQbGF5ZXIgQ2xvc2VyIFRvIFRoZSBCYWxsJywKICAgIERlZmF1bHQgPSBmYWxzZSwK",
+"ICAgIFRpcCA9ICdQcmlvcml0aXplcyBwbGF5ZXJzIGNsb3Nlc3QgdG8gdGhlIGZvb3RiYWxsLicsCn0pCgpib29zdFN0cmVuZ3Ro",
+"ID0gQXV0b21hdGljc1RhYjpDcmVhdGVTbGlkZXIoewogICAgTmFtZSA9ICdCb29zdCBTdHJlbmd0aCcsCiAgICBNaW4gPSAwLAog",
+"ICAgTWF4ID0gMywKICAgIERlZmF1bHQgPSAxLjUsCiAgICBJbmNyZW1lbnQgPSAwLjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRp",
+"cCA9ICdBZGp1c3RzIHRoZSBzdHJlbmd0aCBvZiB0aGUgYm9vc3QgZWZmZWN0LicsCn0pCgpib29zdFJhZGl1cyA9IEF1dG9tYXRp",
+"Y3NUYWI6Q3JlYXRlU2xpZGVyKHsKICAgIE5hbWUgPSAnQm9vc3QgUmFkaXVzJywKICAgIE1pbiA9IDAsCiAgICBNYXggPSAxNSwK",
+"ICAgIERlZmF1bHQgPSAwLAogICAgSW5jcmVtZW50ID0gMC4xLAogICAgU3VmZml4ID0gJycsCiAgICBUaXAgPSAnU2V0cyB0aGUg",
+"YWN0aXZhdGlvbiBkaXN0YW5jZSBmb3IgYm9vc3RpbmcuJywKfSkKCmJvb3N0UG93ZXIgPSBBdXRvbWF0aWNzVGFiOkNyZWF0ZVNs",
+"aWRlcih7CiAgICBOYW1lID0gJ0Jvb3N0IFBvd2VyJywKICAgIE1pbiA9IDUwLAogICAgTWF4ID0gNzAsCiAgICBEZWZhdWx0ID0g",
+"NTAsCiAgICBJbmNyZW1lbnQgPSAwLjEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdDb250cm9scyB0aGUgdXB3YXJkIGZv",
+"cmNlIGFwcGxpZWQgZHVyaW5nIGEgYm9vc3QuJywKfSkKCnRhc2suc3Bhd24oZnVuY3Rpb24oKQogICAgbG9jYWwgYWN0aXZlVHdl",
+"ZW4KCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0KCkKCiAgICAgICAgaWYgbm90IGF1dG9Cb29zdC5WYWx1ZSB0",
+"aGVuCiAgICAgICAgICAgIGlmIGFjdGl2ZVR3ZWVuIHRoZW4KICAgICAgICAgICAgICAgIGFjdGl2ZVR3ZWVuOkNhbmNlbCgpCiAg",
+"ICAgICAgICAgICAgICBhY3RpdmVUd2VlbiA9IG5pbAogICAgICAgICAgICBlbmQKCiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAg",
+"ICAgZW5kCgogICAgICAgIGxvY2FsIGNoYXIgPSBwbGF5ZXIuQ2hhcmFjdGVyCiAgICAgICAgaWYgbm90IGNoYXIgdGhlbiBjb250",
+"aW51ZSBlbmQKCiAgICAgICAgbG9jYWwgaHVtID0gY2hhcjpGaW5kRmlyc3RDaGlsZE9mQ2xhc3MoJ0h1bWFub2lkJykKICAgICAg",
+"ICBpZiBub3QgaHVtIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxvY2FsIGhycCA9IGNoYXI6RmluZEZpcnN0Q2hpbGQoJ0h1",
+"bWFub2lkUm9vdFBhcnQnKQogICAgICAgIGlmIG5vdCBocnAgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgaWYgaHVtOkdldFN0",
+"YXRlKCkgPT0gRW51bS5IdW1hbm9pZFN0YXRlVHlwZS5MYW5kZWQgdGhlbgogICAgICAgICAgICBpZiBhY3RpdmVUd2VlbiB0aGVu",
+"CiAgICAgICAgICAgICAgICBhY3RpdmVUd2VlbjpDYW5jZWwoKQogICAgICAgICAgICAgICAgYWN0aXZlVHdlZW4gPSBuaWwKICAg",
+"ICAgICAgICAgZW5kCgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIGVuZAoKICAgICAgICBsb2NhbCBteUhlYWQgPSBjaGFy",
+"OkZpbmRGaXJzdENoaWxkKCdIZWFkJykKICAgICAgICBpZiBub3QgbXlIZWFkIHRoZW4gY29udGludWUgZW5kCgogICAgICAgIGxv",
+"Y2FsIHRhcmdldFBsYXllcgoKICAgICAgICBpZiB0YXJnZXRDbG9zZXN0UGxheWVyLlZhbHVlIHRoZW4KICAgICAgICAgICAgbG9j",
+"YWwgbmVhcmVzdEJhbGwKICAgICAgICAgICAgbG9jYWwgbmVhcmVzdEJhbGxEaXN0ID0gbWF0aC5odWdlCgogICAgICAgICAgICBm",
+"b3IgXywgYmFsbCBpbiBuZXh0LCB3b3Jrc3BhY2U6R2V0Q2hpbGRyZW4oKSBkbwogICAgICAgICAgICAgICAgaWYgbm90IGJhbGw6",
+"SXNBKCdCYXNlUGFydCcpIHRoZW4gY29udGludWUgZW5kCiAgICAgICAgICAgICAgICBpZiBub3QgYmFsbC5OYW1lOmxvd2VyKCk6",
+"ZmluZCgnYmFsbCcpIHRoZW4gY29udGludWUgZW5kCgogICAgICAgICAgICAgICAgbG9jYWwgZGlzdCA9IChiYWxsLlBvc2l0aW9u",
+"IC0gbXlIZWFkLlBvc2l0aW9uKS5NYWduaXR1ZGUKCiAgICAgICAgICAgICAgICBpZiBkaXN0IDwgbmVhcmVzdEJhbGxEaXN0IHRo",
+"ZW4KICAgICAgICAgICAgICAgICAgICBuZWFyZXN0QmFsbERpc3QgPSBkaXN0CiAgICAgICAgICAgICAgICAgICAgbmVhcmVzdEJh",
+"bGwgPSBiYWxsCiAgICAgICAgICAgICAgICBlbmQKICAgICAgICAgICAgZW5kCgogICAgICAgICAgICBpZiBub3QgbmVhcmVzdEJh",
+"bGwgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgICAgIGxvY2FsIGNsb3Nlc3REaXN0ID0gbWF0aC5odWdlCgogICAgICAgICAg",
+"ICBmb3IgXywgdiBpbiBuZXh0LCBwbGF5ZXJzOkdldFBsYXllcnMoKSBkbwogICAgICAgICAgICAgICAgaWYgdiA9PSBwbGF5ZXIg",
+"dGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgICAgICAgICBsb2NhbCBjaGFyYWN0ZXIgPSB2LkNoYXJhY3RlcgogICAgICAgICAg",
+"ICAgICAgaWYgbm90IGNoYXJhY3RlciB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICAgICAgICAgIGxvY2FsIGhlYWQgPSBjaGFy",
+"YWN0ZXI6RmluZEZpcnN0Q2hpbGQoJ0hlYWQnKQogICAgICAgICAgICAgICAgaWYgbm90IGhlYWQgdGhlbiBjb250aW51ZSBlbmQK",
+"CiAgICAgICAgICAgICAgICBsb2NhbCBkaXN0ID0gKGhlYWQuUG9zaXRpb24gLSBuZWFyZXN0QmFsbC5Qb3NpdGlvbikuTWFnbml0",
+"dWRlCgogICAgICAgICAgICAgICAgaWYgZGlzdCA8IGNsb3Nlc3REaXN0IHRoZW4KICAgICAgICAgICAgICAgICAgICBjbG9zZXN0",
+"RGlzdCA9IGRpc3QKICAgICAgICAgICAgICAgICAgICB0YXJnZXRQbGF5ZXIgPSB2CiAgICAgICAgICAgICAgICBlbmQKICAgICAg",
+"ICAgICAgZW5kCiAgICAgICAgZWxzZQogICAgICAgICAgICBsb2NhbCBjbG9zZXN0RGlzdCA9IG1hdGguaHVnZQoKICAgICAgICAg",
+"ICAgZm9yIF8sIHYgaW4gbmV4dCwgcGxheWVyczpHZXRQbGF5ZXJzKCkgZG8KICAgICAgICAgICAgICAgIGlmIHYgPT0gcGxheWVy",
+"IHRoZW4gY29udGludWUgZW5kCgogICAgICAgICAgICAgICAgbG9jYWwgY2hhcmFjdGVyID0gdi5DaGFyYWN0ZXIKICAgICAgICAg",
+"ICAgICAgIGlmIG5vdCBjaGFyYWN0ZXIgdGhlbiBjb250aW51ZSBlbmQKCiAgICAgICAgICAgICAgICBsb2NhbCBoZWFkID0gY2hh",
+"cmFjdGVyOkZpbmRGaXJzdENoaWxkKCdIZWFkJykKICAgICAgICAgICAgICAgIGlmIG5vdCBoZWFkIHRoZW4gY29udGludWUgZW5k",
+"CgogICAgICAgICAgICAgICAgbG9jYWwgZGlzdCA9IChoZWFkLlBvc2l0aW9uIC0gbXlIZWFkLlBvc2l0aW9uKS5NYWduaXR1ZGUK",
+"CiAgICAgICAgICAgICAgICBpZiBkaXN0IDwgY2xvc2VzdERpc3QgdGhlbgogICAgICAgICAgICAgICAgICAgIGNsb3Nlc3REaXN0",
+"ID0gZGlzdAogICAgICAgICAgICAgICAgICAgIHRhcmdldFBsYXllciA9IHYKICAgICAgICAgICAgICAgIGVuZAogICAgICAgICAg",
+"ICBlbmQKICAgICAgICBlbmQKCiAgICAgICAgaWYgbm90IHRhcmdldFBsYXllciB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBs",
+"b2NhbCBjaGFyYWN0ZXIgPSB0YXJnZXRQbGF5ZXIuQ2hhcmFjdGVyCiAgICAgICAgaWYgbm90IGNoYXJhY3RlciB0aGVuIGNvbnRp",
+"bnVlIGVuZAoKICAgICAgICBsb2NhbCBoZWFkID0gY2hhcmFjdGVyOkZpbmRGaXJzdENoaWxkKCdIZWFkJykKICAgICAgICBpZiBu",
+"b3QgaGVhZCB0aGVuIGNvbnRpbnVlIGVuZAoKICAgICAgICBsb2NhbCB0YXJnZXRIdW1hbm9pZCA9IGNoYXJhY3RlcjpGaW5kRmly",
+"c3RDaGlsZE9mQ2xhc3MoJ0h1bWFub2lkJykKICAgICAgICBpZiBub3QgdGFyZ2V0SHVtYW5vaWQgdGhlbiBjb250aW51ZSBlbmQK",
+"CiAgICAgICAgbG9jYWwgbXlTdGF0ZSA9IGh1bTpHZXRTdGF0ZSgpCiAgICAgICAgbG9jYWwgdGFyZ2V0U3RhdGUgPSB0YXJnZXRI",
+"dW1hbm9pZDpHZXRTdGF0ZSgpCgogICAgICAgIGxvY2FsIGRpc3RhbmNlID0gKGhlYWQuUG9zaXRpb24gLSBteUhlYWQuUG9zaXRp",
+"b24pLk1hZ25pdHVkZQoKICAgICAgICBpZiBkaXN0YW5jZSA+IGJvb3N0UmFkaXVzLlZhbHVlIHRoZW4KICAgICAgICAgICAgY29u",
+"dGludWUKICAgICAgICBlbmQKCiAgICAgICAgaWYgbXlTdGF0ZSB+PSBFbnVtLkh1bWFub2lkU3RhdGVUeXBlLkp1bXBpbmcKICAg",
+"ICAgICAgICAgYW5kIG15U3RhdGUgfj0gRW51bS5IdW1hbm9pZFN0YXRlVHlwZS5GcmVlZmFsbCB0aGVuCiAgICAgICAgICAgIGNv",
+"bnRpbnVlCiAgICAgICAgZW5kCgogICAgICAgIGlmIHRhcmdldFN0YXRlIH49IEVudW0uSHVtYW5vaWRTdGF0ZVR5cGUuSnVtcGlu",
+"ZwogICAgICAgICAgICBhbmQgdGFyZ2V0U3RhdGUgfj0gRW51bS5IdW1hbm9pZFN0YXRlVHlwZS5GcmVlZmFsbCB0aGVuCiAgICAg",
+"ICAgICAgIGNvbnRpbnVlCiAgICAgICAgZW5kCgogICAgICAgIGxvY2FsIHNwZWVkID0gbWF0aC5tYXgoaHVtLldhbGtTcGVlZCAq",
+"IGJvb3N0U3RyZW5ndGguVmFsdWUsIDEpCiAgICAgICAgbG9jYWwgdGFyZ2V0UG9zID0gaGVhZC5Qb3NpdGlvbgoKICAgICAgICBs",
+"b2NhbCBkdXJhdGlvbiA9IG1hdGgubWF4KChocnAuUG9zaXRpb24gLSB0YXJnZXRQb3MpLk1hZ25pdHVkZSAvIHNwZWVkLCAwLjAx",
+"KQoKICAgICAgICBpZiBhY3RpdmVUd2VlbiB0aGVuCiAgICAgICAgICAgIGFjdGl2ZVR3ZWVuOkNhbmNlbCgpCiAgICAgICAgZW5k",
+"CgogICAgICAgIGFjdGl2ZVR3ZWVuID0gdHdlZW5TZXJ2aWNlOkNyZWF0ZSgKICAgICAgICAgICAgaHJwLAogICAgICAgICAgICBU",
+"d2VlbkluZm8ubmV3KGR1cmF0aW9uLCBFbnVtLkVhc2luZ1N0eWxlLkxpbmVhciksCiAgICAgICAgICAgIHsKICAgICAgICAgICAg",
+"ICAgIENGcmFtZSA9IENGcmFtZS5uZXcodGFyZ2V0UG9zKQogICAgICAgICAgICB9CiAgICAgICAgKQoKICAgICAgICBhY3RpdmVU",
+"d2VlbjpQbGF5KCkKCiAgICAgICAgYWN0aXZlVHdlZW4uQ29tcGxldGVkOk9uY2UoZnVuY3Rpb24oc3RhdGUpCiAgICAgICAgICAg",
+"IGlmIHN0YXRlIH49IEVudW0uUGxheWJhY2tTdGF0ZS5Db21wbGV0ZWQgdGhlbgogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAg",
+"ICAgICAgIGVuZAoKICAgICAgICAgICAgaHJwLkFzc2VtYmx5TGluZWFyVmVsb2NpdHkgPSBWZWN0b3IzLm5ldygKICAgICAgICAg",
+"ICAgICAgIGhycC5Bc3NlbWJseUxpbmVhclZlbG9jaXR5LlgsCiAgICAgICAgICAgICAgICBib29zdFBvd2VyLlZhbHVlLAogICAg",
+"ICAgICAgICAgICAgaHJwLkFzc2VtYmx5TGluZWFyVmVsb2NpdHkuWgogICAgICAgICAgICApCiAgICAgICAgZW5kKQogICAgZW5k",
+"CmVuZCkKCmxvY2FsIE1pc2NUYWIgPSBXaW5kb3c6Q3JlYXRlVGFiKHsgTmFtZSA9ICdNaXNjJywgSWNvbiA9ICdyYnhhc3NldGlk",
+"Oi8vMTI5MDgyNTU2OTQ2NzEzJyB9KQoKZnBzQ2FwID0gTWlzY1RhYjpDcmVhdGVTbGlkZXIoewogICAgTmFtZSA9ICdVbmNhcCBG",
+"UFMgQW1vdW50JywKICAgIE1pbiA9IDMwLAogICAgTWF4ID0gMjQwLAogICAgRGVmYXVsdCA9IDI0MCwKICAgIEluY3JlbWVudCA9",
+"IDEsCiAgICBTdWZmaXggPSAnJywKICAgIFRpcCA9ICdTZXRzIHRoZSBtYXhpbXVtIEZQUyBsaW1pdC4nLAp9KQoKdGFzay5zcGF3",
+"bihmdW5jdGlvbigpCiAgICB3aGlsZSB0cnVlIGRvCiAgICAgICAgdGFzay53YWl0KCkKCiAgICAgICAgc2V0ZnBzY2FwKGZwc0Nh",
+"cC5WYWx1ZSkKICAgIGVuZAplbmQpCgphbnRpQWRtaW4gPSBNaXNjVGFiOkNyZWF0ZVRvZ2dsZSh7CiAgICBOYW1lID0gJ0FudGkg",
+"QWRtaW4nLAogICAgRGVmYXVsdCA9IGZhbHNlLAogICAgVGlwID0gJ0F1dG9tYXRpY2FsbHkgcmVhY3RzIHdoZW4gYWRtaW5pc3Ry",
+"YXRvcnMgYXJlIGRldGVjdGVkLicsCiAgICBLZXliaW5kID0gbmlsLAp9KQoKdGFzay5zcGF3bihmdW5jdGlvbigpCiAgICB3aGls",
+"ZSB0YXNrLndhaXQoKSBkbwogICAgICAgIGxvY2FsIHBsYXllckd1aSA9IHBsYXllcjpGaW5kRmlyc3RDaGlsZCgiUGxheWVyR3Vp",
+"IikKICAgICAgICBpZiBub3QgcGxheWVyR3VpIHRoZW4gY29udGludWUgZW5kCiAgICAgICAgCiAgICAgICAgbG9jYWwgbWlzY1Rl",
+"eHQgPSBwbGF5ZXJHdWk6RmluZEZpcnN0Q2hpbGQoIk1pc2NUZXh0IikKICAgICAgICBpZiBub3QgbWlzY1RleHQgdGhlbiBjb250",
+"aW51ZSBlbmQKICAgICAgICAKICAgICAgICBsb2NhbCBpc1ZJUCA9IG1pc2NUZXh0OkZpbmRGaXJzdENoaWxkKCJJc1ZJUCIpCiAg",
+"ICAgICAgaWYgbm90IGlzVklQIHRoZW4gY29udGludWUgZW5kCiAgICAgICAgCiAgICAgICAgaWYgaXNWSVAuVmlzaWJsZSA9PSB0",
+"cnVlIHRoZW4gY29udGludWUgZW5kCiAgICAgICAgCiAgICAgICAgZm9yIF8sIGFkbWluIGluIG5leHQsIHBsYXllcnM6R2V0UGxh",
+"eWVycygpIGRvCiAgICAgICAgICAgIGlmIGFkbWluID09IHBsYXllciB0aGVuIGNvbnRpbnVlIGVuZAogICAgICAgICAgICAKICAg",
+"ICAgICAgICAgbG9jYWwgc3dhZ0RhdGEgPSBhZG1pbjpGaW5kRmlyc3RDaGlsZCgiU3dhZ0RhdGEiKQogICAgICAgICAgICBpZiBu",
+"b3Qgc3dhZ0RhdGEgdGhlbiBjb250aW51ZSBlbmQKICAgICAgICAgICAgCiAgICAgICAgICAgIGxvY2FsIGFkbWluVGFnID0gc3dh",
+"Z0RhdGE6RmluZEZpcnN0Q2hpbGQoIkFkbWluIikKICAgICAgICAgICAgaWYgbm90IGFkbWluVGFnIHRoZW4gY29udGludWUgZW5k",
+"CiAgICAgICAgICAgIAogICAgICAgICAgICBpZiBhZG1pblRhZy5WYWx1ZSB+PSAiIiBhbmQgYW50aUFkbWluLlZhbHVlIHRoZW4K",
+"ICAgICAgICAgICAgICAgIHBsYXllcjpLaWNrKCJbQWVyb10gRGV0ZWN0ZWQgQWRtaW5cbk5hbWU6ICIgLi4gYWRtaW4uTmFtZSAu",
+"LiAiXG5JRDogIiAuLiBhZG1pbi5Vc2VySWQpCiAgICAgICAgICAgIGVuZAogICAgICAgIGVuZAogICAgZW5kCmVuZCkKCnNtb290",
+"aFJlcGxheSA9IE1pc2NUYWI6Q3JlYXRlVG9nZ2xlKHsKCQlOYW1lID0gJ1Ntb290aCBSZXBsYXknLAoJCURlZmF1bHQgPSBmYWxz",
+"ZSwKCQlUaXAgPSAnU21vb3RocyByZXBsYXkgcGxheWJhY2sgZm9yIGltcHJvdmVkIHZpc3VhbCBxdWFsaXR5LicsCgkJS2V5Ymlu",
+"ZCA9IG5pbCwKCX0pCgoJcmVwbGF5RlBTID0gTWlzY1RhYjpDcmVhdGVTbGlkZXIoewoJCU5hbWUgPSAnUmVwbGF5IEZyYW1lIFBl",
+"ciBTZWNvbmQnLAoJCU1pbiA9IDksCgkJTWF4ID0gMTIwLAoJCURlZmF1bHQgPSA5LAoJCUluY3JlbWVudCA9IDEsCgkJVGlwID0g",
+"J1NldHMgdGhlIHJlcGxheSBwbGF5YmFjayBmcmFtZSByYXRlLicsCgl9KQogICAgCmlmIG5vdCBpc1ByYWN0aWNlIHRoZW4KCgls",
+"b2NhbCBwbGF5ZXIgPSBnYW1lOkdldFNlcnZpY2UoJ1BsYXllcnMnKS5Mb2NhbFBsYXllcgoJbG9jYWwgcmVwbGljYXRlZFN0b3Jh",
+"Z2UgPSBnYW1lOkdldFNlcnZpY2UoJ1JlcGxpY2F0ZWRTdG9yYWdlJykKCWxvY2FsIHJ1blNlcnZpY2UgPSBnYW1lOkdldFNlcnZp",
+"Y2UoJ1J1blNlcnZpY2UnKQoKCWxvY2FsIHJlbW90ZSA9IHJlcGxpY2F0ZWRTdG9yYWdlOldhaXRGb3JDaGlsZCgnUmVtb3Rlcycp",
+"OldhaXRGb3JDaGlsZCgnQ2hhcmFjdGVyU291bmRFdmVudCcpCglsb2NhbCBoZWFydGJlYXQgPSBydW5TZXJ2aWNlLkhlYXJ0YmVh",
+"dAoKCWxvY2FsIHRyYW5zaXRpb24gPSBwbGF5ZXI6V2FpdEZvckNoaWxkKCdQbGF5ZXJHdWknKTpXYWl0Rm9yQ2hpbGQoJ01haW5H",
+"dWknKTpXYWl0Rm9yQ2hpbGQoJ1RyYW5zaXRpb24nKQoKCWxvY2FsIGhvbWVDYW1lcmEgPSBDRnJhbWUuQW5nbGVzKC0wLjI2MTc5",
+"OTM4Nzc5OTE0OTQsIDAsIDApCglsb2NhbCBhd2F5Q2FtZXJhID0gQ0ZyYW1lLkFuZ2xlcygwLjI2MTc5OTM4Nzc5OTE0OTQsIG1h",
+"dGgucGksIDApCgoJbG9jYWwgY2FtZXJhT2Zmc2V0ID0gQ0ZyYW1lLm5ldygwLCAwLCAxOSkKCglsb2NhbCBsaW1icyA9IHsKCQkn",
+"VG9yc28nLAoJCSdMZWZ0IEFybScsCgkJJ1JpZ2h0IEFybScsCgkJJ0xlZnQgTGVnJywKCQknUmlnaHQgTGVnJywKCQknSGVhZCcK",
+"CX0KCgl0YXNrLnNwYXduKGZ1bmN0aW9uKCkKCQl3aGlsZSB0cnVlIGRvCgkJCXRhc2sud2FpdCgpCgoJCQlsb2NhbCByZXBsYXlT",
+"Y3JpcHQgPSBwbGF5ZXIuUGxheWVyU2NyaXB0czpGaW5kRmlyc3RDaGlsZCgnQ2xpZW50UmVwbGF5JykKCQkJaWYgcmVwbGF5U2Ny",
+"aXB0IHRoZW4KCQkJCXJlcGxheVNjcmlwdC5FbmFibGVkID0gbm90IHNtb290aFJlcGxheS5WYWx1ZQoJCQllbmQKCQllbmQKCWVu",
+"ZCkKCglsb2NhbCByZXBsYXkgPSBmdW5jdGlvbihkYXRhLCBjaGFyYWN0ZXJzKQoJCWxvY2FsIHJlcGxheUJhbGwgPSB3b3Jrc3Bh",
+"Y2U6V2FpdEZvckNoaWxkKCdSZXBsYXlCYWxsJykKCQlsb2NhbCBjYW1lcmEgPSB3b3Jrc3BhY2UuQ3VycmVudENhbWVyYQoKCQlj",
+"YW1lcmEuQ2FtZXJhVHlwZSA9IEVudW0uQ2FtZXJhVHlwZS5TY3JpcHRhYmxlCgkJY2FtZXJhLkNhbWVyYVN1YmplY3QgPSByZXBs",
+"YXlCYWxsCgoJCWxvY2FsIGNhbWVyYVJvdGF0aW9uID0gZGF0YS5jaGFuZ2VzWzFdLnBvc3MgPT0gJ2gnIGFuZCBob21lQ2FtZXJh",
+"IG9yIGF3YXlDYW1lcmEKCgkJbG9jYWwgY3VycmVudENoYW5nZSA9IDEKCQlsb2NhbCBoaWdoZXN0WSA9IDE4CgkJbG9jYWwgY2Ft",
+"ZXJhVGlsdCA9IHRydWUKCgkJbG9jYWwgcGxheWJhY2sgPSAxCgkJbG9jYWwgcmVjb3JkZWRGUFMgPSBkYXRhLmZwcwoKCQlsb2Nh",
+"bCBhY2N1bXVsYXRvciA9IDAKCQlsb2NhbCBsYXN0ID0gdGljaygpCgoJCWxvY2FsIGdldEZyYW1lID0gZnVuY3Rpb24oaW5kZXgp",
+"CgkJCWxvY2FsIG1heEZyYW1lcyA9ICNkYXRhLmJhbGwKCQkJaWYgaW5kZXggPCAxIHRoZW4gcmV0dXJuIDEgZW5kCgkJCWlmIGlu",
+"ZGV4ID4gbWF4RnJhbWVzIHRoZW4gcmV0dXJuIG1heEZyYW1lcyBlbmQKCQkJcmV0dXJuIGluZGV4CgkJZW5kCgoJCWxvY2FsIGlu",
+"dGVycG9sYXRlID0gZnVuY3Rpb24oYSwgYiwgYWxwaGEpCgkJCXJldHVybiBhOkxlcnAoYiwgYWxwaGEpCgkJZW5kCgoJCXdoaWxl",
+"IHBsYXliYWNrIDwgI2RhdGEuYmFsbCBkbwoJCQlpZiByZXBsaWNhdGVkU3RvcmFnZS5GbGFncy5TdGF0dXNUYWcuVmFsdWUgfj0g",
+"J1JFUExBWScgdGhlbgoJCQkJYnJlYWsKCQkJZW5kCgoJCQlpZiBjYW1lcmEuQ2FtZXJhVHlwZSB+PSBFbnVtLkNhbWVyYVR5cGUu",
+"U2NyaXB0YWJsZSB0aGVuCgkJCQlicmVhawoJCQllbmQKCgkJCWxvY2FsIHJlcGxheUZQU1ZhbHVlID0gcmVwbGF5RlBTLlZhbHVl",
+"CgkJCWxvY2FsIHJlcGxheURlbHRhID0gMSAvIHJlcGxheUZQU1ZhbHVlCgoJCQlsb2NhbCBub3cgPSB0aWNrKCkKCQkJYWNjdW11",
+"bGF0b3IgKz0gbm93IC0gbGFzdAoJCQlsYXN0ID0gbm93CgoJCQl3aGlsZSBhY2N1bXVsYXRvciA+PSByZXBsYXlEZWx0YSBkbwoJ",
+"CQkJcGxheWJhY2sgKz0gcmVjb3JkZWRGUFMgLyByZXBsYXlGUFNWYWx1ZQoJCQkJYWNjdW11bGF0b3IgLT0gcmVwbGF5RGVsdGEK",
+"CQkJZW5kCgoJCQlsb2NhbCBmcmFtZTEgPSBnZXRGcmFtZShtYXRoLmZsb29yKHBsYXliYWNrKSkKCQkJbG9jYWwgZnJhbWUyID0g",
+"Z2V0RnJhbWUobWF0aC5jZWlsKHBsYXliYWNrKSkKCQkJbG9jYWwgYWxwaGEgPSBwbGF5YmFjayAtIGZyYW1lMQoKCQkJZm9yIF8s",
+"IGNoYXJhY3RlciBpbiBuZXh0LCBjaGFyYWN0ZXJzIGRvCgkJCQlsb2NhbCBjaGFyYWN0ZXJEYXRhID0gZGF0YS5saW1ic1tjaGFy",
+"YWN0ZXIuTmFtZV0KCQkJCWlmIG5vdCBjaGFyYWN0ZXJEYXRhIHRoZW4gY2hhcmFjdGVyLlBhcmVudCA9IG5pbCBjb250aW51ZSBl",
+"bmQKCgkJCQlsb2NhbCBsaW1iRGF0YSA9IGNoYXJhY3RlckRhdGFbMV0KCQkJCWxvY2FsIGFjY2Vzc29yeURhdGEgPSBjaGFyYWN0",
+"ZXJEYXRhWzJdCgoJCQkJaWYgbm90IGxpbWJEYXRhWzFdIHRoZW4KCQkJCQljaGFyYWN0ZXIuUGFyZW50ID0gbmlsCgkJCQkJY29u",
+"dGludWUKCQkJCWVuZAoKCQkJCWxvY2FsIHRvcnNvMSA9IGxpbWJEYXRhWzFdWzJdW2ZyYW1lMV0KCQkJCWxvY2FsIHRvcnNvMiA9",
+"IGxpbWJEYXRhWzFdWzJdW2ZyYW1lMl0KCgkJCQlpZiBub3QgdG9yc28xIG9yIG5vdCB0b3JzbzIgdGhlbgoJCQkJCWNoYXJhY3Rl",
+"ci5QYXJlbnQgPSBuaWwKCQkJCQljb250aW51ZQoJCQkJZW5kCgoJCQkJbG9jYWwgdG9yc28gPSBpbnRlcnBvbGF0ZSh0b3JzbzEs",
+"IHRvcnNvMiwgYWxwaGEpCgoJCQkJZm9yIGkgPSAxLCAjbGltYnMgZG8KCQkJCQlsb2NhbCBsaW1iTmFtZSA9IGxpbWJzW2ldCgkJ",
+"CQkJbG9jYWwgbGltYiA9IGNoYXJhY3RlcjpGaW5kRmlyc3RDaGlsZChsaW1iTmFtZSkKCQkJCQlpZiBub3QgbGltYiB0aGVuIGNv",
+"bnRpbnVlIGVuZAoKCQkJCQlsb2NhbCByZXBsYXlMaW1iID0gbGltYkRhdGFbaV0KCQkJCQlpZiBub3QgcmVwbGF5TGltYiB0aGVu",
+"IGNvbnRpbnVlIGVuZAoKCQkJCQlsb2NhbCBjZjEgPSByZXBsYXlMaW1iWzJdW2ZyYW1lMV0KCQkJCQlsb2NhbCBjZjIgPSByZXBs",
+"YXlMaW1iWzJdW2ZyYW1lMl0KCgkJCQkJaWYgaSA9PSA0IHRoZW4KCQkJCQkJaWYgY2YxIGFuZCBjZjIgdGhlbgoJCQkJCQkJbG9j",
+"YWwgYW5nbGUgPSBjZjEgKyAoKGNmMiAtIGNmMSkgKiBhbHBoYSkKCgkJCQkJCQlsaW1iLkNGcmFtZSA9CgkJCQkJCQkJdG9yc28g",
+"KgoJCQkJCQkJCUNGcmFtZS5uZXcoLTAuNSwgLTEsIDApICoKCQkJCQkJCQlDRnJhbWUuZnJvbU9yaWVudGF0aW9uKGFuZ2xlLCAw",
+"LCAwKSAqCgkJCQkJCQkJQ0ZyYW1lLm5ldygwLCAtMSwgMCkKCQkJCQkJZW5kCgkJCQkJZWxzZWlmIGkgPT0gNSB0aGVuCgkJCQkJ",
+"CWlmIGNmMSBhbmQgY2YyIHRoZW4KCQkJCQkJCWxvY2FsIGFuZ2xlID0gY2YxICsgKChjZjIgLSBjZjEpICogYWxwaGEpCgoJCQkJ",
+"CQkJbGltYi5DRnJhbWUgPQoJCQkJCQkJCXRvcnNvICoKCQkJCQkJCQlDRnJhbWUubmV3KDAuNSwgLTEsIDApICoKCQkJCQkJCQlD",
+"RnJhbWUuZnJvbU9yaWVudGF0aW9uKGFuZ2xlLCAwLCAwKSAqCgkJCQkJCQkJQ0ZyYW1lLm5ldygwLCAtMSwgMCkKCQkJCQkJZW5k",
+"CgkJCQkJZWxzZQoJCQkJCQlpZiBjZjEgYW5kIGNmMiB0aGVuCgkJCQkJCQlsaW1iLkNGcmFtZSA9IGludGVycG9sYXRlKGNmMSwg",
+"Y2YyLCBhbHBoYSkKCQkJCQkJZWxzZWlmIGkgPT0gNiB0aGVuCgkJCQkJCQlsaW1iLkNGcmFtZSA9IHRvcnNvICogQ0ZyYW1lLm5l",
+"dygwLCAxLjUsIDApCgkJCQkJCWVuZAoJCQkJCWVuZAoJCQkJZW5kCgoJCQkJbG9jYWwgdW5pZm9ybSA9IGNoYXJhY3RlcjpGaW5k",
+"Rmlyc3RDaGlsZCgnVW5pZm9ybScpCgkJCQlpZiBhY2Nlc3NvcnlEYXRhIGFuZCB1bmlmb3JtIHRoZW4KCQkJCQlmb3IgbmFtZSwg",
+"aW5mbyBpbiBuZXh0LCBhY2Nlc3NvcnlEYXRhIGRvCgkJCQkJCWlmIHVuaWZvcm06RmluZEZpcnN0Q2hpbGQobmFtZSkgYW5kIGNo",
+"YXJhY3RlcjpGaW5kRmlyc3RDaGlsZChpbmZvWzFdKSB0aGVuCgkJCQkJCQl1bmlmb3JtW25hbWVdLkNGcmFtZSA9CgkJCQkJCQkJ",
+"Y2hhcmFjdGVyW2luZm9bMV1dLkNGcmFtZSAqIGluZm9bMl0KCQkJCQkJZW5kCgkJCQkJZW5kCgkJCQllbmQKCQkJZW5kCgoJCQls",
+"b2NhbCBiYWxsMSA9IGRhdGEuYmFsbFtmcmFtZTFdCgkJCWxvY2FsIGJhbGwyID0gZGF0YS5iYWxsW2ZyYW1lMl0KCgkJCWlmIGJh",
+"bGwxIGFuZCBiYWxsMiB0aGVuCgkJCQlyZXBsYXlCYWxsLkNGcmFtZSA9IGludGVycG9sYXRlKGJhbGwxLCBiYWxsMiwgYWxwaGEp",
+"CgkJCWVuZAoKCQkJaWYgaGlnaGVzdFkgPCByZXBsYXlCYWxsLlBvc2l0aW9uLlkgdGhlbgoJCQkJaGlnaGVzdFkgPSByZXBsYXlC",
+"YWxsLlBvc2l0aW9uLlkKCQkJZWxzZWlmIGhpZ2hlc3RZID4gNDkgYW5kIGNhbWVyYVRpbHQgdGhlbgoJCQkJbG9jYWwgeCA9IHNl",
+"bGVjdCgxLCBjYW1lcmFSb3RhdGlvbjpUb09yaWVudGF0aW9uKCkpCgoJCQkJY2FtZXJhUm90YXRpb24gKj0gQ0ZyYW1lLkFuZ2xl",
+"cygKCQkJCQl4ICogMyAqIG1hdGguY2xhbXAoKGhpZ2hlc3RZIC0gNTApIC8gOTksIDAsIDEpLAoJCQkJCTAsCgkJCQkJMAoJCQkJ",
+"KQoKCQkJCWNhbWVyYVRpbHQgPSBmYWxzZQoJCQllbmQKCgkJCWxvY2FsIHRhcmdldENhbWVyYQoKCQkJaWYgaGlnaGVzdFkgPiA0",
+"OSBhbmQgY2FtZXJhVGlsdCB0aGVuCgkJCQlsb2NhbCB4ID0gc2VsZWN0KDEsIGNhbWVyYVJvdGF0aW9uOlRvT3JpZW50YXRpb24o",
+"KSkKCgkJCQl0YXJnZXRDYW1lcmEgPQoJCQkJCUNGcmFtZS5uZXcocmVwbGF5QmFsbC5Qb3NpdGlvbikgKgoJCQkJCWNhbWVyYVJv",
+"dGF0aW9uICoKCQkJCQlDRnJhbWUuQW5nbGVzKAoJCQkJCQl4ICogMyAqIG1hdGguY2xhbXAoKGhpZ2hlc3RZIC0gNTApIC8gOTks",
+"IDAsIDEpLAoJCQkJCQkwLAoJCQkJCQkwCgkJCQkJKSAqCgkJCQkJY2FtZXJhT2Zmc2V0CgkJCWVsc2UKCQkJCXRhcmdldENhbWVy",
+"YSA9CgkJCQkJQ0ZyYW1lLm5ldyhyZXBsYXlCYWxsLlBvc2l0aW9uKSAqCgkJCQkJY2FtZXJhUm90YXRpb24gKgoJCQkJCWNhbWVy",
+"YU9mZnNldAoJCQllbmQKCgkJCWNhbWVyYS5DRnJhbWUgPSB0YXJnZXRDYW1lcmEKCgkJCWxvY2FsIGNoYW5nZSA9IGRhdGEuY2hh",
+"bmdlc1tjdXJyZW50Q2hhbmdlXQoKCQkJaWYgY2hhbmdlIGFuZCBjaGFuZ2UuZnJhbWUgPD0gZnJhbWUxIHRoZW4KCQkJCWN1cnJl",
+"bnRDaGFuZ2UgKz0gMQoKCQkJCWlmIGNoYW5nZS5mcmFtZSA9PSBmcmFtZTEgdGhlbgoJCQkJCWlmIGNoYW5nZS5wb3NzIGFuZCAo",
+"ZnJhbWUxID4gOSBhbmQgKGNoYW5nZS50dXJub3ZlciBvciBoaWdoZXN0WSA+IDQ5KSkgdGhlbgoJCQkJCQlsb2NhbCBuZXh0Um90",
+"YXRpb24gPQoJCQkJCQkJY2hhbmdlLnBvc3MgPT0gJ2gnIGFuZCBob21lQ2FtZXJhIG9yIGF3YXlDYW1lcmEKCgkJCQkJCWxvY2Fs",
+"IGR1cmF0aW9uID0KCQkJCQkJCShjaGFuZ2UudHVybm92ZXIgPT0gdHJ1ZSBvciByZXBsYXlCYWxsLlBvc2l0aW9uLlkgPj0gMTMp",
+"CgkJCQkJCQlhbmQgMC41CgkJCQkJCQlvciAoaGlnaGVzdFkgLyA1MDApCgoJCQkJCQlsb2NhbCBlbGFwc2VkID0gMAoJCQkJCQls",
+"b2NhbCBzdGFydFJvdGF0aW9uID0gY2FtZXJhUm90YXRpb24KCgkJCQkJCXdoaWxlIGVsYXBzZWQgPCBkdXJhdGlvbiBkbwoJCQkJ",
+"CQkJZWxhcHNlZCArPSBoZWFydGJlYXQ6V2FpdCgpCgoJCQkJCQkJY2FtZXJhUm90YXRpb24gPSBzdGFydFJvdGF0aW9uOkxlcnAo",
+"CgkJCQkJCQkJbmV4dFJvdGF0aW9uLAoJCQkJCQkJCW1hdGguY2xhbXAoZWxhcHNlZCAvIGR1cmF0aW9uLCAwLCAxKQoJCQkJCQkJ",
+"KQoKCQkJCQkJCWNhbWVyYS5DRnJhbWUgPQoJCQkJCQkJCUNGcmFtZS5uZXcocmVwbGF5QmFsbC5Qb3NpdGlvbikgKgoJCQkJCQkJ",
+"CWNhbWVyYVJvdGF0aW9uICoKCQkJCQkJCQljYW1lcmFPZmZzZXQKCQkJCQkJZW5kCgoJCQkJCQljYW1lcmFSb3RhdGlvbiA9IG5l",
+"eHRSb3RhdGlvbgoKCQkJCQllbHNlaWYgY2hhbmdlLmZyZWV6ZSB0aGVuCgkJCQkJCXRhc2sud2FpdChjaGFuZ2UuZnJlZXplKQoJ",
+"CQkJCWVuZAoJCQkJZW5kCgkJCWVuZAoKCQkJaGVhcnRiZWF0OldhaXQoKQoJCWVuZAoKCQlyZW1vdGU6RmlyZVNlcnZlcignUmVw",
+"bGF5RmluaXNoZWQnKQoKCQlpZiByZXBsaWNhdGVkU3RvcmFnZS5GbGFncy5TdGF0dXNUYWcuVmFsdWUgPT0gJ1JFUExBWScgdGhl",
+"bgoJCQlyZXBsaWNhdGVkU3RvcmFnZS5GbGFncy5TdGF0dXNUYWcuVmFsdWUgPSAnJwoJCWVuZAoKCQl0YXNrLndhaXQoMC4yKQoK",
+"CQlyZXBsYXlCYWxsOkRlc3Ryb3koKQoKCQlmb3IgXywgY2hhcmFjdGVyIGluIG5leHQsIGNoYXJhY3RlcnMgZG8KCQkJY2hhcmFj",
+"dGVyOkRlc3Ryb3koKQoJCWVuZAoKCQlkYXRhLnQgPSBuaWwKCQlkYXRhLmxpbWJzID0gbmlsCgkJZGF0YS5iYWxsID0gbmlsCgoJ",
+"CWNhbWVyYS5DYW1lcmFUeXBlID0gRW51bS5DYW1lcmFUeXBlLkN1c3RvbQoJCWNhbWVyYS5DYW1lcmFTdWJqZWN0ID0gcGxheWVy",
+"LkNoYXJhY3Rlci5IdW1hbm9pZAoJZW5kCgoJcmVtb3RlLk9uQ2xpZW50RXZlbnQ6Q29ubmVjdChmdW5jdGlvbihhY3Rpb24sIC4u",
+"LikKCQlpZiBhY3Rpb24gPT0gJ0NsaWVudFJlcGxheScgdGhlbgoJCQl3aGlsZSB0cmFuc2l0aW9uLlBvc2l0aW9uLlguU2NhbGUg",
+"PiAtMiBhbmQgdHJhbnNpdGlvbi5Qb3NpdGlvbi5YLlNjYWxlIDwgLTAuNSBkbwoJCQkJdGFzay53YWl0KCkKCQkJZW5kCgoJCQly",
+"ZXBsYXkoLi4uKQoJCWVuZAoJZW5kKQoKZW5k"
 }
-
-local Theme = {}
-for k, v in pairs(Themes['Minimal White']) do Theme[k] = v end
-
-local AeroLib = {}
-AeroLib.Flags = {}
-AeroLib.ThemeConnections = {}
-AeroLib.RainbowAccent = false
-AeroLib.RainbowSpeed = 5
-AeroLib.ShowNotifications = true
-AeroLib.ShowTooltips = true
-
-local SetupDirectories = function()
-    if delfolder and makefolder and isfolder then
-        if isfolder('aero') then
-            pcall(delfolder, 'aero')
+local b=table.concat(_A)
+local function dec(data)
+    local b64="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    data=data:gsub("[^%w%+%/%=]","")
+    local t={}
+    for i=1,#data,4 do
+        local n=0
+        for j=0,3 do
+            local c=data:sub(i+j,i+j)
+            local v=(b64:find(c,1,true) or 1)-1
+            n=n*64+v
         end
-        if isfolder('aero') then
-            if isfile and not isfile('aero/v2_marker.txt') then
-                pcall(delfolder, 'aero')
-                pcall(makefolder, 'aero')
-                if writefile then
-                    pcall(writefile, 'aero/v2_marker.txt', 'v2')
-                end
-            end
-        else
-            pcall(makefolder, 'aero')
-            if writefile then
-                pcall(writefile, 'aero/v2_marker.txt', 'v2')
-            end
-        end
+        local a1=math.floor(n/65536)%256
+        local a2=math.floor(n/256)%256
+        local a3=n%256
+        table.insert(t,string.char(a1))
+        if data:sub(i+2,i+2)~="=" then table.insert(t,string.char(a2)) end
+        if data:sub(i+3,i+3)~="=" then table.insert(t,string.char(a3)) end
     end
+    return table.concat(t)
 end
-SetupDirectories()
-
-local createInstance = function(className, properties)
-    local inst = Instance.new(className)
-    for k, v in pairs(properties or {}) do
-        inst[k] = v
-    end
-    return inst
+local s
+if crypt and crypt.base64decode then
+    s=crypt.base64decode(b)
+elseif base64decode then
+    s=base64decode(b)
+else
+    s=dec(b)
 end
-
-local getStringValue = function(val)
-    if type(val) == 'table' then
-        if val.Type == 'Color3' then
-            return string.format('RGB: %d, %d, %d', math.floor(val.R * 255), math.floor(val.G * 255), math.floor(val.B * 255))
-        elseif val.Type == 'EnumItem' then
-            return tostring(val.Name)
-        end
-        for _, v in pairs(val) do
-            if type(v) == 'string' or type(v) == 'number' then
-                return tostring(v)
-            end
-        end
-        return 'None'
-    end
-    return val ~= nil and tostring(val) or 'None'
-end
-
-local regTheme = function(instance, callback)
-    table.insert(AeroLib.ThemeConnections, function()
-        local success, hasParent = pcall(function() return instance and instance.Parent end)
-        if success and hasParent then
-            callback()
-            return true
-        end
-        return false
-    end)
-    callback()
-end
-
-local UpdateThemeAccent = function(newColor)
-    Theme.Accent = newColor
-    local alive = {}
-    for i = 1, #AeroLib.ThemeConnections do
-        local func = AeroLib.ThemeConnections[i]
-        if type(func) == 'function' then
-            local s, res = pcall(func)
-            if s and res ~= false then 
-                table.insert(alive, func) 
-            end
-        end
-    end
-    AeroLib.ThemeConnections = alive
-end
-
-local ApplySelectedTheme = function(themeName)
-    local targetTheme = Themes[themeName]
-    if not targetTheme then return end
-    for k, v in pairs(targetTheme) do
-        Theme[k] = v
-    end
-    local alive = {}
-    for i = 1, #AeroLib.ThemeConnections do
-        local func = AeroLib.ThemeConnections[i]
-        if type(func) == 'function' then
-            local s, res = pcall(func)
-            if s and res ~= false then 
-                table.insert(alive, func) 
-            end
-        end
-    end
-    AeroLib.ThemeConnections = alive
-end
-
-RunService.RenderStepped:Connect(function()
-    if AeroLib.RainbowAccent then
-        local hue = tick() * (AeroLib.RainbowSpeed / 100) % 1
-        UpdateThemeAccent(Color3.fromHSV(hue, 1, 1))
-    end
-end)
-
-local GetDarkerColor = function(color, factor)
-    local h, s, v = Color3.toHSV(color)
-    return Color3.fromHSV(h, s, math.clamp(v * factor, 0, 1))
-end
-
-local SerializeValue = function(val)
-    if typeof(val) == 'Color3' then
-        return {Type = 'Color3', R = val.R, G = val.G, B = val.B}
-    elseif typeof(val) == 'EnumItem' then
-        return {Type = 'EnumItem', EnumType = tostring(val.EnumType), Name = val.Name}
-    elseif typeof(val) == 'table' then
-        local tbl = {}
-        for k, v in pairs(val) do
-            tbl[k] = SerializeValue(v)
-        end
-        return tbl
-    end
-    return val
-end
-
-local DeserializeValue = function(val)
-    if type(val) == 'table' then
-        if val.Type == 'Color3' then
-            return Color3.new(val.R, val.G, val.B)
-        elseif val.Type == 'EnumItem' then
-            local success, enum = pcall(function() return Enum[val.EnumType][val.Name] end)
-            return success and enum or nil
-        else
-            local tbl = {}
-            for k, v in pairs(val) do
-                tbl[k] = DeserializeValue(v)
-            end
-            return tbl
-        end
-    end
-    return val
-end
-
-AeroLib.Notify = function(self, options)
-    if not AeroLib.ShowNotifications then return end
-    local Title = options.Title or 'Notification'
-    local Content = options.Content or 'Notification content goes here.'
-    local Duration = options.Duration or 3
-
-    local ScreenGui = uiParent:FindFirstChild('AeroUI')
-    if not ScreenGui then return end
-    
-    local NotifContainer = ScreenGui:FindFirstChild('NotifyContainer')
-    if not NotifContainer then return end
-
-    local Wrapper = createInstance('Frame', {
-        Parent = NotifContainer,
-        BackgroundTransparency = 1,
-        Size = UDim2.new(0, 260, 0, 0),
-        ClipsDescendants = true,
-        ZIndex = 200
-    })
-
-    local NotifCard = createInstance('CanvasGroup', {
-        Parent = Wrapper,
-        BackgroundColor3 = Theme.MainBG,
-        BackgroundTransparency = 0.35,
-        Size = UDim2.new(1, 0, 0, 75),
-        Position = UDim2.new(1, 300, 0, 0),
-        GroupTransparency = 1,
-        ZIndex = 200
-    })
-    createInstance('UICorner', {Parent = NotifCard, CornerRadius = UDim.new(0, 6)})
-    regTheme(NotifCard, function() NotifCard.BackgroundColor3 = Theme.MainBG end)
-
-    local TitleLbl = createInstance('TextLabel', {
-        Parent = NotifCard,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 0, 0, 10),
-        Size = UDim2.new(1, 0, 0, 16),
-        Font = Enum.Font.GothamBold,
-        Text = Title,
-        TextColor3 = Theme.Accent,
-        TextSize = 14,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        ZIndex = 201
-    })
-    regTheme(TitleLbl, function() TitleLbl.TextColor3 = Theme.Accent end)
-
-    local InfoLbl = createInstance('TextLabel', {
-        Parent = NotifCard,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 15, 0, 30),
-        Size = UDim2.new(1, -30, 0, 35),
-        Font = Enum.Font.Gotham,
-        Text = Content,
-        TextColor3 = Theme.TextSub,
-        TextSize = 12,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        TextWrapped = true,
-        ZIndex = 201
-    })
-    regTheme(InfoLbl, function() InfoLbl.TextColor3 = Theme.TextSub end)
-
-    local LineFrame = createInstance('Frame', {
-        Parent = NotifCard,
-        BackgroundColor3 = Theme.Accent,
-        BorderSizePixel = 0,
-        AnchorPoint = Vector2.new(0.5, 1),
-        Position = UDim2.new(0.5, 0, 1, 0),
-        Size = UDim2.new(1, 0, 0, 2),
-        ZIndex = 201
-    })
-    createInstance('UICorner', {Parent = LineFrame, CornerRadius = UDim.new(1, 0)})
-    regTheme(LineFrame, function() LineFrame.BackgroundColor3 = Theme.Accent end)
-
-    TweenService:Create(Wrapper, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0, 260, 0, 85)}):Play()
-    TweenService:Create(NotifCard, TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-        Position = UDim2.new(0, 0, 0, 0),
-        GroupTransparency = 0
-    }):Play()
-    TweenService:Create(LineFrame, TweenInfo.new(Duration, Enum.EasingStyle.Linear), {Size = UDim2.new(0, 0, 0, 2)}):Play()
-
-    task.delay(Duration, function()
-        local outTween = TweenService:Create(NotifCard, TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
-            Position = UDim2.new(1, 300, 0, 0),
-            GroupTransparency = 1
-        })
-        outTween:Play()
-        outTween.Completed:Wait()
-        TweenService:Create(Wrapper, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {Size = UDim2.new(0, 260, 0, 0)}):Play()
-        task.delay(0.3, function() Wrapper:Destroy() end)
-    end)
-end
-
-AeroLib.CreateWindow = function(self, options)
-    local WindowTitle = options.Title or 'ro'
-    local TitlePrefix = options.Prefix or 'Ae'
-    local defaultTheme = options.Theme or 'Minimal White'
-    
-    local ScreenGui = createInstance('ScreenGui', {
-        Name = 'AeroUI',
-        ResetOnSpawn = false,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-        Parent = uiParent
-    })
-    
-    if uiParent:FindFirstChild('AeroUI') and uiParent:FindFirstChild('AeroUI') ~= ScreenGui then
-        uiParent:FindFirstChild('AeroUI'):Destroy()
-    end
-
-    local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-
-    local MainGroup = createInstance('CanvasGroup', {
-        Name = 'MainGroup',
-        Parent = ScreenGui,
-        BackgroundColor3 = Theme.MainBG,
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(0.5, 0, 0.5, 0),
-        Size = UDim2.new(0, 580, 0, 360),
-        BorderSizePixel = 0
-    })
-    regTheme(MainGroup, function() MainGroup.BackgroundColor3 = Theme.MainBG end)
-    
-    local CurrentScale = 1
-    local MainScale = createInstance('UIScale', {Parent = MainGroup, Scale = CurrentScale})
-    local ScalesToUpdate = {MainScale}
-
-    local WindowObj = { Tabs = {}, CurrentTab = nil, ElementsList = {} }
-    
-    local MenuVisible = true
-    
-    local UpdateScale = function(newScale)
-        CurrentScale = newScale
-        if MenuVisible then
-            for i = 1, #ScalesToUpdate do
-                local scaleObj = ScalesToUpdate[i]
-                TweenService:Create(scaleObj, TweenInfo.new(0.2, Enum.EasingStyle.Quad), {Scale = CurrentScale}):Play()
-            end
-        end
-    end
-    
-    WindowObj.UpdateScale = function(self, newScale)
-        local scale = type(self) == 'number' and self or newScale
-        UpdateScale(scale)
-    end
-
-    createInstance('UICorner', {Parent = MainGroup, CornerRadius = UDim.new(0, 6)})
-
-    local MainStrokeFrame = createInstance('Frame', {
-        Name = 'StrokeFrame',
-        Parent = MainGroup,
-        BackgroundTransparency = 1,
-        Size = UDim2.new(1, 0, 1, 0)
-    })
-    createInstance('UICorner', {Parent = MainStrokeFrame, CornerRadius = UDim.new(0, 6)})
-    local MainStroke = createInstance('UIStroke', {Parent = MainStrokeFrame, Color = Theme.Border})
-    regTheme(MainStroke, function() MainStroke.Color = Theme.Border end)
-
-    local NotifyContainer = createInstance('Frame', {
-        Name = 'NotifyContainer',
-        Parent = ScreenGui,
-        BackgroundTransparency = 1,
-        AnchorPoint = Vector2.new(1, 1),
-        Position = UDim2.new(1, -20, 1, -20),
-        Size = UDim2.new(0, 300, 1, 0),
-        ZIndex = 100
-    })
-
-    createInstance('UIListLayout', {
-        Parent = NotifyContainer,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        VerticalAlignment = Enum.VerticalAlignment.Bottom,
-        HorizontalAlignment = Enum.HorizontalAlignment.Right,
-        Padding = UDim.new(0, 10)
-    })
-
-    local TooltipCard = createInstance('CanvasGroup', {
-        Name = 'TooltipCard',
-        Parent = ScreenGui,
-        BackgroundColor3 = Theme.MainBG,
-        BackgroundTransparency = 0.1,
-        Size = UDim2.new(0, 0, 0, 24),
-        Position = UDim2.new(0, 0, 0, 0),
-        BorderSizePixel = 0,
-        Visible = false,
-        GroupTransparency = 1,
-        ZIndex = 300
-    })
-    regTheme(TooltipCard, function() TooltipCard.BackgroundColor3 = Theme.MainBG end)
-    createInstance('UICorner', {Parent = TooltipCard, CornerRadius = UDim.new(0, 2)})
-    createInstance('UIPadding', {Parent = TooltipCard, PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10)})
-    
-    local TooltipLine = createInstance('Frame', {
-        Parent = TooltipCard,
-        BackgroundColor3 = Theme.Accent,
-        BorderSizePixel = 0,
-        Position = UDim2.new(0, -10, 0, 0),
-        Size = UDim2.new(0, 3, 1, 0),
-        ZIndex = 301
-    })
-    regTheme(TooltipLine, function() TooltipLine.BackgroundColor3 = Theme.Accent end)
-    
-    local TooltipText = createInstance('TextLabel', {
-        Parent = TooltipCard,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 0, 0, 0),
-        Size = UDim2.new(0, 0, 1, 0),
-        Font = Enum.Font.GothamMedium,
-        Text = '',
-        TextColor3 = Theme.TextMain,
-        TextSize = 11,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        AutomaticSize = Enum.AutomaticSize.X,
-        ZIndex = 301
-    })
-    regTheme(TooltipText, function() TooltipText.TextColor3 = Theme.TextMain end)
-
-    local tooltipActive = false
-    local activeHoveredElement = nil
-    local tooltipCurrentOffset = 20
-    local targetTooltipOffset = 20
-
-    local ShowTooltip = function(text, targetY)
-        if not AeroLib.ShowTooltips then return end
-        if not text or text == '' then return end
-        TooltipText.Text = text
-        TooltipCard.AutomaticSize = Enum.AutomaticSize.X
-        TooltipCard.Visible = true
-        tooltipActive = true
-        targetTooltipOffset = 0
-        
-        TweenService:Create(TooltipCard, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-            GroupTransparency = 0
-        }):Play()
-    end
-    
-    local HideTooltip = function()
-        tooltipActive = false
-        targetTooltipOffset = 20
-        TweenService:Create(TooltipCard, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
-            GroupTransparency = 1
-        }):Play()
-        task.delay(0.2, function() 
-            if not tooltipActive then
-                TooltipCard.Visible = false
-            end
-        end)
-    end
-
-    RunService.RenderStepped:Connect(function(dt)
-        if TooltipCard.Visible and activeHoveredElement then
-            tooltipCurrentOffset = tooltipCurrentOffset + (targetTooltipOffset - tooltipCurrentOffset) * math.clamp(dt * 15, 0, 1)
-            local targetY = activeHoveredElement.AbsolutePosition.Y + (activeHoveredElement.AbsoluteSize.Y / 2) - (TooltipCard.AbsoluteSize.Y / 2)
-            local mainX = MainGroup.AbsolutePosition.X + MainGroup.AbsoluteSize.X + 15 + tooltipCurrentOffset
-            TooltipCard.Position = UDim2.new(0, mainX, 0, targetY)
-        end
-    end)
-
-    local SetupTooltip = function(elementFrame, tipText)
-        if not tipText or tipText == '' then return end
-        elementFrame.MouseEnter:Connect(function()
-            activeHoveredElement = elementFrame
-            ShowTooltip(tipText, elementFrame.AbsolutePosition.Y)
-        end)
-        elementFrame.MouseLeave:Connect(function()
-            if activeHoveredElement == elementFrame then
-                activeHoveredElement = nil
-                HideTooltip()
-            end
-        end)
-    end
-
-    local MenuKeybind = Enum.KeyCode.RightControl
-
-    local ToggleMenuVisible = function(state)
-        if state ~= nil then MenuVisible = state else MenuVisible = not MenuVisible end
-        MainGroup.Interactable = MenuVisible
-        
-        if MenuVisible then
-            MainGroup.Visible = true
-            TweenService:Create(MainGroup, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {GroupTransparency = 0}):Play()
-            TweenService:Create(MainStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Transparency = 0}):Play()
-            for i = 1, #ScalesToUpdate do
-                local scaleObj = ScalesToUpdate[i]
-                TweenService:Create(scaleObj, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Scale = CurrentScale}):Play()
-            end
-        else
-            TweenService:Create(MainGroup, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {GroupTransparency = 1}):Play()
-            TweenService:Create(MainStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Transparency = 1}):Play()
-            for i = 1, #ScalesToUpdate do
-                local scaleObj = ScalesToUpdate[i]
-                TweenService:Create(scaleObj, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Scale = CurrentScale * 0.95}):Play()
-            end
-            task.delay(0.3, function() if not MenuVisible then MainGroup.Visible = false end end)
-        end
-    end
-
-    UserInputService.InputBegan:Connect(function(input, gpe)
-        if not gpe and input.KeyCode == MenuKeybind then ToggleMenuVisible() end
-    end)
-
-    if isMobile then
-        local ToggleBtn = createInstance('ImageButton', {
-            Parent = ScreenGui,
-            BackgroundColor3 = Theme.MainBG,
-            AnchorPoint = Vector2.new(0.5, 0),
-            Position = UDim2.new(0.5, 0, 0, 20),
-            Size = UDim2.new(0, 48, 0, 40),
-            AutoButtonColor = false,
-            Image = ''
-        })
-        createInstance('UICorner', {Parent = ToggleBtn, CornerRadius = UDim.new(0, 8)})
-        local btnStroke = createInstance('UIStroke', {Parent = ToggleBtn, Color = Theme.Border, ApplyStrokeMode = Enum.ApplyStrokeMode.Border})
-        regTheme(ToggleBtn, function() 
-            ToggleBtn.BackgroundColor3 = Theme.MainBG
-            btnStroke.Color = Theme.Border
-        end)
-
-        local TogTextFrame = createInstance('Frame', {
-            Parent = ToggleBtn,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 1, 0)
-        })
-
-        local TogText = createInstance('TextLabel', {
-            Parent = TogTextFrame,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 1, 0),
-            RichText = true,
-            Font = Enum.Font.GothamBold,
-            TextColor3 = Color3.fromRGB(255, 255, 255),
-            TextSize = 14,
-            Text = '<i>★</i>'
-        })
-        regTheme(TogText, function() TogText.TextColor3 = Theme.TextMain end)
-
-        local draggingTog, dragInputTog, dragStartTog, startPosTog
-        ToggleBtn.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-                draggingTog = true
-                dragStartTog = input.Position
-                startPosTog = ToggleBtn.Position
-            end
-        end)
-        ToggleBtn.InputChanged:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
-                dragInputTog = input
-            end
-        end)
-        UserInputService.InputChanged:Connect(function(input)
-            if input == dragInputTog and draggingTog then
-                local delta = input.Position - dragStartTog
-                ToggleBtn.Position = UDim2.new(startPosTog.X.Scale, startPosTog.X.Offset + delta.X, startPosTog.Y.Scale, startPosTog.Y.Offset + delta.Y)
-            end
-        end)
-        UserInputService.InputEnded:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-                draggingTog = false
-            end
-        end)
-        ToggleBtn.MouseButton1Click:Connect(function() ToggleMenuVisible() end)
-    end
-
-    local Topbar = createInstance('Frame', {
-        Name = 'Topbar',
-        Parent = MainGroup,
-        BackgroundColor3 = Theme.TopbarBG,
-        Size = UDim2.new(1, 0, 0, 48),
-        BorderSizePixel = 0,
-        ZIndex = 2
-    })
-    regTheme(Topbar, function() Topbar.BackgroundColor3 = Theme.TopbarBG end)
-
-    local TopbarBorder = createInstance('Frame', {
-        Parent = Topbar,
-        BackgroundColor3 = Theme.Border,
-        BorderSizePixel = 0,
-        Position = UDim2.new(0, 0, 1, -1),
-        Size = UDim2.new(1, 0, 0, 1)
-    })
-    regTheme(TopbarBorder, function() TopbarBorder.BackgroundColor3 = Theme.Border end)
-
-    local dragging, dragInput, dragStart, startPos
-    Topbar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPos = MainGroup.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-    Topbar.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            dragInput = input
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            local delta = input.Position - dragStart
-            TweenService:Create(MainGroup, TweenInfo.new(0.1, Enum.EasingStyle.Linear), {
-                Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-            }):Play()
-        end
-    end)
-
-    -- Custom Aero logo: star with vertical trail leading into "Aero"
-    local LogoContainer = createInstance('Frame', {
-        Parent = Topbar,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 14, 0, 0),
-        Size = UDim2.new(0, 110, 1, 0)
-    })
-
-    local StarLabel = createInstance('TextLabel', {
-        Parent = LogoContainer,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 0, 0, 2),
-        Size = UDim2.new(0, 22, 0, 20),
-        Font = Enum.Font.GothamBold,
-        Text = '★',
-        TextColor3 = Theme.Accent,
-        TextSize = 20,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        TextYAlignment = Enum.TextYAlignment.Center
-    })
-    regTheme(StarLabel, function() StarLabel.TextColor3 = Theme.Accent end)
-
-    -- Vertical trail from star down toward the text
-    local Trail = createInstance('Frame', {
-        Parent = LogoContainer,
-        BackgroundColor3 = Theme.Accent,
-        BorderSizePixel = 0,
-        Position = UDim2.new(0, 10, 0, 20),
-        Size = UDim2.new(0, 2, 0, 14),
-        ZIndex = 2
-    })
-    createInstance('UICorner', {Parent = Trail, CornerRadius = UDim.new(1, 0)})
-    local TrailGrad = createInstance('UIGradient', {
-        Parent = Trail,
-        Rotation = 90,
-        Transparency = NumberSequence.new({
-            NumberSequenceKeypoint.new(0, 0),
-            NumberSequenceKeypoint.new(0.55, 0.35),
-            NumberSequenceKeypoint.new(1, 1)
-        })
-    })
-    regTheme(Trail, function() Trail.BackgroundColor3 = Theme.Accent end)
-
-    -- Small trailing dots for extra trail feel
-    for i = 1, 3 do
-        local dot = createInstance('Frame', {
-            Parent = LogoContainer,
-            BackgroundColor3 = Theme.Accent,
-            BorderSizePixel = 0,
-            AnchorPoint = Vector2.new(0.5, 0.5),
-            Position = UDim2.new(0, 11, 0, 20 + (i * 4)),
-            Size = UDim2.new(0, 3 - (i * 0.4), 0, 3 - (i * 0.4)),
-            BackgroundTransparency = 0.25 * i,
-            ZIndex = 3
-        })
-        createInstance('UICorner', {Parent = dot, CornerRadius = UDim.new(1, 0)})
-        regTheme(dot, function()
-            if dot and dot.Parent then
-                dot.BackgroundColor3 = Theme.Accent
-            end
-        end)
-    end
-
-    local TitleLabel = createInstance('TextLabel', {
-        Parent = LogoContainer,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 22, 0, 0),
-        Size = UDim2.new(0, 80, 1, 0),
-        Font = Enum.Font.GothamBold,
-        Text = 'Aero',
-        TextColor3 = Theme.TextMain,
-        TextSize = 22,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextYAlignment = Enum.TextYAlignment.Center
-    })
-    regTheme(TitleLabel, function() TitleLabel.TextColor3 = Theme.TextMain end)
-
-    local titleBounds = Vector2.new(110, 48)
-    local cleanTitle = 'Aero' 
-
-    local profileText = 'Welcome, ' .. LocalPlayer.Name
-    local profileBounds = TextService:GetTextSize(profileText, 12, Enum.Font.Gotham, Vector2.new(1000, 48))
-
-    local ProfileBox = createInstance('Frame', {
-        Parent = Topbar,
-        BackgroundColor3 = Theme.MainBG,
-        AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -50, 0.5, 0),
-        Size = UDim2.new(0, profileBounds.X + 42, 0, 30)
-    })
-    createInstance('UICorner', {Parent = ProfileBox, CornerRadius = UDim.new(0, 4)})
-    local ProfileStroke = createInstance('UIStroke', {Parent = ProfileBox, Color = Theme.Border})
-    regTheme(ProfileBox, function() 
-        ProfileBox.BackgroundColor3 = Theme.MainBG
-        ProfileStroke.Color = Theme.Border
-    end)
-
-    local AvatarImg = createInstance('ImageLabel', {
-        Parent = ProfileBox,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 4, 0.5, -11),
-        Size = UDim2.new(0, 22, 0, 22)
-    })
-    createInstance('UICorner', {Parent = AvatarImg, CornerRadius = UDim.new(1, 0)})
-
-    task.spawn(function()
-        local content, isReady = Players:GetUserThumbnailAsync(LocalPlayer.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
-        if isReady then AvatarImg.Image = content end
-    end)
-
-    local ProfileName = createInstance('TextLabel', {
-        Parent = ProfileBox,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 32, 0, 0),
-        Size = UDim2.new(1, -36, 1, 0),
-        Font = Enum.Font.Gotham,
-        Text = profileText,
-        TextColor3 = Theme.TextMain,
-        TextSize = 12,
-        TextXAlignment = Enum.TextXAlignment.Left
-    })
-    regTheme(ProfileName, function() ProfileName.TextColor3 = Theme.TextMain end)
-
-    local SearchOverlay = createInstance('CanvasGroup', {
-        Parent = ScreenGui,
-        BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-        BackgroundTransparency = 0.5,
-        Size = UDim2.new(1, 0, 1, 0),
-        ZIndex = 500,
-        GroupTransparency = 1,
-        Visible = false
-    })
-
-    local SearchPanel = createInstance('Frame', {
-        Parent = SearchOverlay,
-        BackgroundColor3 = Theme.MainBG,
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new(0.5, 0, 0.5, -20),
-        Size = UDim2.new(0, 400, 0, 300),
-        ClipsDescendants = true
-    })
-    createInstance('UICorner', {Parent = SearchPanel, CornerRadius = UDim.new(0, 6)})
-    local SearchPanelStroke = createInstance('UIStroke', {Parent = SearchPanel, Color = Theme.Border})
-    regTheme(SearchPanel, function() 
-        SearchPanel.BackgroundColor3 = Theme.MainBG
-        SearchPanelStroke.Color = Theme.Border 
-    end)
-
-    local SearchInputBox = createInstance('TextBox', {
-        Parent = SearchPanel,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 20, 0, 10),
-        Size = UDim2.new(1, -40, 0, 40),
-        Font = Enum.Font.GothamMedium,
-        PlaceholderText = 'Search elements...',
-        PlaceholderColor3 = Theme.TextSub,
-        TextColor3 = Theme.TextMain,
-        TextSize = 14,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        ClearTextOnFocus = false,
-        Text = ''
-    })
-    regTheme(SearchInputBox, function() 
-        SearchInputBox.TextColor3 = Theme.TextMain 
-        SearchInputBox.PlaceholderColor3 = Theme.TextSub
-    end)
-    
-    local SearchLine = createInstance('Frame', {
-        Parent = SearchPanel,
-        BackgroundColor3 = Theme.Border,
-        BorderSizePixel = 0,
-        Position = UDim2.new(0, 0, 0, 55),
-        Size = UDim2.new(1, 0, 0, 1)
-    })
-    regTheme(SearchLine, function() SearchLine.BackgroundColor3 = Theme.Border end)
-
-    local SearchScroll = createInstance('ScrollingFrame', {
-        Parent = SearchPanel,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 10, 0, 65),
-        Size = UDim2.new(1, -20, 1, -75),
-        ScrollBarThickness = 2,
-        ScrollBarImageColor3 = Theme.Border,
-        BorderSizePixel = 0,
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        CanvasSize = UDim2.new(0, 0, 0, 0)
-    })
-    regTheme(SearchScroll, function() SearchScroll.ScrollBarImageColor3 = Theme.Border end)
-
-    createInstance('UIListLayout', {
-        Parent = SearchScroll,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 5)
-    })
-
-    local SearchBtn = createInstance('ImageButton', {
-        Parent = Topbar,
-        BackgroundTransparency = 1,
-        AnchorPoint = Vector2.new(1, 0.5),
-        Position = UDim2.new(1, -15, 0.5, 0),
-        Size = UDim2.new(0, 24, 0, 24),
-        Image = 'rbxassetid://6031154871',
-        ImageColor3 = Theme.TextSub
-    })
-    regTheme(SearchBtn, function() SearchBtn.ImageColor3 = Theme.TextSub end)
-
-    SearchBtn.MouseButton1Click:Connect(function()
-        SearchOverlay.Visible = true
-        SearchInputBox.Text = ''
-        TweenService:Create(SearchOverlay, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {GroupTransparency = 0}):Play()
-        SearchInputBox:CaptureFocus()
-    end)
-
-    SearchOverlay.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            local pos = input.Position
-            local cx1, cy1 = SearchPanel.AbsolutePosition.X, SearchPanel.AbsolutePosition.Y
-            local cx2, cy2 = cx1 + SearchPanel.AbsoluteSize.X, cy1 + SearchPanel.AbsoluteSize.Y
-            if not (pos.X >= cx1 and pos.X <= cx2 and pos.Y >= cy1 and pos.Y <= cy2) then
-                TweenService:Create(SearchOverlay, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {GroupTransparency = 1}):Play()
-                task.delay(0.3, function() SearchOverlay.Visible = false end)
-            end
-        end
-    end)
-
-    local PopulateSearch = function(query)
-        local cList = SearchScroll:GetChildren()
-        for i = 1, #cList do
-            local v = cList[i]
-            if v:IsA('TextButton') then v:Destroy() end
-        end
-        if query == '' then return end
-        
-        query = query:lower()
-        for i = 1, #WindowObj.ElementsList do
-            local elementData = WindowObj.ElementsList[i]
-            if string.find(elementData.Name:lower(), query) then
-                local sBtn = createInstance('TextButton', {
-                    Parent = SearchScroll,
-                    BackgroundColor3 = Theme.ElementBG,
-                    Size = UDim2.new(1, 0, 0, 34),
-                    Text = '',
-                    AutoButtonColor = false
-                })
-                createInstance('UICorner', {Parent = sBtn, CornerRadius = UDim.new(0, 4)})
-                
-                local sText = createInstance('TextLabel', {
-                    Parent = sBtn,
-                    BackgroundTransparency = 1,
-                    Position = UDim2.new(0, 10, 0, 0),
-                    Size = UDim2.new(1, -20, 1, 0),
-                    Font = Enum.Font.GothamMedium,
-                    Text = elementData.Name .. "  <font color='rgb(120,120,120)'>[" .. elementData.Tab.Name .. "]</font>",
-                    RichText = true,
-                    TextColor3 = Theme.TextMain,
-                    TextSize = 13,
-                    TextXAlignment = Enum.TextXAlignment.Left
-                })
-
-                regTheme(sBtn, function() sBtn.BackgroundColor3 = Theme.ElementBG end)
-                regTheme(sText, function() sText.TextColor3 = Theme.TextMain end)
-
-                sBtn.MouseEnter:Connect(function()
-                    TweenService:Create(sBtn, TweenInfo.new(0.2), {BackgroundColor3 = GetDarkerColor(Theme.ElementBG, 0.8)}):Play()
-                end)
-                sBtn.MouseLeave:Connect(function()
-                    TweenService:Create(sBtn, TweenInfo.new(0.2), {BackgroundColor3 = Theme.ElementBG}):Play()
-                end)
-
-                sBtn.MouseButton1Click:Connect(function()
-                    TweenService:Create(SearchOverlay, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {GroupTransparency = 1}):Play()
-                    task.delay(0.3, function() SearchOverlay.Visible = false end)
-                    
-                    elementData.Tab.Select()
-                    
-                    task.wait(0.1) 
-                    local targetY = elementData.Frame.AbsolutePosition.Y - elementData.Tab.Page.AbsolutePosition.Y + elementData.Tab.Page.CanvasPosition.Y - (elementData.Tab.Page.AbsoluteWindowSize.Y / 2) + (elementData.Frame.AbsoluteSize.Y / 2)
-                    TweenService:Create(elementData.Tab.Page, TweenInfo.new(0.5, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
-                        CanvasPosition = Vector2.new(0, math.max(0, targetY))
-                    }):Play()
-
-                    local origColor = elementData.Frame.BackgroundColor3
-                    TweenService:Create(elementData.Frame, TweenInfo.new(0.3), {BackgroundColor3 = Theme.Accent}):Play()
-                    task.delay(0.6, function()
-                        if elementData.Frame then
-                            TweenService:Create(elementData.Frame, TweenInfo.new(0.5), {BackgroundColor3 = origColor}):Play()
-                        end
-                    end)
-                end)
-            end
-        end
-    end
-
-    SearchInputBox:GetPropertyChangedSignal('Text'):Connect(function()
-        PopulateSearch(SearchInputBox.Text)
-    end)
-
-    local startX = 14 + titleBounds.X + 12
-    local endX = 580 - 15 - (profileBounds.X + 42) - 15 - 30
-    local subTabsWidth = endX - startX
-
-    local SubTabs = createInstance('Frame', {
-        Parent = Topbar,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, startX, 0, 0),
-        Size = UDim2.new(0, subTabsWidth, 1, 0)
-    })
-
-    createInstance('UIListLayout', {
-        Parent = SubTabs,
-        FillDirection = Enum.FillDirection.Horizontal,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 15),
-        VerticalAlignment = Enum.VerticalAlignment.Center
-    })
-
-    local subTabItems = {'Home', 'UI Settings', 'Configs'}
-    local activeSubTab = 'Home'
-    local MasterContainers = {}
-
-    local BodyContainer = createInstance('Frame', {
-        Name = 'BodyContainer',
-        Parent = MainGroup,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 0, 0, 48),
-        Size = UDim2.new(1, 0, 1, -48),
-        ClipsDescendants = true
-    })
-
-    local CreateTopSubTab = function(text)
-        local SubContainer = createInstance('CanvasGroup', {
-            Name = text .. 'Container',
-            Parent = BodyContainer,
-            BackgroundTransparency = 1,
-            Position = UDim2.new(0, 0, 0, 0),
-            Size = UDim2.new(1, 0, 1, 0),
-            Visible = (text == activeSubTab),
-            GroupTransparency = (text == activeSubTab) and 0 or 1
-        })
-        MasterContainers[text] = SubContainer
-
-        local tabBtn = createInstance('ImageButton', {
-            Name = text .. 'Tab',
-            Parent = SubTabs,
-            BackgroundTransparency = 1,
-            AutoButtonColor = false,
-            Image = ''
-        })
-
-        local labelBounds = TextService:GetTextSize(text, 12, Enum.Font.GothamMedium, Vector2.new(1000, 48))
-        tabBtn.Size = UDim2.new(0, labelBounds.X + 10, 1, 0)
-
-        local tabLabel = createInstance('TextLabel', {
-            Parent = tabBtn,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 1, 0),
-            Font = Enum.Font.GothamMedium,
-            Text = text,
-            TextSize = 12,
-            TextColor3 = (text == activeSubTab) and Theme.TextMain or Theme.TextSub
-        })
-        
-        regTheme(tabLabel, function()
-            if activeSubTab == text then tabLabel.TextColor3 = Theme.TextMain end
-        end)
-
-        local underline = createInstance('Frame', {
-            Parent = tabBtn,
-            BackgroundColor3 = Theme.Accent,
-            BorderSizePixel = 0,
-            AnchorPoint = Vector2.new(0.5, 1),
-            Position = UDim2.new(0.5, 0, 1, -2),
-            Size = (text == activeSubTab) and UDim2.new(1, 0, 0, 2) or UDim2.new(0, 0, 0, 2),
-            BackgroundTransparency = (text == activeSubTab) and 0 or 1
-        })
-        
-        regTheme(underline, function() underline.BackgroundColor3 = Theme.Accent end)
-
-        tabBtn.MouseEnter:Connect(function()
-            if activeSubTab ~= text then
-                TweenService:Create(tabLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextMain}):Play()
-                TweenService:Create(underline, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0.8, 0, 0, 2), BackgroundTransparency = 0.3}):Play()
-            end
-        end)
-
-        tabBtn.MouseLeave:Connect(function()
-            if activeSubTab ~= text then
-                TweenService:Create(tabLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextSub}):Play()
-                TweenService:Create(underline, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0, 0, 0, 2), BackgroundTransparency = 1}):Play()
-            end
-        end)
-
-        tabBtn.MouseButton1Click:Connect(function()
-            if activeSubTab ~= text then
-                local prevActive = activeSubTab
-                activeSubTab = text
-                
-                local prevBtn = SubTabs:FindFirstChild(prevActive .. 'Tab')
-                if prevBtn then
-                    TweenService:Create(prevBtn.TextLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextSub}):Play()
-                    TweenService:Create(prevBtn.Frame, TweenInfo.new(0.2), {Size = UDim2.new(0, 0, 0, 2), BackgroundTransparency = 1}):Play()
-                end
-
-                TweenService:Create(tabLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextMain}):Play()
-                TweenService:Create(underline, TweenInfo.new(0.2), {Size = UDim2.new(1, 0, 0, 2), BackgroundTransparency = 0}):Play()
-                
-                local prevContainer = MasterContainers[prevActive]
-                if prevContainer then
-                    TweenService:Create(prevContainer, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {Position = UDim2.new(0, 0, 0, -15), GroupTransparency = 1}):Play()
-                    task.delay(0.25, function() if activeSubTab ~= prevActive then prevContainer.Visible = false end end)
-                end
-
-                local newContainer = MasterContainers[text]
-                if newContainer then
-                    newContainer.Visible = true
-                    newContainer.Position = UDim2.new(0, 0, 0, 15)
-                    newContainer.GroupTransparency = 1
-                    TweenService:Create(newContainer, TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0}):Play()
-                end
-            end
-        end)
-    end
-
-    for i = 1, #subTabItems do CreateTopSubTab(subTabItems[i]) end
-
-    local CreateElementBuilder = function(PageTarget, ParentTab)
-        local Builder = {}
-
-        Builder.CreateDivider = function(self)
-            local DivContainer = createInstance('Frame', {
-                Parent = PageTarget,
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 14)
-            })
-            local Line = createInstance('Frame', {
-                Parent = DivContainer,
-                BackgroundColor3 = Theme.Border,
-                BorderSizePixel = 0,
-                AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.new(0.5, 0, 0.5, 0),
-                Size = UDim2.new(1, -20, 0, 2)
-            })
-            createInstance('UICorner', {Parent = Line, CornerRadius = UDim.new(0, 1)})
-            regTheme(Line, function()
-                if Line then Line.BackgroundColor3 = Theme.Border end
-            end)
-        end
-
-        Builder.CreateButton = function(self, options)
-            local BtnName = options.Name or 'Button'
-            local Callback = options.Callback or function() end
-
-            local BtnFrame = createInstance('ImageButton', {
-                Parent = PageTarget,
-                BackgroundColor3 = Theme.ElementBG,
-                Size = UDim2.new(1, 0, 0, 36),
-                AutoButtonColor = false,
-                Image = ''
-            })
-            createInstance('UICorner', {Parent = BtnFrame, CornerRadius = UDim.new(0, 4)})
-            regTheme(BtnFrame, function() BtnFrame.BackgroundColor3 = Theme.ElementBG end)
-
-            local TextLabel = createInstance('TextLabel', {
-                Parent = BtnFrame,
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 1, 0),
-                Font = Enum.Font.GothamMedium,
-                Text = BtnName,
-                TextColor3 = Theme.TextSub,
-                TextSize = 13
-            })
-            regTheme(TextLabel, function() TextLabel.TextColor3 = Theme.TextSub end)
-
-            SetupTooltip(BtnFrame, options.Tip)
-            table.insert(WindowObj.ElementsList, {Name = BtnName, Frame = BtnFrame, Tab = ParentTab})
-
-            BtnFrame.MouseEnter:Connect(function()
-                TweenService:Create(BtnFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {BackgroundColor3 = GetDarkerColor(Theme.ElementBG, 0.8)}):Play()
-                TweenService:Create(TextLabel, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {TextColor3 = Theme.TextMain}):Play()
-            end)
-            BtnFrame.MouseLeave:Connect(function()
-                TweenService:Create(BtnFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {BackgroundColor3 = Theme.ElementBG}):Play()
-                TweenService:Create(TextLabel, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {TextColor3 = Theme.TextSub}):Play()
-            end)
-            BtnFrame.MouseButton1Down:Connect(function()
-                TweenService:Create(BtnFrame, TweenInfo.new(0.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {BackgroundColor3 = Theme.Accent}):Play()
-                TweenService:Create(TextLabel, TweenInfo.new(0.1, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {TextColor3 = Color3.fromRGB(255, 255, 255)}):Play()
-            end)
-            BtnFrame.MouseButton1Click:Connect(function()
-                TweenService:Create(BtnFrame, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {BackgroundColor3 = GetDarkerColor(Theme.ElementBG, 0.8)}):Play()
-                Callback()
-            end)
-        end
-
-        Builder.CreateTextbox = function(self, options)
-            local ElementName = options.Name or 'Textbox'
-            local Default = options.Default or ''
-            local UseLetter = options.UseLetter
-            local UseNumber = options.UseNumber
-            local Callback = options.Callback or function() end
-
-            local Element = { Value = Default }
-            AeroLib.Flags[ElementName] = Element
-
-            local Container = createInstance('Frame', {
-                Parent = PageTarget,
-                BackgroundColor3 = Theme.ElementBG,
-                Size = UDim2.new(1, 0, 0, 36)
-            })
-            createInstance('UICorner', {Parent = Container, CornerRadius = UDim.new(0, 4)})
-            regTheme(Container, function() Container.BackgroundColor3 = Theme.ElementBG end)
-            table.insert(WindowObj.ElementsList, {Name = ElementName, Frame = Container, Tab = ParentTab})
-
-            local labelBounds = TextService:GetTextSize(ElementName, 13, Enum.Font.GothamMedium, Vector2.new(1000, 36))
-
-            local LabelText = createInstance('TextLabel', {
-                Parent = Container,
-                BackgroundTransparency = 1,
-                Position = UDim2.new(0, 12, 0, 0),
-                Size = UDim2.new(0, labelBounds.X + 5, 1, 0),
-                Font = Enum.Font.GothamMedium,
-                Text = ElementName,
-                TextColor3 = Theme.TextSub,
-                TextSize = 13,
-                TextXAlignment = Enum.TextXAlignment.Left
-            })
-            regTheme(LabelText, function() LabelText.TextColor3 = Theme.TextSub end)
-
-            local ValBox = createInstance('Frame', {
-                Parent = Container,
-                BackgroundColor3 = Color3.fromRGB(35, 35, 35),
-                AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -6, 0.5, 0),
-                Size = UDim2.new(0, 120, 0, 24)
-            })
-            createInstance('UICorner', {Parent = ValBox, CornerRadius = UDim.new(0, 4)})
-            regTheme(ValBox, function() ValBox.BackgroundColor3 = Theme.MainBG end)
-            
-            local ValBoxStroke = createInstance('UIStroke', {Parent = ValBox, Color = Theme.Border})
-            regTheme(ValBoxStroke, function() ValBoxStroke.Color = Theme.Border end)
-
-            local TextBox = createInstance('TextBox', {
-                Parent = ValBox,
-                BackgroundTransparency = 1,
-                Position = UDim2.new(0, 0, 0, 0),
-                Size = UDim2.new(1, -6, 1, 0),
-                Font = Enum.Font.Gotham,
-                Text = Default,
-                PlaceholderText = 'Type...',
-                PlaceholderColor3 = Color3.fromRGB(150, 150, 150),
-                TextColor3 = Theme.TextMain,
-                TextSize = 12,
-                TextXAlignment = Enum.TextXAlignment.Right,
-                ClearTextOnFocus = false
-            })
-            regTheme(TextBox, function() TextBox.TextColor3 = Theme.TextMain end)
-
-            SetupTooltip(Container, options.Tip)
-
-            TextBox:GetPropertyChangedSignal('Text'):Connect(function()
-                local original = TextBox.Text
-                local cleaned = original
-                if UseLetter and not UseNumber then
-                    cleaned = original:gsub('[^%a%s]', '')
-                elseif UseNumber and not UseLetter then
-                    cleaned = original:gsub('[^%d%.%-]', '')
-                elseif UseLetter and UseNumber then
-                    cleaned = original:gsub('[^%w%s%_%-]', '')
-                end
-                if original ~= cleaned then TextBox.Text = cleaned end
-            end)
-
-            TextBox.FocusLost:Connect(function()
-                Element.Value = TextBox.Text
-                AeroLib.Flags[ElementName].Value = Element.Value
-                Callback(Element.Value)
-            end)
-            
-            function Element:Set(val)
-                TextBox.Text = val
-                Element.Value = val
-                AeroLib.Flags[ElementName].Value = val
-                Callback(val)
-            end
-
-            return Element
-        end
-
-        Builder.CreateSlider = function(self, options)
-            local ElementName = options.Name or 'Slider'
-            local Min = options.Min or 0
-            local Max = options.Max or 100
-            local Default = options.Default or 35
-            local Increment = options.Increment or 1
-            local Suffix = options.Suffix or ''
-            local Callback = options.Callback or function() end
-
-            local Element = { Value = Default }
-            AeroLib.Flags[ElementName] = Element
-
-            local Container = createInstance('Frame', {
-                Parent = PageTarget,
-                BackgroundColor3 = Theme.ElementBG,
-                Size = UDim2.new(1, 0, 0, 36)
-            })
-            createInstance('UICorner', {Parent = Container, CornerRadius = UDim.new(0, 4)})
-            regTheme(Container, function() Container.BackgroundColor3 = Theme.ElementBG end)
-            table.insert(WindowObj.ElementsList, {Name = ElementName, Frame = Container, Tab = ParentTab})
-
-            local labelBounds = TextService:GetTextSize(ElementName, 13, Enum.Font.GothamMedium, Vector2.new(1000, 36))
-
-            local LabelText = createInstance('TextLabel', {
-                Parent = Container,
-                BackgroundTransparency = 1,
-                Position = UDim2.new(0, 12, 0, 0),
-                Size = UDim2.new(0, labelBounds.X + 5, 1, 0),
-                Font = Enum.Font.GothamMedium,
-                Text = ElementName,
-                TextColor3 = Theme.TextSub,
-                TextSize = 13,
-                TextXAlignment = Enum.TextXAlignment.Left
-            })
-            regTheme(LabelText, function() LabelText.TextColor3 = Theme.TextSub end)
-
-            local ValBox = createInstance('Frame', {
-                Parent = Container,
-                BackgroundColor3 = Color3.fromRGB(35, 35, 35),
-                AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -6, 0.5, 0),
-                Size = UDim2.new(0, 40, 0, 22)
-            })
-            createInstance('UICorner', {Parent = ValBox, CornerRadius = UDim.new(0, 4)})
-            regTheme(ValBox, function() ValBox.BackgroundColor3 = Theme.MainBG end)
-            
-            local ValBoxStroke = createInstance('UIStroke', {Parent = ValBox, Color = Theme.Border})
-            regTheme(ValBoxStroke, function() ValBoxStroke.Color = Theme.Border end)
-
-            local ValTextBox = createInstance('TextBox', {
-                Parent = ValBox,
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 1, 0),
-                Font = Enum.Font.Gotham,
-                Text = tostring(Default) .. Suffix,
-                TextColor3 = Theme.TextSub,
-                TextSize = 11,
-                ClearTextOnFocus = false
-            })
-            regTheme(ValTextBox, function() ValTextBox.TextColor3 = Theme.TextSub end)
-
-            local sliderStartOffset = 12 + labelBounds.X + 15
-            local sliderEndPadding = 6 + 40 + 15
-
-            local TrackBox = createInstance('ImageButton', {
-                Parent = Container,
-                BackgroundColor3 = Color3.fromRGB(45, 45, 45),
-                AnchorPoint = Vector2.new(0, 0.5),
-                Position = UDim2.new(0, sliderStartOffset, 0.5, 0),
-                Size = UDim2.new(1, -(sliderStartOffset + sliderEndPadding), 0, 6),
-                AutoButtonColor = false,
-                Image = ''
-            })
-            createInstance('UICorner', {Parent = TrackBox, CornerRadius = UDim.new(1, 0)})
-            regTheme(TrackBox, function() TrackBox.BackgroundColor3 = Theme.DropdownListStroke end)
-
-            local FillBox = createInstance('Frame', {
-                Parent = TrackBox,
-                BackgroundColor3 = Theme.Accent,
-                Size = UDim2.new((Default - Min) / (Max - Min), 0, 1, 0)
-            })
-            createInstance('UICorner', {Parent = FillBox, CornerRadius = UDim.new(1, 0)})
-            
-            regTheme(FillBox, function() FillBox.BackgroundColor3 = Theme.Accent end)
-
-            SetupTooltip(Container, options.Tip)
-
-            local SetValue = function(val)
-                val = math.clamp(val, Min, Max)
-                val = math.floor((val / Increment) + 0.5) * Increment
-                local percent = (val - Min) / (Max - Min)
-                TweenService:Create(FillBox, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {Size = UDim2.new(percent, 0, 1, 0)}):Play()
-                ValTextBox.Text = tostring(val) .. Suffix
-                Element.Value = val
-                AeroLib.Flags[ElementName].Value = val
-                Callback(val)
-            end
-
-            local UpdateSlider = function(input)
-                local percent = math.clamp((input.Position.X - TrackBox.AbsolutePosition.X) / TrackBox.AbsoluteSize.X, 0, 1)
-                local value = Min + ((Max - Min) * percent)
-                SetValue(value)
-            end
-
-            local dragging = false
-            TrackBox.InputBegan:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                    dragging = true
-                    UpdateSlider(input)
-                end
-            end)
-            UserInputService.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
-            end)
-            UserInputService.InputChanged:Connect(function(input)
-                if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then UpdateSlider(input) end
-            end)
-
-            ValTextBox.FocusLost:Connect(function()
-                local numStr = string.match(ValTextBox.Text, '^%-?%d+%.?%d*')
-                local num = tonumber(numStr) or Default
-                SetValue(num)
-            end)
-            
-            function Element:Set(val) SetValue(val) end
-            return Element
-        end
-
-        Builder.CreateToggle = function(self, options)
-            local ElementName = options.Name or 'Toggle'
-            local Default = options.Default or false
-            local Keybind = options.Keybind
-            local Callback = options.Callback or function() end
-            
-            local state = Default
-            local currentBind = Keybind
-
-            local Element = { Value = Default }
-            AeroLib.Flags[ElementName] = Element
-
-            local TogFrame = createInstance('ImageButton', {
-                Parent = PageTarget,
-                BackgroundColor3 = Theme.ElementBG,
-                Size = UDim2.new(1, 0, 0, 36),
-                AutoButtonColor = false,
-                Image = ''
-            })
-            createInstance('UICorner', {Parent = TogFrame, CornerRadius = UDim.new(0, 4)})
-            regTheme(TogFrame, function() TogFrame.BackgroundColor3 = Theme.ElementBG end)
-            table.insert(WindowObj.ElementsList, {Name = ElementName, Frame = TogFrame, Tab = ParentTab})
-
-            local TitleLabel = createInstance('TextLabel', {
-                Parent = TogFrame,
-                BackgroundTransparency = 1,
-                Position = UDim2.new(0, 12, 0, 0),
-                Size = UDim2.new(1, -120, 1, 0),
-                Font = Enum.Font.GothamMedium,
-                Text = ElementName,
-                TextColor3 = Theme.TextSub,
-                TextSize = 13,
-                TextXAlignment = Enum.TextXAlignment.Left
-            })
-            regTheme(TitleLabel, function()
-                TitleLabel.TextColor3 = state and Theme.TextMain or Theme.TextSub
-            end)
-
-            local Switch = createInstance('Frame', {
-                Parent = TogFrame,
-                BackgroundColor3 = Color3.fromRGB(20, 20, 20),
-                AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -12, 0.5, 0),
-                Size = UDim2.new(0, 28, 0, 10)
-            })
-            createInstance('UICorner', {Parent = Switch, CornerRadius = UDim.new(1, 0)})
-
-            local Knob = createInstance('Frame', {
-                Parent = Switch,
-                BackgroundColor3 = state and GetDarkerColor(Theme.Accent, 0.4) or Color3.fromRGB(150, 150, 150),
-                AnchorPoint = Vector2.new(0, 0.5),
-                Position = state and UDim2.new(1, -14, 0.5, 0) or UDim2.new(0, -2, 0.5, 0),
-                Size = UDim2.new(0, 16, 0, 16)
-            })
-            createInstance('UICorner', {Parent = Knob, CornerRadius = UDim.new(1, 0)})
-            
-            regTheme(Switch, function()
-                if state then
-                    Switch.BackgroundColor3 = GetDarkerColor(Theme.Accent, 0.4)
-                    Knob.BackgroundColor3 = Theme.Accent
-                else
-                    Switch.BackgroundColor3 = Theme.MainBG
-                    Knob.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
-                end
-            end)
-
-            SetupTooltip(TogFrame, options.Tip)
-
-            local FireToggle = function(skipAnim)
-                local speed = skipAnim and 0 or 0.2
-                TweenService:Create(Switch, TweenInfo.new(speed), {BackgroundColor3 = state and GetDarkerColor(Theme.Accent, 0.4) or Theme.MainBG}):Play()
-                TweenService:Create(Knob, TweenInfo.new(speed), {Position = state and UDim2.new(1, -14, 0.5, 0) or UDim2.new(0, -2, 0.5, 0), BackgroundColor3 = state and Theme.Accent or Color3.fromRGB(150, 150, 150)}):Play()
-                TweenService:Create(TitleLabel, TweenInfo.new(speed), {TextColor3 = state and Theme.TextMain or Theme.TextSub}):Play()
-                Element.Value = state
-                AeroLib.Flags[ElementName].Value = state
-            end
-            FireToggle(true)
-
-            TogFrame.MouseButton1Click:Connect(function()
-                state = not state
-                Callback(state)
-                FireToggle(false)
-            end)
-
-            if Keybind then
-                local BindContainer = createInstance('Frame', {
-                    Parent = TogFrame,
-                    AnchorPoint = Vector2.new(1, 0.5),
-                    Position = UDim2.new(1, -55, 0.5, 0),
-                    Size = UDim2.new(0, 45, 0, 22),
-                    BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-                })
-                createInstance('UICorner', {Parent = BindContainer, CornerRadius = UDim.new(0, 4)})
-                regTheme(BindContainer, function() BindContainer.BackgroundColor3 = Theme.MainBG end)
-                
-                local BindContainerStroke = createInstance('UIStroke', {Parent = BindContainer, Color = Theme.Border})
-                regTheme(BindContainerStroke, function() BindContainerStroke.Color = Theme.Border end)
-
-                local BindBtn = createInstance('TextButton', {
-                    Parent = BindContainer,
-                    BackgroundTransparency = 1,
-                    Size = UDim2.new(1, 0, 1, 0),
-                    Text = currentBind and currentBind.Name or '',
-                    Font = Enum.Font.Gotham,
-                    TextColor3 = Theme.TextSub,
-                    TextSize = 11
-                })
-
-                local UpdateBindSize = function()
-                    local bindName = currentBind and currentBind.Name or 'None'
-                    BindBtn.Text = bindName
-                    local textBounds = TextService:GetTextSize(bindName, 11, Enum.Font.Gotham, Vector2.new(1000, 22))
-                    BindContainer.Size = UDim2.new(0, math.max(textBounds.X + 16, 40), 0, 22)
-                end
-                UpdateBindSize()
-
-                local isBinding = false
-                BindBtn.MouseButton1Click:Connect(function()
-                    isBinding = true
-                    BindBtn.Text = '...'
-                    BindContainer.Size = UDim2.new(0, 40, 0, 22)
-                end)
-
-                UserInputService.InputBegan:Connect(function(input, gpe)
-                    if isBinding and (input.UserInputType == Enum.UserInputType.Keyboard or input.UserInputType == Enum.UserInputType.Gamepad1) then
-                        currentBind = input.KeyCode
-                        isBinding = false
-                        UpdateBindSize()
-                        Callback(state)
-                    elseif not gpe and currentBind and input.KeyCode == currentBind then
-                        state = not state
-                        Callback(state)
-                        FireToggle(false)
-                    end
-                end)
-            end
-            
-            function Element:Set(val)
-                state = val
-                Callback(state)
-                FireToggle(true)
-            end
-
-            return Element
-        end
-
-        Builder.CreateDropdown = function(self, options)
-            local ElementName = options.Name or 'Dropdown'
-            local DropOptions = options.Options or {}
-            local Default = options.Default
-            local MultiSelect = options.MultiSelect or false
-            local Callback = options.Callback or function() end
-
-            local currentSelection
-            if MultiSelect then
-                currentSelection = {}
-                if type(Default) == 'table' then
-                    for i = 1, #Default do
-                        table.insert(currentSelection, getStringValue(Default[i]))
-                    end
-                elseif type(Default) == 'string' and Default ~= '' then
-                    table.insert(currentSelection, Default)
-                end
-            else
-                if Default ~= nil then
-                    currentSelection = type(Default) == 'table' and tostring(Default or '') or tostring(Default)
-                else
-                    currentSelection = type(DropOptions) == 'table' and tostring(DropOptions or '') or ''
-                end
-                if type(currentSelection) == 'table' then currentSelection = 'None' end
-            end
-            
-            local Element = { Value = currentSelection }
-            AeroLib.Flags[ElementName] = Element
-
-            local Container = createInstance('ImageButton', {
-                Parent = PageTarget,
-                BackgroundColor3 = Theme.ElementBG,
-                Size = UDim2.new(1, 0, 0, 36),
-                AutoButtonColor = false,
-                Image = ''
-            })
-            createInstance('UICorner', {Parent = Container, CornerRadius = UDim.new(0, 4)})
-            regTheme(Container, function() Container.BackgroundColor3 = Theme.ElementBG end)
-            table.insert(WindowObj.ElementsList, {Name = ElementName, Frame = Container, Tab = ParentTab})
-
-            local TitleLabel = createInstance('TextLabel', {
-                Parent = Container,
-                BackgroundTransparency = 1,
-                Position = UDim2.new(0, 12, 0, 0),
-                Size = UDim2.new(1, -120, 1, 0),
-                Font = Enum.Font.GothamMedium,
-                Text = ElementName,
-                TextColor3 = Theme.TextSub,
-                TextSize = 13,
-                TextXAlignment = Enum.TextXAlignment.Left
-            })
-            regTheme(TitleLabel, function() TitleLabel.TextColor3 = Theme.TextSub end)
-
-            local SelectedBox = createInstance('Frame', {
-                Parent = Container,
-                BackgroundColor3 = Color3.fromRGB(22, 22, 22),
-                AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -6, 0.5, 0),
-                Size = UDim2.new(0, 100, 0, 24)
-            })
-            createInstance('UICorner', {Parent = SelectedBox, CornerRadius = UDim.new(0, 4)})
-            regTheme(SelectedBox, function() SelectedBox.BackgroundColor3 = Theme.MainBG end)
-            
-            local SelectedBoxStroke = createInstance('UIStroke', {Parent = SelectedBox, Color = Theme.Border})
-            regTheme(SelectedBoxStroke, function() SelectedBoxStroke.Color = Theme.Border end)
-
-            local SelectedLabel = createInstance('TextLabel', {
-                Parent = SelectedBox,
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, -20, 1, 0),
-                Position = UDim2.new(0, 8, 0, 0),
-                Font = Enum.Font.Gotham,
-                TextColor3 = Theme.TextMain,
-                TextSize = 11,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                TextTruncate = Enum.TextTruncate.AtEnd
-            })
-            regTheme(SelectedLabel, function() SelectedLabel.TextColor3 = Theme.TextMain end)
-            
-            local UpdateLabel = function()
-                if MultiSelect then
-                    SelectedLabel.Text = #currentSelection > 0 and table.concat(currentSelection, ', ') or 'None'
-                else
-                    SelectedLabel.Text = (currentSelection == '' or currentSelection == nil) and 'None' or tostring(currentSelection)
-                end
-            end
-            UpdateLabel()
-
-            local Icon = createInstance('TextLabel', {
-                Parent = SelectedBox,
-                BackgroundTransparency = 1,
-                AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -5, 0.5, 0),
-                Size = UDim2.new(0, 16, 0, 16),
-                Font = Enum.Font.Gotham,
-                Text = '+',
-                TextColor3 = Theme.TextSub,
-                TextSize = 16
-            })
-            regTheme(Icon, function() Icon.TextColor3 = Theme.TextSub end)
-
-            local ListCanvas = createInstance('CanvasGroup', {
-                Parent = ScreenGui,
-                BackgroundTransparency = 1,
-                ZIndex = 100,
-                Size = UDim2.new(0, 0, 0, 0),
-                GroupTransparency = 1,
-                Visible = false
-            })
-            
-            local LCScale = createInstance('UIScale', {Parent = ListCanvas, Scale = CurrentScale})
-            table.insert(ScalesToUpdate, LCScale)
-            createInstance('UICorner', {Parent = ListCanvas, CornerRadius = UDim.new(0, 4)})
-
-            local ListFrame = createInstance('ScrollingFrame', {
-                Parent = ListCanvas,
-                BackgroundColor3 = Theme.DropdownListBG,
-                Size = UDim2.new(1, 0, 1, 0),
-                ZIndex = 100,
-                ScrollBarThickness = 2,
-                BorderSizePixel = 0,
-                AutomaticCanvasSize = Enum.AutomaticSize.Y
-            })
-            local ListFrameStroke = createInstance('UIStroke', {Parent = ListFrame, Color = Theme.DropdownListStroke})
-            
-            regTheme(ListFrame, function() 
-                ListFrame.BackgroundColor3 = Theme.DropdownListBG
-                ListFrameStroke.Color = Theme.DropdownListStroke
-            end)
-            
-            local CanvasLayout = createInstance('Frame', {
-                Parent = ListFrame,
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 0),
-                AutomaticSize = Enum.AutomaticSize.Y
-            })
-            createInstance('UIListLayout', {Parent = CanvasLayout, SortOrder = Enum.SortOrder.LayoutOrder})
-
-            SetupTooltip(Container, options.Tip)
-
-            local expanded = false
-            local OptionsRendered = {}
-
-            local RefreshOptions = function()
-                local cList = CanvasLayout:GetChildren()
-                for i = 1, #cList do
-                    local v = cList[i]
-                    if v:IsA('TextButton') then v:Destroy() end
-                end
-                table.clear(OptionsRendered)
-
-                for i = 1, #DropOptions do
-                    local strOpt = tostring(DropOptions[i])
-                    
-                    local Option = createInstance('TextButton', {
-                        Parent = CanvasLayout,
-                        BackgroundTransparency = 1,
-                        Size = UDim2.new(1, 0, 0, 26),
-                        Text = '',
-                        ZIndex = 101
-                    })
-
-                    local isSel = false
-                    if MultiSelect then
-                        isSel = table.find(currentSelection, strOpt) ~= nil
-                    else
-                        isSel = currentSelection == strOpt
-                    end
-                    
-                    local OptCheck = createInstance('ImageLabel', {
-                        Parent = Option,
-                        BackgroundTransparency = 1,
-                        Position = isSel and UDim2.new(0, 8, 0.5, -7) or UDim2.new(0, 0, 0.5, -7),
-                        Size = UDim2.new(0, 14, 0, 14),
-                        Image = 'rbxassetid://6031094667',
-                        ImageColor3 = Theme.TextMain,
-                        ImageTransparency = isSel and 0 or 1,
-                        ZIndex = 101
-                    })
-                    regTheme(OptCheck, function() OptCheck.ImageColor3 = Theme.TextMain end)
-                    
-                    local OptText = createInstance('TextLabel', {
-                        Parent = Option,
-                        BackgroundTransparency = 1,
-                        Size = UDim2.new(1, -30, 1, 0),
-                        Position = UDim2.new(0, 28, 0, 0),
-                        Font = Enum.Font.GothamMedium,
-                        Text = strOpt,
-                        TextColor3 = isSel and Theme.TextMain or Theme.TextSub,
-                        TextSize = 13,
-                        TextXAlignment = Enum.TextXAlignment.Left,
-                        ZIndex = 101
-                    })
-
-                    table.insert(OptionsRendered, {
-                        Value = strOpt,
-                        Text = OptText,
-                        Check = OptCheck,
-                        Button = Option
-                    })
-                    
-                    Option.MouseEnter:Connect(function()
-                        TweenService:Create(OptText, TweenInfo.new(0.2), {TextColor3 = Theme.TextMain}):Play()
-                    end)
-                    Option.MouseLeave:Connect(function()
-                        local active = false
-                        if MultiSelect then active = table.find(currentSelection, strOpt) ~= nil else active = currentSelection == strOpt end
-                        TweenService:Create(OptText, TweenInfo.new(0.2), {TextColor3 = active and Theme.TextMain or Theme.TextSub}):Play()
-                    end)
-
-                    Option.MouseButton1Click:Connect(function()
-                        if MultiSelect then
-                            local idx = table.find(currentSelection, strOpt)
-                            if idx then 
-                                table.remove(currentSelection, idx) 
-                                OptText.TextColor3 = Theme.TextSub
-                                TweenService:Create(OptCheck, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, 0, 0.5, -7), ImageTransparency = 1}):Play()
-                            else 
-                                table.insert(currentSelection, strOpt) 
-                                OptText.TextColor3 = Theme.TextMain
-                                TweenService:Create(OptCheck, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, 8, 0.5, -7), ImageTransparency = 0}):Play()
-                            end
-                        else
-                            currentSelection = strOpt
-                            expanded = false
-                            TweenService:Create(Icon, TweenInfo.new(0.3), {Rotation = 0}):Play()
-                            TweenService:Create(ListCanvas, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0, SelectedBox.AbsoluteSize.X, 0, 0), GroupTransparency = 1}):Play()
-                            task.delay(0.3, function() if not expanded then ListCanvas.Visible = false end end)
-                            
-                            for k = 1, #OptionsRendered do
-                                local renderData = OptionsRendered[k]
-                                if renderData.Value == strOpt then
-                                    renderData.Text.TextColor3 = Theme.TextMain
-                                    TweenService:Create(renderData.Check, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, 8, 0.5, -7), ImageTransparency = 0}):Play()
-                                else
-                                    renderData.Text.TextColor3 = Theme.TextSub
-                                    TweenService:Create(renderData.Check, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, 0, 0.5, -7), ImageTransparency = 1}):Play()
-                                end
-                            end
-                        end
-                        UpdateLabel()
-                        Element.Value = currentSelection
-                        AeroLib.Flags[ElementName].Value = currentSelection
-                        Callback(currentSelection)
-                    end)
-                end
-                
-                ListFrame.CanvasSize = UDim2.new(0, 0, 0, #DropOptions * 26)
-            end
-
-            RefreshOptions()
-
-            Container.MouseButton1Click:Connect(function()
-                expanded = not expanded
-                if expanded then
-                    RefreshOptions()
-                    ListCanvas.Position = UDim2.new(0, SelectedBox.AbsolutePosition.X, 0, SelectedBox.AbsolutePosition.Y + (28 * CurrentScale))
-                    local dropHeight = math.min(#DropOptions * 26, 150)
-                    ListCanvas.Size = UDim2.new(0, SelectedBox.AbsoluteSize.X, 0, 0)
-                    ListCanvas.GroupTransparency = 1
-                    ListCanvas.Visible = true
-                    TweenService:Create(ListCanvas, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0, SelectedBox.AbsoluteSize.X, 0, dropHeight), GroupTransparency = 0}):Play()
-                else
-                    TweenService:Create(ListCanvas, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0, SelectedBox.AbsoluteSize.X, 0, 0), GroupTransparency = 1}):Play()
-                    task.delay(0.3, function() if not expanded then ListCanvas.Visible = false end end)
-                end
-                TweenService:Create(Icon, TweenInfo.new(0.3), {Rotation = expanded and 45 or 0}):Play()
-            end)
-
-            UserInputService.InputBegan:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                    local pos = input.Position
-                    if expanded and ListCanvas.Visible then
-                        local x1 = ListCanvas.AbsolutePosition.X
-                        local y1 = ListCanvas.AbsolutePosition.Y
-                        local x2 = x1 + ListCanvas.AbsoluteSize.X
-                        local y2 = y1 + ListCanvas.AbsoluteSize.Y
-                        local cx1 = Container.AbsolutePosition.X
-                        local cy1 = Container.AbsolutePosition.Y
-                        local cx2 = cx1 + Container.AbsoluteSize.X
-                        local cy2 = cy1 + Container.AbsoluteSize.Y
-                        
-                        if not (pos.X >= x1 and pos.X <= x2 and pos.Y >= y1 and pos.Y <= y2) and not (pos.X >= cx1 and pos.X <= cx2 and pos.Y >= cy1 and pos.Y <= cy2) then
-                            expanded = false
-                            TweenService:Create(ListCanvas, TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0, SelectedBox.AbsoluteSize.X, 0, 0), GroupTransparency = 1}):Play()
-                            TweenService:Create(Icon, TweenInfo.new(0.3), {Rotation = 0}):Play()
-                            task.delay(0.3, function() if not expanded then ListCanvas.Visible = false end end)
-                        end
-                    end
-                end
-            end)
-            
-            function Element:Set(val)
-                if MultiSelect then
-                    currentSelection = type(val) == 'table' and val or {}
-                else
-                    currentSelection = getStringValue(val)
-                end
-                if type(currentSelection) == 'table' then currentSelection = 'None' end
-                UpdateLabel()
-                Element.Value = currentSelection
-                AeroLib.Flags[ElementName].Value = currentSelection
-                RefreshOptions()
-                Callback(currentSelection)
-            end
-
-            function Element:Refresh(newOptions)
-                DropOptions = type(newOptions) == 'table' and newOptions or {}
-                if MultiSelect then
-                    local newSel = {}
-                    for i = 1, #currentSelection do
-                        local v = currentSelection[i]
-                        if table.find(DropOptions, v) then table.insert(newSel, v) end
-                    end
-                    currentSelection = newSel
-                else
-                    if not table.find(DropOptions, currentSelection) then
-                        currentSelection = getStringValue(DropOptions)
-                    end
-                end
-                if type(currentSelection) == 'table' then currentSelection = 'None' end
-                UpdateLabel()
-                Element.Value = currentSelection
-                AeroLib.Flags[ElementName].Value = currentSelection
-                RefreshOptions()
-            end
-
-            return Element
-        end
-
-        Builder.CreateColorpicker = function(self, options)
-            local ElementName = options.Name or 'Colorpicker'
-            local Default = options.Default or Color3.fromRGB(255, 255, 255)
-            local Callback = options.Callback or function() end
-
-            local Element = { Value = Default }
-            AeroLib.Flags[ElementName] = Element
-            
-            local currentColor = Default
-            local h, s, v = Color3.toHSV(currentColor)
-
-            local Container = createInstance('ImageButton', {
-                Parent = PageTarget,
-                BackgroundColor3 = Theme.ElementBG,
-                Size = UDim2.new(1, 0, 0, 36),
-                AutoButtonColor = false,
-                Image = ''
-            })
-            createInstance('UICorner', {Parent = Container, CornerRadius = UDim.new(0, 4)})
-            regTheme(Container, function() Container.BackgroundColor3 = Theme.ElementBG end)
-            table.insert(WindowObj.ElementsList, {Name = ElementName, Frame = Container, Tab = ParentTab})
-
-            local TitleLabel = createInstance('TextLabel', {
-                Parent = Container,
-                BackgroundTransparency = 1,
-                Position = UDim2.new(0, 12, 0, 0),
-                Size = UDim2.new(1, -120, 1, 0),
-                Font = Enum.Font.GothamMedium,
-                Text = ElementName,
-                TextColor3 = Theme.TextSub,
-                TextSize = 13,
-                TextXAlignment = Enum.TextXAlignment.Left
-            })
-            regTheme(TitleLabel, function() TitleLabel.TextColor3 = Theme.TextSub end)
-
-            local ColorView = createInstance('Frame', {
-                Parent = Container,
-                BackgroundColor3 = currentColor,
-                AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -6, 0.5, 0),
-                Size = UDim2.new(0, 40, 0, 20)
-            })
-            createInstance('UICorner', {Parent = ColorView, CornerRadius = UDim.new(0, 4)})
-            local ColorViewStroke = createInstance('UIStroke', {Parent = ColorView, Color = Theme.Border})
-            regTheme(ColorViewStroke, function() ColorViewStroke.Color = Theme.Border end)
-
-            local FloatPicker = createInstance('Frame', {
-                Parent = ScreenGui,
-                BackgroundColor3 = Color3.fromRGB(25, 25, 25),
-                Size = UDim2.new(0, 180, 0, 190),
-                ZIndex = 100,
-                Visible = false
-            })
-            
-            local FloatPickerScale = createInstance('UIScale', {Parent = FloatPicker, Scale = CurrentScale})
-            table.insert(ScalesToUpdate, FloatPickerScale)
-
-            createInstance('UICorner', {Parent = FloatPicker, CornerRadius = UDim.new(0, 6)})
-            local FloatPickerStroke = createInstance('UIStroke', {Parent = FloatPicker, Color = Theme.Border})
-            regTheme(FloatPickerStroke, function() FloatPickerStroke.Color = Theme.Border end)
-            regTheme(FloatPicker, function() FloatPicker.BackgroundColor3 = Theme.ElementBG end)
-
-            local SatValMap = createInstance('ImageButton', {
-                Parent = FloatPicker,
-                BackgroundColor3 = Color3.fromHSV(h, 1, 1),
-                Position = UDim2.new(0, 10, 0, 10),
-                Size = UDim2.new(0, 130, 0, 130),
-                Image = 'rbxassetid://4155801252',
-                AutoButtonColor = false
-            })
-            createInstance('UICorner', {Parent = SatValMap, CornerRadius = UDim.new(0, 4)})
-
-            local SVKnob = createInstance('Frame', {
-                Parent = SatValMap,
-                BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-                Size = UDim2.new(0, 4, 0, 4),
-                AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.new(s, 0, 1 - v, 0)
-            })
-            createInstance('UICorner', {Parent = SVKnob, CornerRadius = UDim.new(1, 0)})
-            createInstance('UIStroke', {Parent = SVKnob, Color = Color3.fromRGB(0, 0, 0)})
-
-            local HueMap = createInstance('ImageButton', {
-                Parent = FloatPicker,
-                Position = UDim2.new(0, 150, 0, 10),
-                Size = UDim2.new(0, 20, 0, 130),
-                BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-                AutoButtonColor = false,
-                Image = ''
-            })
-            createInstance('UICorner', {Parent = HueMap, CornerRadius = UDim.new(0, 4)})
-
-            createInstance('UIGradient', {
-                Parent = HueMap,
-                Color = ColorSequence.new({
-                    ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
-                    ColorSequenceKeypoint.new(0.167, Color3.fromRGB(255, 255, 0)),
-                    ColorSequenceKeypoint.new(0.333, Color3.fromRGB(0, 255, 0)),
-                    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(0, 255, 255)),
-                    ColorSequenceKeypoint.new(0.667, Color3.fromRGB(0, 0, 255)),
-                    ColorSequenceKeypoint.new(0.833, Color3.fromRGB(255, 0, 255)),
-                    ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0))
-                }),
-                Rotation = 90
-            })
-
-            local HueKnob = createInstance('Frame', {
-                Parent = HueMap,
-                BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-                Size = UDim2.new(1, 4, 0, 4),
-                AnchorPoint = Vector2.new(0.5, 0.5),
-                Position = UDim2.new(0.5, 0, 1 - h, 0)
-            })
-            createInstance('UIStroke', {Parent = HueKnob, Color = Color3.fromRGB(0, 0, 0)})
-
-            local HexBox = createInstance('TextBox', {
-                Parent = FloatPicker,
-                Position = UDim2.new(0, 10, 0, 150),
-                Size = UDim2.new(0, 75, 0, 24),
-                BackgroundColor3 = Color3.fromRGB(35, 35, 35),
-                TextColor3 = Color3.fromRGB(255, 255, 255),
-                Font = Enum.Font.Gotham,
-                TextSize = 11,
-                Text = currentColor:ToHex(),
-                ClearTextOnFocus = false
-            })
-            createInstance('UICorner', {Parent = HexBox, CornerRadius = UDim.new(0, 4)})
-            regTheme(HexBox, function() HexBox.BackgroundColor3 = Theme.MainBG end)
-
-            local RGBBox = createInstance('TextBox', {
-                Parent = FloatPicker,
-                Position = UDim2.new(0, 95, 0, 150),
-                Size = UDim2.new(0, 75, 0, 24),
-                BackgroundColor3 = Color3.fromRGB(35, 35, 35),
-                TextColor3 = Color3.fromRGB(255, 255, 255),
-                Font = Enum.Font.Gotham,
-                TextSize = 11,
-                Text = math.floor(currentColor.R*255)..', '..math.floor(currentColor.G*255)..', '..math.floor(currentColor.B*255),
-                ClearTextOnFocus = false
-            })
-            createInstance('UICorner', {Parent = RGBBox, CornerRadius = UDim.new(0, 4)})
-            regTheme(RGBBox, function() RGBBox.BackgroundColor3 = Theme.MainBG end)
-
-            SetupTooltip(Container, options.Tip)
-
-            local UpdateColor = function()
-                currentColor = Color3.fromHSV(h, s, v)
-                ColorView.BackgroundColor3 = currentColor
-                SatValMap.BackgroundColor3 = Color3.fromHSV(h, 1, 1)
-                HexBox.Text = currentColor:ToHex()
-                RGBBox.Text = math.floor(currentColor.R*255)..', '..math.floor(currentColor.G*255)..', '..math.floor(currentColor.B*255)
-                Element.Value = currentColor
-                AeroLib.Flags[ElementName].Value = currentColor
-                Callback(currentColor)
-            end
-
-            HexBox.FocusLost:Connect(function()
-                local success, color = pcall(function() return Color3.fromHex(HexBox.Text) end)
-                if success then
-                    currentColor = color
-                    h, s, v = Color3.toHSV(currentColor)
-                    SVKnob.Position = UDim2.new(s, 0, 1 - v, 0)
-                    HueKnob.Position = UDim2.new(0.5, 0, 1 - h, 0)
-                    UpdateColor()
-                else
-                    HexBox.Text = currentColor:ToHex()
-                end
-            end)
-
-            RGBBox.FocusLost:Connect(function()
-                local r, g, b = RGBBox.Text:match('(%d+)[%s,]+(%d+)[%s,]+(%d+)')
-                if r and g and b then
-                    currentColor = Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b))
-                    h, s, v = Color3.toHSV(currentColor)
-                    SVKnob.Position = UDim2.new(s, 0, 1 - v, 0)
-                    HueKnob.Position = UDim2.new(0.5, 0, 1 - h, 0)
-                    UpdateColor()
-                else
-                    RGBBox.Text = math.floor(currentColor.R*255)..', '..math.floor(currentColor.G*255)..', '..math.floor(currentColor.B*255)
-                end
-            end)
-
-            local draggingSV = false
-            SatValMap.InputBegan:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then draggingSV = true end
-            end)
-            local draggingHue = false
-            HueMap.InputBegan:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then draggingHue = true end
-            end)
-            UserInputService.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                    draggingSV = false
-                    draggingHue = false
-                end
-            end)
-            UserInputService.InputChanged:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-                    if draggingSV then
-                        local pctX = math.clamp((input.Position.X - SatValMap.AbsolutePosition.X) / SatValMap.AbsoluteSize.X, 0, 1)
-                        local pctY = math.clamp((input.Position.Y - SatValMap.AbsolutePosition.Y) / SatValMap.AbsoluteSize.Y, 0, 1)
-                        s = pctX
-                        v = 1 - pctY
-                        SVKnob.Position = UDim2.new(s, 0, 1 - v, 0)
-                        UpdateColor()
-                    elseif draggingHue then
-                        local pctY = math.clamp((input.Position.Y - HueMap.AbsolutePosition.Y) / HueMap.AbsoluteSize.Y, 0, 1)
-                        h = 1 - pctY
-                        HueKnob.Position = UDim2.new(0.5, 0, 1 - h, 0)
-                        UpdateColor()
-                    end
-                end
-            end)
-
-            Container.MouseButton1Click:Connect(function()
-                FloatPicker.Position = UDim2.new(0, ColorView.AbsolutePosition.X - (140 * CurrentScale), 0, ColorView.AbsolutePosition.Y + (28 * CurrentScale))
-                FloatPicker.Visible = not FloatPicker.Visible
-            end)
-
-            UserInputService.InputBegan:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-                    local pos = input.Position
-                    if FloatPicker.Visible then
-                        local x1, y1 = FloatPicker.AbsolutePosition.X, FloatPicker.AbsolutePosition.Y
-                        local x2, y2 = x1 + FloatPicker.AbsoluteSize.X, y1 + FloatPicker.AbsoluteSize.Y
-                        local cx1, cy1 = Container.AbsolutePosition.X, Container.AbsolutePosition.Y
-                        local cx2, cy2 = cx1 + Container.AbsoluteSize.X, cy1 + Container.AbsoluteSize.Y
-                        if not (pos.X >= x1 and pos.X <= x2 and pos.Y >= y1 and pos.Y <= y2) and not (pos.X >= cx1 and pos.X <= cx2 and pos.Y >= cy1 and pos.Y <= cy2) then
-                            FloatPicker.Visible = false
-                        end
-                    end
-                end
-            end)
-            
-            function Element:Set(val)
-                currentColor = val
-                h, s, v = Color3.toHSV(currentColor)
-                SVKnob.Position = UDim2.new(s, 0, 1 - v, 0)
-                HueKnob.Position = UDim2.new(0.5, 0, 1 - h, 0)
-                UpdateColor()
-            end
-
-            return Element
-        end
-
-        Builder.CreateKeybind = function(self, options)
-            local ElementName = options.Name or 'Keybind'
-            local Default = options.Default or Enum.KeyCode.E
-            local Callback = options.Callback or function() end
-            local currentBind = Default
-            
-            local Element = { Value = currentBind }
-            AeroLib.Flags[ElementName] = Element
-
-            local BindFrame = createInstance('Frame', {
-                Parent = PageTarget,
-                BackgroundColor3 = Theme.ElementBG,
-                Size = UDim2.new(1, 0, 0, 36)
-            })
-            createInstance('UICorner', {Parent = BindFrame, CornerRadius = UDim.new(0, 4)})
-            regTheme(BindFrame, function() BindFrame.BackgroundColor3 = Theme.ElementBG end)
-            table.insert(WindowObj.ElementsList, {Name = ElementName, Frame = BindFrame, Tab = ParentTab})
-
-            local TitleLabel = createInstance('TextLabel', {
-                Parent = BindFrame,
-                BackgroundTransparency = 1,
-                Position = UDim2.new(0, 12, 0, 0),
-                Size = UDim2.new(1, -120, 1, 0),
-                Font = Enum.Font.GothamMedium,
-                Text = ElementName,
-                TextColor3 = Theme.TextSub,
-                TextSize = 13,
-                TextXAlignment = Enum.TextXAlignment.Left
-            })
-            regTheme(TitleLabel, function() TitleLabel.TextColor3 = Theme.TextSub end)
-
-            local BindContainer = createInstance('Frame', {
-                Parent = BindFrame,
-                AnchorPoint = Vector2.new(1, 0.5),
-                Position = UDim2.new(1, -6, 0.5, 0),
-                Size = UDim2.new(0, 60, 0, 22),
-                BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-            })
-            createInstance('UICorner', {Parent = BindContainer, CornerRadius = UDim.new(0, 4)})
-            regTheme(BindContainer, function() BindContainer.BackgroundColor3 = Theme.MainBG end)
-            
-            local BindContainerStroke = createInstance('UIStroke', {Parent = BindContainer, Color = Theme.Border})
-            regTheme(BindContainerStroke, function() BindContainerStroke.Color = Theme.Border end)
-
-            local BindBtn = createInstance('TextButton', {
-                Parent = BindContainer,
-                BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 1, 0),
-                Text = currentBind.Name,
-                Font = Enum.Font.Gotham,
-                TextColor3 = Theme.TextSub,
-                TextSize = 11
-            })
-
-            SetupTooltip(BindFrame, options.Tip)
-
-            local UpdateBindSize = function()
-                local bindName = currentBind and currentBind.Name or 'None'
-                BindBtn.Text = bindName
-                local textBounds = TextService:GetTextSize(bindName, 11, Enum.Font.Gotham, Vector2.new(1000, 22))
-                BindContainer.Size = UDim2.new(0, math.max(textBounds.X + 16, 40), 0, 22)
-            end
-            UpdateBindSize()
-
-            local isBinding = false
-            BindBtn.MouseButton1Click:Connect(function()
-                isBinding = true
-                BindBtn.Text = '...'
-                BindContainer.Size = UDim2.new(0, 40, 0, 22)
-            end)
-
-            UserInputService.InputBegan:Connect(function(input, gpe)
-                if isBinding and (input.UserInputType == Enum.UserInputType.Keyboard or input.UserInputType == Enum.UserInputType.Gamepad1) then
-                    currentBind = input.KeyCode
-                    isBinding = false
-                    UpdateBindSize()
-                    
-                    Element.Value = currentBind
-                    AeroLib.Flags[ElementName].Value = currentBind
-                    Callback(currentBind)
-                end
-            end)
-            
-            function Element:Set(val)
-                currentBind = val
-                UpdateBindSize()
-                Element.Value = currentBind
-                AeroLib.Flags[ElementName].Value = currentBind
-                Callback(currentBind)
-            end
-
-            return Element
-        end
-
-        return setmetatable(Builder, {__index = Builder})
-    end
-
-    local HomeBody = MasterContainers['Home']
-    local Sidebar = createInstance('ScrollingFrame', {
-        Parent = HomeBody,
-        BackgroundTransparency = 1,
-        Size = UDim2.new(0, 160, 1, 0),
-        BorderSizePixel = 0,
-        ScrollBarThickness = 0,
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        CanvasSize = UDim2.new(0, 0, 0, 0)
-    })
-
-    createInstance('UIListLayout', {
-        Parent = Sidebar,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 4)
-    })
-    
-    createInstance('UIPadding', {
-        Parent = Sidebar,
-        PaddingTop = UDim.new(0, 10),
-        PaddingLeft = UDim.new(0, 8),
-        PaddingRight = UDim.new(0, 8)
-    })
-
-    local ContentContainer = createInstance('Frame', {
-        Parent = HomeBody,
-        BackgroundTransparency = 1,
-        Position = UDim2.new(0, 160, 0, 0),
-        Size = UDim2.new(1, -160, 1, 0)
-    })
-
-    WindowObj.CreateTab = function(self, options)
-        local TabName = options.Name or 'Tab'
-        local TabIconId = options.Icon or 'rbxassetid://6034502844'
-
-        local TabBtn = createInstance('ImageButton', {
-            Parent = Sidebar,
-            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 0, 38),
-            AutoButtonColor = false,
-            Image = ''
-        })
-        createInstance('UICorner', {Parent = TabBtn, CornerRadius = UDim.new(0, 4)})
-
-        local TabGradient = createInstance('UIGradient', {
-            Parent = TabBtn,
-            Color = ColorSequence.new(Theme.Accent),
-            Offset = Vector2.new(-1, 0),
-            Transparency = NumberSequence.new({
-                NumberSequenceKeypoint.new(0, 0.86),
-                NumberSequenceKeypoint.new(0.6, 1),
-                NumberSequenceKeypoint.new(1, 1)
-            })
-        })
-        regTheme(TabGradient, function()
-            TabGradient.Color = ColorSequence.new(Theme.Accent)
-        end)
-
-        local IconImg = createInstance('ImageLabel', {
-            Parent = TabBtn,
-            BackgroundTransparency = 1,
-            Position = UDim2.new(0, 12, 0.5, -9),
-            Size = UDim2.new(0, 18, 0, 18),
-            Image = TabIconId,
-            ImageColor3 = Theme.TextSub
-        })
-
-        local TextLabel = createInstance('TextLabel', {
-            Parent = TabBtn,
-            BackgroundTransparency = 1,
-            Position = UDim2.new(0, 40, 0, 0),
-            Size = UDim2.new(1, -40, 1, 0),
-            Font = Enum.Font.GothamMedium,
-            Text = TabName,
-            TextColor3 = Theme.TextSub,
-            TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left
-        })
-
-        TabBtn.MouseEnter:Connect(function()
-            if WindowObj.CurrentTab ~= TabName then
-                TweenService:Create(TextLabel, TweenInfo.new(0.2), {TextColor3 = Color3.fromRGB(210, 210, 210)}):Play()
-                TweenService:Create(IconImg, TweenInfo.new(0.2), {ImageColor3 = Color3.fromRGB(210, 210, 210)}):Play()
-            end
-        end)
-        TabBtn.MouseLeave:Connect(function()
-            if WindowObj.CurrentTab ~= TabName then
-                TweenService:Create(TextLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextSub}):Play()
-                TweenService:Create(IconImg, TweenInfo.new(0.2), {ImageColor3 = Theme.TextSub}):Play()
-            end
-        end)
-
-        local PageGroup = createInstance('CanvasGroup', {
-            Parent = ContentContainer,
-            Size = UDim2.new(1, 0, 1, 0),
-            Position = UDim2.new(0, 50, 0, 0),
-            BackgroundTransparency = 1,
-            GroupTransparency = 1,
-            BorderSizePixel = 0,
-            Visible = false
-        })
-
-        local Page = createInstance('ScrollingFrame', {
-            Parent = PageGroup,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 1, 0),
-            ScrollBarThickness = 2,
-            ScrollBarImageColor3 = Theme.Border,
-            BorderSizePixel = 0,
-            AutomaticCanvasSize = Enum.AutomaticSize.Y,
-            CanvasSize = UDim2.new(0, 0, 0, 0)
-        })
-        regTheme(Page, function() Page.ScrollBarImageColor3 = Theme.Border end)
-        
-        createInstance('UIPadding', {
-            Parent = Page,
-            PaddingTop = UDim.new(0, 15),
-            PaddingLeft = UDim.new(0, 20),
-            PaddingRight = UDim.new(0, 20)
-        })
-
-        createInstance('UIListLayout', {
-            Parent = Page,
-            SortOrder = Enum.SortOrder.LayoutOrder,
-            Padding = UDim.new(0, 8)
-        })
-
-        local TabObj = { Name = TabName, Page = Page, Select = nil }
-        local Builder = CreateElementBuilder(Page, TabObj)
-
-        TabObj.Select = function()
-            if WindowObj.CurrentTab == TabObj.Name then return end
-            if WindowObj.CurrentTab then 
-                WindowObj.CurrentTab.Unselect() 
-            end
-            WindowObj.CurrentTab = TabObj
-            
-            PageGroup.Visible = true
-            PageGroup.Position = UDim2.new(0, 50, 0, 0)
-            PageGroup.GroupTransparency = 1
-            TweenService:Create(PageGroup, TweenInfo.new(0.65, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0}):Play()
-            
-            TweenService:Create(TabBtn, TweenInfo.new(0.2), {BackgroundTransparency = 0}):Play()
-            TweenService:Create(TabGradient, TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Offset = Vector2.new(0, 0)}):Play()
-            TweenService:Create(TextLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextMain}):Play()
-            TweenService:Create(IconImg, TweenInfo.new(0.2), {ImageColor3 = Theme.TextMain}):Play()
-        end
-
-        TabObj.Unselect = function()
-            TweenService:Create(PageGroup, TweenInfo.new(0.65, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, -50, 0, 0), GroupTransparency = 1}):Play()
-            task.delay(0.65, function() if WindowObj.CurrentTab ~= TabObj then PageGroup.Visible = false end end)
-
-            TweenService:Create(TabGradient, TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Offset = Vector2.new(-1, 0)}):Play()
-            TweenService:Create(TabBtn, TweenInfo.new(0.2), {BackgroundTransparency = 1}):Play()
-            TweenService:Create(TextLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextSub}):Play()
-            TweenService:Create(IconImg, TweenInfo.new(0.2), {ImageColor3 = Theme.TextSub}):Play()
-        end
-
-        TabBtn.MouseButton1Click:Connect(TabObj.Select)
-
-        if #WindowObj.Tabs == 0 then TabObj.Select() end
-        table.insert(WindowObj.Tabs, TabObj)
-
-        return setmetatable(TabObj, {__index = Builder})
-    end
-
-    local MakeSubTabElements = function(TabName)
-        local parentGrp = MasterContainers[TabName]
-        local Page = createInstance('ScrollingFrame', {
-            Parent = parentGrp,
-            BackgroundTransparency = 1,
-            Size = UDim2.new(1, 0, 1, 0),
-            ScrollBarThickness = 2,
-            ScrollBarImageColor3 = Theme.Border,
-            BorderSizePixel = 0,
-            AutomaticCanvasSize = Enum.AutomaticSize.Y,
-            CanvasSize = UDim2.new(0, 0, 0, 0)
-        })
-        createInstance('UIPadding', {
-            Parent = Page,
-            PaddingTop = UDim.new(0, 15),
-            PaddingLeft = UDim.new(0, 20),
-            PaddingRight = UDim.new(0, 20)
-        })
-        createInstance('UIListLayout', {
-            Parent = Page,
-            SortOrder = Enum.SortOrder.LayoutOrder,
-            Padding = UDim.new(0, 8)
-        })
-        regTheme(Page, function() Page.ScrollBarImageColor3 = Theme.Border end)
-        return CreateElementBuilder(Page, {Name = TabName, Page = Page, Select = function()
-            if activeSubTab ~= TabName then
-                local btn = SubTabs:FindFirstChild(TabName .. 'Tab')
-                if btn then
-                    local subChildren = SubTabs:GetChildren()
-                    for i = 1, #subChildren do
-                        local child = subChildren[i]
-                        if child:IsA('ImageButton') and child.Name ~= TabName .. 'Tab' then
-                            TweenService:Create(child.TextLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextSub}):Play()
-                            TweenService:Create(child.Frame, TweenInfo.new(0.2), {Size = UDim2.new(0, 0, 0, 2), BackgroundTransparency = 1}):Play()
-                            local oc = MasterContainers[child.Name:gsub('Tab', '')]
-                            if oc then
-                                TweenService:Create(oc, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {Position = UDim2.new(0, 0, 0, -15), GroupTransparency = 1}):Play()
-                                task.delay(0.25, function() oc.Visible = false end)
-                            end
-                        end
-                    end
-                    activeSubTab = TabName
-                    TweenService:Create(btn.TextLabel, TweenInfo.new(0.2), {TextColor3 = Theme.TextMain}):Play()
-                    TweenService:Create(btn.Frame, TweenInfo.new(0.2), {Size = UDim2.new(1, 0, 0, 2), BackgroundTransparency = 0}):Play()
-                    local nc = MasterContainers[TabName]
-                    if nc then
-                        nc.Visible = true
-                        nc.Position = UDim2.new(0, 0, 0, 15)
-                        nc.GroupTransparency = 1
-                        TweenService:Create(nc, TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Position = UDim2.new(0, 0, 0, 0), GroupTransparency = 0}):Play()
-                    end
-                end
-            end
-        end})
-    end
-
-    WindowObj.UISettings = MakeSubTabElements('UI Settings')
-    
-    WindowObj.UISettings:CreateKeybind({
-        Name = 'Menu Visible Keybind',
-        Default = MenuKeybind,
-        Callback = function(key) MenuKeybind = key end
-    })
-    
-    local themeNamesList = {}
-    for name, _ in pairs(Themes) do
-        table.insert(themeNamesList, name)
-    end
-    table.sort(themeNamesList)
-
-    WindowObj.UISettings:CreateDropdown({
-        Name = 'Select UI Theme',
-        Options = themeNamesList,
-        Default = defaultTheme,
-        Callback = function(selectedTheme)
-            ApplySelectedTheme(selectedTheme)
-        end
-    })
-    
-    local AccentColorElement
-    AccentColorElement = WindowObj.UISettings:CreateColorpicker({
-        Name = 'Accent Color',
-        Default = Theme.Accent,
-        Callback = function(color) 
-            if not AeroLib.RainbowAccent then
-                UpdateThemeAccent(color) 
-            end
-        end
-    })
-
-    WindowObj.UISettings:CreateToggle({
-        Name = 'Rainbow Accent',
-        Default = false,
-        Callback = function(val)
-            AeroLib.RainbowAccent = val
-            if not val and AccentColorElement then
-                UpdateThemeAccent(AccentColorElement.Value)
-            end
-        end
-    })
-
-    WindowObj.UISettings:CreateSlider({
-        Name = 'Rainbow Speed',
-        Min = 1,
-        Max = 20,
-        Default = 5,
-        Increment = 1,
-        Suffix = '',
-        Callback = function(val)
-            AeroLib.RainbowSpeed = val
-        end
-    })
-
-    WindowObj.UISettings:CreateButton({
-        Name = 'Randomize Theme',
-        Callback = function()
-            local baseHue = math.random()
-            local bgSaturation = math.random() * 0.2
-            local bgValue = math.random() * 0.15 + 0.05
-            
-            Theme.MainBG = Color3.fromHSV(baseHue, bgSaturation, bgValue)
-            Theme.SidebarBG = Color3.fromHSV(baseHue, bgSaturation, math.clamp(bgValue + 0.02, 0, 1))
-            Theme.TopbarBG = Color3.fromHSV(baseHue, bgSaturation, math.clamp(bgValue - 0.02, 0, 1))
-            Theme.ElementBG = Color3.fromHSV(baseHue, bgSaturation, math.clamp(bgValue + 0.05, 0, 1))
-            Theme.Border = Color3.fromHSV(baseHue, bgSaturation, math.clamp(bgValue + 0.1, 0, 1))
-            Theme.DropdownListBG = Theme.ElementBG
-            Theme.DropdownListStroke = Theme.Border
-            
-            local acH = (baseHue + math.random() * 0.5) % 1
-            Theme.Accent = Color3.fromHSV(acH, 0.8, 0.9)
-            
-            Theme.TextMain = Color3.fromRGB(240, 240, 240)
-            Theme.TextSub = Color3.fromRGB(160, 160, 160)
-
-            local alive = {}
-            for i = 1, #AeroLib.ThemeConnections do
-                local func = AeroLib.ThemeConnections[i]
-                if type(func) == 'function' then
-                    local s, res = pcall(func)
-                    if s and res ~= false then 
-                        table.insert(alive, func) 
-                    end
-                end
-            end
-            AeroLib.ThemeConnections = alive
-        end
-    })
-
-    WindowObj.UISettings:CreateToggle({
-        Name = 'Notifications & Tooltips',
-        Default = true,
-        Callback = function(val) 
-            AeroLib.ShowNotifications = val 
-            AeroLib.ShowTooltips = val 
-        end
-    })
-
-    WindowObj.UISettings:CreateSlider({
-        Name = 'Window Scale',
-        Min = 50,
-        Max = 150,
-        Default = 100,
-        Increment = 5,
-        Suffix = '%',
-        Callback = function(val) WindowObj:UpdateScale(val / 100) end
-    })
-
-    WindowObj.Configs = MakeSubTabElements('Configs')
-    local ConfigName = 'default'
-    local ConfigFolder = 'aero/' .. tostring(game.GameId)
-    local SecureFolder = function()
-        if makefolder then
-            if not isfolder('aero') then makefolder('aero') end
-            if not isfolder(ConfigFolder) then makefolder(ConfigFolder) end
-        end
-    end
-    local RefreshConfigs = function(dropdownObj)
-        if not listfiles then return end
-        SecureFolder()
-        local list = {}
-        local success, files = pcall(function() return listfiles(ConfigFolder) end)
-        if success and type(files) == 'table' then
-            for i = 1, #files do
-                local file = files[i]
-                if type(file) == 'string' then
-                    local match = file:match('([^/\\\\]+)%.json$')
-                    if match then table.insert(list, match) end
-                elseif type(file) == 'table' then
-                    local path = file.Path or file.path or file.Name or file.name or tostring(file)
-                    if type(path) == 'string' then
-                        local match = path:match('([^/\\\\]+)%.json$')
-                        if match then table.insert(list, match) end
-                    end
-                end
-            end
-        end
-        dropdownObj:Refresh(list)
-    end
-
-    local CfgTextBox = WindowObj.Configs:CreateTextbox({
-        Name = 'Config Name',
-        UseLetter = true,
-        UseNumber = true,
-        Callback = function(txt) ConfigName = txt end
-    })
-
-    local AutoloadTog
-    local isAutoload = (readfile and isfile('aero_autoload.txt') and readfile('aero_autoload.txt') == ConfigName) or false
-    
-    AutoloadTog = WindowObj.Configs:CreateToggle({
-        Name = 'Autoload',
-        Default = isAutoload,
-        Callback = function(val)
-            if writefile then
-                SecureFolder()
-                if val then
-                    writefile('aero_autoload.txt', ConfigName)
-                else
-                    if isfile('aero_autoload.txt') then
-                        delfile('aero_autoload.txt')
-                    end
-                end
-            end
-        end
-    })
-
-    local ConfigDrop
-    WindowObj.Configs:CreateButton({
-        Name = 'Save Config',
-        Callback = function()
-            if writefile then
-                SecureFolder()
-                local data = {}
-                for k,v in pairs(AeroLib.Flags) do 
-                    data[k] = SerializeValue(v.Value) 
-                end
-                writefile(ConfigFolder .. '/' .. ConfigName .. '.json', HttpService:JSONEncode(data))
-                if ConfigDrop then RefreshConfigs(ConfigDrop) end
-            end
-        end
-    })
-
-    WindowObj.Configs:CreateButton({
-        Name = 'Load Config',
-        Callback = function()
-            if readfile and isfile(ConfigFolder .. '/' .. ConfigName .. '.json') then
-                local success, data = pcall(function()
-                    return HttpService:JSONDecode(readfile(ConfigFolder .. '/' .. ConfigName .. '.json'))
-                end)
-                if success and type(data) == 'table' then
-                    for k,v in pairs(data) do
-                        local flagElement = AeroLib.Flags[k]
-                        if flagElement then 
-                            local decodedVal = DeserializeValue(v)
-                            if decodedVal ~= nil then
-                                flagElement:Set(decodedVal)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    })
-
-    ConfigDrop = WindowObj.Configs:CreateDropdown({
-        Name = 'View Configs',
-        Options = {},
-        Callback = function(sel) 
-            ConfigName = sel 
-            if AutoloadTog then
-                local activeAuto = (readfile and isfile('aero_autoload.txt') and readfile('aero_autoload.txt') == ConfigName) or false
-                AutoloadTog:Set(activeAuto)
-            end
-        end
-    })
-    RefreshConfigs(ConfigDrop)
-
-    WindowObj.Configs:CreateButton({
-        Name = 'Delete Config',
-        Callback = function()
-            if delfile and isfile(ConfigFolder .. '/' .. ConfigName .. '.json') then
-                delfile(ConfigFolder .. '/' .. ConfigName .. '.json')
-                if ConfigDrop then RefreshConfigs(ConfigDrop) end
-            end
-        end
-    })
-
-    ApplySelectedTheme(defaultTheme)
-
-    task.spawn(function()
-        if readfile and isfile('aero_autoload.txt') then
-            local autoCfg = readfile('aero_autoload.txt')
-            local filePath = ConfigFolder .. '/' .. autoCfg .. '.json'
-            if isfile(filePath) then
-                local success, data = pcall(function()
-                    return HttpService:JSONDecode(readfile(filePath))
-                end)
-                if success and type(data) == 'table' then
-                    task.wait(0.5)
-                    for k,v in pairs(data) do
-                        local flagElement = AeroLib.Flags[k]
-                        if flagElement then 
-                            local decodedVal = DeserializeValue(v)
-                            if decodedVal ~= nil then
-                                flagElement:Set(decodedVal)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end)
-
-    local connection
-    connection = RunService.RenderStepped:Connect(function()
-        local success, hasParent = pcall(function() return ScreenGui and ScreenGui.Parent end)
-        if not success or not hasParent then
-            if connection then connection:Disconnect() end
-            return
-        end
-    end)
-
-    return WindowObj
-end
-
-local Window = AeroLib:CreateWindow({
-    Title = 'ro',
-    Prefix = 'Ae',
-    Theme = 'Minimal White'
-})
-
-local ThrowingTab = Window:CreateTab({ Name = 'QB Aimbot', Icon = 'rbxassetid://6034684949' })
-
-enableQbAimbot = ThrowingTab:CreateToggle({
-    Name = 'Enable QB Aimbot',
-    Default = false,
-    Tip = 'Automatically aims passes at the best target for more accurate throws.',
-})
-
-throwAimbot = ThrowingTab:CreateToggle({
-    Name = 'Throw To Mouse Aimbot',
-    Default = false,
-    Tip = 'Automatically aims passes toward your mouse position.',
-})
-
-autoChooseWr = ThrowingTab:CreateToggle({
-    Name = 'Auto Choose Open Reciever',
-    Default = false,
-    Tip = 'Automatically selects the most open receiver for each throw.',
-})
-
-autoSelectThrowMode = ThrowingTab:CreateToggle({
-    Name = 'Auto Select Throw Type',
-    Default = false,
-    Tip = 'Automatically chooses the best throw type for each pass.',
-})
-
-autoPower = ThrowingTab:CreateToggle({
-    Name = 'Auto Power',
-    Default = false,
-    Tip = 'Automatically sets the optimal throw power.',
-})
-
-autoAngle = ThrowingTab:CreateToggle({
-    Name = 'Auto Angle',
-    Default = false,
-    Tip = 'Automatically adjusts throw angle for better accuracy.',
-})
-
-highPowerOnly = ThrowingTab:CreateToggle({
-    Name = 'High Power Only',
-    Default = false,
-    Tip = 'Only uses high-power throws when passing.',
-})
-
-antiDB = ThrowingTab:CreateToggle({
-    Name = 'Anti DB',
-    Default = false,
-    Tip = 'Avoids throws that defenders can easily intercept.',
-})
-
-antiDBThreshold = ThrowingTab:CreateSlider({
-    Name = 'Anti DB Threshold',
-    Min = 0,
-    Max = 15,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets how aggressively defender coverage is avoided.',
-})
-
-antiOOB = ThrowingTab:CreateToggle({
-    Name = 'Anti OOB',
-    Default = false,
-    Tip = 'Prevents throws that may lead receivers out of bounds.',
-})
-
-antiOOBThreshold = ThrowingTab:CreateSlider({
-    Name = 'Anti OOB Threshold',
-    Min = 0,
-    Max = 15,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets how close targets can be to the sideline.',
-})
-
-throwLeadOffset = ThrowingTab:CreateSlider({
-    Name = 'Throw Lead Offset',
-    Min = -10,
-    Max = 10,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Adjusts how far ahead passes are led.',
-})
-
-throwHeightOffset = ThrowingTab:CreateSlider({
-    Name = 'Throw Height Offset',
-    Min = -10,
-    Max = 10,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Adjusts the height of targeted throws.',
-})
-
-autoJuke = ThrowingTab:CreateToggle({
-    Name = 'Auto Juke Rusher',
-    Default = false,
-    Tip = 'Automatically jukes nearby rushers before throwing.',
-})
-
-hideCards = ThrowingTab:CreateToggle({
-    Name = 'Hide QB Aimbot Cards',
-    Default = false,
-    Tip = 'Hides QB Aimbot visual cards from the screen.',
-})
-
-autoChangePowerUI = ThrowingTab:CreateToggle({
-    Name = 'Auto Change Power UI',
-    Default = false,
-    Tip = 'Automatically updates the power UI to match throws.',
-})
-
-autoJumpWhenThrow = ThrowingTab:CreateToggle({
-    Name = 'Auto Jump Before Throw',
-    Default = false,
-    Tip = 'Automatically jumps before releasing the ball.',
-})
-
-autoThrowAfterSack = ThrowingTab:CreateToggle({
-    Name = 'Auto Throw Before Getting Sacked',
-    Default = false,
-    Tip = 'Automatically throws the ball when a sack is imminent.',
-})
-
-dimeKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Dime Mode Keybind',
-    Default = Enum.KeyCode.One,
-    Tip = 'Switches to Dime throw mode.',
-})
-
-magKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Mag Mode Keybind',
-    Default = Enum.KeyCode.Two,
-    Tip = 'Switches to Mag throw mode.',
-})
-
-diveKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Dive Mode Keybind',
-    Default = Enum.KeyCode.Three,
-    Tip = 'Switches to Dive throw mode.',
-})
-
-jumpKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Jump Mode Keybind',
-    Default = Enum.KeyCode.Four,
-    Tip = 'Switches to Jump throw mode.',
-})
-
-bulletKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Bullet Mode Keybind',
-    Default = Enum.KeyCode.Five,
-    Tip = 'Switches to Bullet throw mode.',
-})
-
-throwBallAwayKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Throw Ball Away Keybind',
-    Default = Enum.KeyCode.T,
-    Tip = 'Instantly throws the ball away.',
-})
-
-increaseAngleKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Increase Angle Keybind',
-    Default = Enum.KeyCode.R,
-    Tip = 'Increases the current throw angle.',
-})
-
-decreaseAngleKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Decrease Angle Keybind',
-    Default = Enum.KeyCode.F,
-    Tip = 'Decreases the current throw angle.',
-})
-
-lockKeybind = ThrowingTab:CreateKeybind({
-    Name = 'Lock To Target Keybind',
-    Default = Enum.KeyCode.Z,
-    Tip = 'Locks passes onto the current target.',
-})
-
-local players = game:GetService('Players')
-local replicatedStorage = game:GetService('ReplicatedStorage')
-local tweenService = game:GetService('TweenService')
-local userInputService = game:GetService('UserInputService')
-local runService = game:GetService('RunService')
-local stats = game:GetService('Stats')
-local camera = workspace.CurrentCamera
-local lp = players.LocalPlayer
-if not lp then
-    players:GetPropertyChangedSignal('LocalPlayer'):Wait()
-    lp = players.LocalPlayer
-end
-local mouse = lp:GetMouse()
-
-local isPractice = (game.PlaceId == 81310542478972)
-if isPractice then
-    autoJuke.Value = false
-end
-
-local targetLocked = false
-local lockedTarget = nil
-
-local RouteData = {}
-local HUDCards = {}
-local rusherHighlights = {}
-local numCards = 0
-
-local leadDime = 8.5
-local leadMag = 8.6
-local leadDive = 8.5
-local leadJump = 8.4
-local leadBullet = 2.5 
-
-local yLeadDime = 1.2
-local yLeadMag = 1.0
-local yLeadDive = 1.5
-local yLeadJump = 2.0
-local yLeadBullet = -0.8
-
-local ModeOrder = {'Bullet', 'Dime', 'Dive', 'Jump', 'Mag'}
-
-local QBKeybinds = {
-    [dimeKeybind.Value] = 'Dime',
-    [magKeybind.Value] = 'Mag',
-    [diveKeybind.Value] = 'Dive',
-    [jumpKeybind.Value] = 'Jump',
-    [bulletKeybind.Value] = 'Bullet'
-}
-
-local customHeight = { Value = 0 }
-
-local target = nil
-local lastValidTarget = nil
-local targetLeadPos = nil
-local highlight = nil
-local direction = Vector3.new(0, 1, 0)
-local power = 60
-local angle = 45
-local airtime = 0
-local isThrowing = false
-local isThrowingAway = false
-local firedRemote = false
-local modeIndex = 1
-local smoothedJukeDir = Vector3.zero
-
-local lockedMousePos = nil
-
-local LockToggleBtn = nil
-local LockedLabel = nil
-
-local attach0 = Instance.new('Attachment', workspace.Terrain)
-local attach1 = Instance.new('Attachment', workspace.Terrain)
-
-local beam = Instance.new('Beam')
-beam.Attachment0 = attach0
-beam.Attachment1 = attach1
-beam.Segments = 7500
-beam.Width0 = 1
-beam.Width1 = 1
-beam.FaceCamera = true
-beam.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255))
-beam.Transparency = NumberSequence.new({
-    NumberSequenceKeypoint.new(0, 1),
-    NumberSequenceKeypoint.new(0.01, 0),
-    NumberSequenceKeypoint.new(1, 0)
-})
-beam.Enabled = true
-beam.Parent = workspace.Terrain
-
-local posPart = Instance.new('Part', workspace.Terrain)
-posPart.Anchored = true
-posPart.CanCollide = false
-posPart.CastShadow = false
-posPart.Size = Vector3.new(3, 3, 3)
-posPart.Shape = Enum.PartType.Ball
-posPart.Color = Color3.fromRGB(0, 0, 0)
-
-local hudFolder = nil
-pcall(function()
-    hudFolder = (gethui and gethui()) or game:GetService('CoreGui')
-end)
-if not hudFolder or (hudFolder.Name == 'CoreGui' and not pcall(function() Instance.new('Folder', hudFolder):Destroy() end)) then
-    hudFolder = lp:WaitForChild('PlayerGui', 10)
-end
-
-local sg = Instance.new('ScreenGui')
-sg.ResetOnSpawn = false
-sg.Parent = hudFolder
-sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-local container = Instance.new('CanvasGroup')
-container.Size = UDim2.new(1, 0, 0, 100)
-container.Position = UDim2.new(0.5, 0, 0.05, 0)
-container.AnchorPoint = Vector2.new(0.5, 0)
-container.BackgroundTransparency = 1
-container.GroupTransparency = 1
-container.Visible = true
-container.Parent = sg
-
-local hudVisible = false
-local updateHUDVisibility = function(show)
-    if show and not hudVisible then
-        hudVisible = true
-        tweenService:Create(container, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {GroupTransparency = 0}):Play()
-    elseif not show and hudVisible then
-        hudVisible = false
-        tweenService:Create(container, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {GroupTransparency = 1}):Play()
-    end
-end
-
-local containerScale = Instance.new('UIScale', container)
-
-local updateScale = function()
-    local vp = camera.ViewportSize
-    local scale = (vp.X / 1100)
-    containerScale.Scale = math.clamp(scale, 0.5, 1.2)
-end
-
-camera:GetPropertyChangedSignal('ViewportSize'):Connect(updateScale)
-updateScale()
-
-local layout = Instance.new('UIListLayout')
-layout.FillDirection = Enum.FillDirection.Horizontal
-layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-layout.VerticalAlignment = Enum.VerticalAlignment.Center
-layout.SortOrder = Enum.SortOrder.LayoutOrder
-layout.Padding = UDim.new(0, 10)
-layout.Parent = container
-
-local assignFont = function(instance, font)
-    pcall(function()
-        instance.Font = font
-    end)
-end
-
-local createCard = function(titleTxt)
-    local card = Instance.new('Frame')
-    card.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    card.BackgroundTransparency = 0
-    card.BorderSizePixel = 0
-    
-    local gradient = Instance.new('UIGradient')
-    gradient.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(45, 45, 50)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(15, 15, 18))
-    })
-    gradient.Rotation = 90
-    gradient.Parent = card
-    
-    if titleTxt == 'Throw Type' then
-        card.Size = UDim2.new(0, 110, 0, 80)
-    else
-        card.Size = UDim2.new(0, 95, 0, 80)
-    end
-    
-    card.LayoutOrder = numCards
-    card.Parent = container
-
-    local corner = Instance.new('UICorner', card)
-    corner.CornerRadius = UDim.new(0, 8)
-
-    local stroke = Instance.new('UIStroke', card)
-    stroke.Color = Color3.fromRGB(80, 80, 85)
-    stroke.Thickness = 1.000
-
-    local padding = Instance.new('UIPadding', card)
-    padding.PaddingTop = UDim.new(0, 5)
-    padding.PaddingBottom = UDim.new(0, 5)
-
-    local title = Instance.new('TextLabel')
-    title.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    title.BackgroundTransparency = 1.000
-    title.BorderSizePixel = 0
-    title.Position = UDim2.new(0, 0, 0.70, 0)
-    title.Size = UDim2.new(1, 0, 0, 15)
-    assignFont(title, Enum.Font.GothamBold)
-    title.Text = titleTxt
-    title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.TextScaled = true
-    title.Parent = card
-
-    local valBtn = Instance.new('TextButton')
-    valBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-    valBtn.BackgroundTransparency = 1.000
-    valBtn.BorderSizePixel = 0
-    valBtn.Position = UDim2.new(0, 0, 0.15, 0)
-    valBtn.Size = UDim2.new(1, 0, 0.5, 0)
-    assignFont(valBtn, Enum.Font.GothamBold)
-    valBtn.Text = '-'
-    valBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    valBtn.TextScaled = true
-    valBtn.AutoButtonColor = false
-    valBtn.Parent = card
-
-    if titleTxt == 'Throw Type' then
-        local uiScale = Instance.new('UIScale', card)
-        valBtn.MouseButton1Down:Connect(function()
-            local c = lp.Character
-            if not c or not c:FindFirstChild('Football') then return end
-            tweenService:Create(uiScale, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 0.9}):Play()
-        end)
-        valBtn.MouseButton1Up:Connect(function()
-            local c = lp.Character
-            if not c or not c:FindFirstChild('Football') then return end
-            tweenService:Create(uiScale, TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = 1}):Play()
-            modeIndex = modeIndex + 1
-            if modeIndex > #ModeOrder then modeIndex = 1 end
-        end)
-    end
-
-    if titleTxt == 'Player' then
-        local lockedLbl = Instance.new('TextLabel')
-        lockedLbl.Size = UDim2.new(1, 0, 0.25, 0)
-        lockedLbl.Position = UDim2.new(0, 0, 0.05, 0)
-        lockedLbl.BackgroundTransparency = 1
-        lockedLbl.Text = 'LOCKED'
-        lockedLbl.TextColor3 = Color3.fromRGB(255, 50, 50)
-        assignFont(lockedLbl, Enum.Font.GothamBold)
-        lockedLbl.TextSize = 12
-        lockedLbl.Visible = false
-        lockedLbl.ZIndex = 2
-        lockedLbl.Parent = card
-
-        LockedLabel = lockedLbl
-
-        local lockOverlay = Instance.new('TextButton')
-        lockOverlay.Size = UDim2.new(1, 0, 1, 0)
-        lockOverlay.BackgroundTransparency = 1
-        lockOverlay.Text = ''
-        lockOverlay.ZIndex = 5
-        lockOverlay.Parent = card
-
-        lockOverlay.MouseButton1Click:Connect(function()
-            local c = lp.Character
-            if not c or not c:FindFirstChild('Football') then return end
-            if target or targetLocked then
-                targetLocked = not targetLocked
-                if targetLocked then
-                    lockedTarget = target
-                    if LockedLabel then LockedLabel.Visible = true end
-                else
-                    lockedTarget = nil
-                    if LockedLabel then LockedLabel.Visible = false end
-                end
-            end
-        end)
-        
-        LockToggleBtn = valBtn
-    end
-
-    HUDCards[titleTxt] = valBtn
-    numCards = numCards + 1
-end
-
-createCard('Angle')
-createCard('Throw Type')
-createCard('Player')
-createCard('Airtime')
-createCard('Power')
-
-local getActiveBots = function()
-    local bots = {}
-    local npcwr = workspace:FindFirstChild('npcwr')
-    if npcwr then
-        local a = npcwr:FindFirstChild('a')
-        if a then
-            local bot1 = a:FindFirstChild('bot 1')
-            if bot1 and bot1:IsA('Model') then table.insert(bots, bot1) end
-        end
-        local b = npcwr:FindFirstChild('b')
-        if b then
-            local bot3 = b:FindFirstChild('bot 3')
-            if bot3 and bot3:IsA('Model') then table.insert(bots, bot3) end
-        end
-    end
-    return bots
-end
-
-local performThrow = function()
-    if not enableQbAimbot.Value then return end
-
-    local character = lp.Character
-    if not character then return end
-
-    local football = character:FindFirstChildOfClass('Tool')
-    if not football then return end
-
-    local handle = football:FindFirstChild('Handle')
-    if not handle then return end
-
-    local remote = handle:FindFirstChild('RemoteEvent')
-    if not remote then return end
-
-    local head = character:FindFirstChild('Head')
-    if not head then return end
-
-    local root = character:FindFirstChild('HumanoidRootPart')
-    if not root then return end
-
-    local finalDirection = direction or Vector3.new(0, 1, 0)
-
-    if isPractice then
-        local arg = 'Clicked'
-        local arg1 = head.Position
-        local arg2 = head.Position + finalDirection * 10000
-        local arg3 = tonumber(power) or 0
-        remote:FireServer(arg, arg1, arg2, arg3)
-    else
-        local arg = 'Clicked'
-        local arg1 = (root.CFrame * CFrame.new(0, 1.5, 0)).Position + Vector3.new(70000000)
-        local arg2 = head.Position + finalDirection * 10000
-        local arg3 = tonumber(power) or 0
-        remote:FireServer(arg, arg1, arg2, arg3, 1)
-    end
-end
-
-local findRoute = function(character)
-    if not character then return 'stationary', Vector3.zero end
-    local isPlayer = players:GetPlayerFromCharacter(character)
-    local humanoid = character:FindFirstChild('Humanoid')
-    local targetHRP = character:FindFirstChild('HumanoidRootPart')
-    local qbChar = lp.Character
-    local qbHRP = qbChar and qbChar:FindFirstChild('HumanoidRootPart')
-    
-    if not humanoid or not targetHRP or not qbHRP then 
-        return 'stationary', Vector3.zero 
-    end
-    
-    local moveDirection = Vector3.zero
-    if isPlayer then
-        moveDirection = humanoid.MoveDirection
-    else
-        local wtpDiff = humanoid.WalkToPoint - targetHRP.Position
-        moveDirection = wtpDiff.Magnitude > 0.01 and wtpDiff.Unit or Vector3.zero
-    end
-    
-    local toWR = targetHRP.Position - qbHRP.Position
-    local distance = tonumber(toWR.Magnitude) or 0
-
-    local toWRDir = Vector3.new(toWR.X, 0, toWR.Z)
-    if toWRDir.Magnitude > 0.01 then
-        toWRDir = toWRDir.Unit
-    else
-        toWRDir = Vector3.new(0, 0, 1)
-    end
-
-    local mdFlat = Vector3.new(moveDirection.X, 0, moveDirection.Z)
-    if mdFlat.Magnitude < 0.01 then
-        return 'stationary', moveDirection
-    end
-    mdFlat = mdFlat.Unit
-
-    local dot = tonumber(mdFlat:Dot(toWRDir)) or 0
-
-    if dot > 0.75 then
-        return 'go/fade', moveDirection
-    elseif dot >= 0.25 and dot <= 0.75 then
-        if distance <= 120 then return 'slant', moveDirection
-        elseif distance <= 160 then return 'seam', moveDirection
-        else return 'post/corner', moveDirection end
-    elseif dot > -0.25 and dot < 0.25 then
-        if distance <= 60 then return 'drag', moveDirection
-        elseif distance <= 130 then return 'in/out', moveDirection
-        else return 'flat', moveDirection end
-    else
-        if distance <= 50 then return 'hitch', moveDirection
-        else return 'curl/comeback', moveDirection end
-    end
-end
-
-local isWROpen = function(wrChar)
-    if not wrChar then return false end
-    local hrp = wrChar:FindFirstChild('HumanoidRootPart')
-    if not hrp then return false end
-
-    local isCovered = false
-    local _, moveDir = findRoute(wrChar)
-    
-    local teamCount = 0
-    pcall(function() teamCount = tonumber(#game:GetService('Teams'):GetTeams()) or 0 end)
-    
-    local checkDB = function(dbHRP)
-        local toDB = dbHRP.Position - hrp.Position
-        local dist = tonumber(toDB.Magnitude) or 0
-        if dist < 5 then
-            local routeDirXZ = Vector3.new(moveDir.X, 0, moveDir.Z)
-            if (tonumber(routeDirXZ.Magnitude) or 0) > 0.01 then
-                routeDirXZ = routeDirXZ.Unit
-                local dot = tonumber(toDB.Unit:Dot(routeDirXZ)) or 0
-                if dot > -0.7 then 
-                    return true
-                end
-            else
-                return true
-            end
-        end
-        return false
-    end
-
-    local checkPR = function(dbHRP)
-        local qbChar = lp.Character
-        if not qbChar then return false end
-        local qbHRP = qbChar:FindFirstChild('HumanoidRootPart')
-        if not qbHRP then return false end
-        
-        local toPR = dbHRP.Position - qbHRP.Position
-        local toWR = hrp.Position - qbHRP.Position
-        local wrDist = tonumber(toWR.Magnitude) or 0
-        local wrDir = toWR.Unit
-        
-        local proj = tonumber(toPR:Dot(wrDir)) or 0
-        if proj > 2 and proj < (wrDist * 0.6) then
-            local distToLine = tonumber((toPR - (wrDir * proj)).Magnitude) or 0
-            if distToLine < 5.5 then
-                return true
-            end
-        end
-        return false
-    end
-
-    local plrs = players:GetPlayers()
-    for i = 1, #plrs do
-        local plr = plrs[i]
-        if plr ~= lp and plr.Character then
-            local isEnemy = true
-            if teamCount > 1 and lp.Team ~= nil and plr.Team ~= nil and lp.Team == plr.Team then
-                isEnemy = false
-            end
-            if isEnemy then
-                local dbHRP = plr.Character:FindFirstChild('HumanoidRootPart')
-                if dbHRP and (checkDB(dbHRP) or checkPR(dbHRP)) then
-                    isCovered = true
-                    break
-                end
-            end
-        end
-    end
-
-    if not isCovered then
-        local bots = getActiveBots()
-        for i = 1, #bots do
-            local bot = bots[i]
-            if bot ~= wrChar then
-                local dbHRP = bot:FindFirstChild('HumanoidRootPart')
-                if dbHRP and (checkDB(dbHRP) or checkPR(dbHRP)) then
-                    isCovered = true
-                    break
-                end
-            end
-        end
-    end
-
-    return not isCovered
-end
-
-local getTarget = function()
-    if isThrowing and target then return target end
-    
-    if targetLocked and lockedTarget and lockedTarget:FindFirstChild('HumanoidRootPart') then
-        return lockedTarget
-    elseif targetLocked then
-        targetLocked = false
-        lockedTarget = nil
-    end
-
-    local potentialTargets = {}
-    local teamCount = 0
-    pcall(function() teamCount = tonumber(#game:GetService('Teams'):GetTeams()) or 0 end)
-
-    local plrs = players:GetPlayers()
-    for i = 1, #plrs do
-        local plr = plrs[i]
-        if plr ~= lp and plr.Character and plr.Character:FindFirstChild('HumanoidRootPart') then
-            local isTeammate = true
-            if teamCount > 1 and lp.Team ~= nil and plr.Team ~= nil and lp.Team ~= plr.Team then
-                isTeammate = false
-            end
-            
-            if isTeammate then
-                local eHum = plr.Character:FindFirstChildOfClass('Humanoid')
-                if not eHum or not eHum.Sit then
-                    table.insert(potentialTargets, plr.Character)
-                end
-            end
-        end
-    end
-
-    local bots = getActiveBots()
-    for i = 1, #bots do
-        local bot = bots[i]
-        if bot:FindFirstChild('HumanoidRootPart') then
-            local eHum = bot:FindFirstChildOfClass('Humanoid')
-            if not eHum or not eHum.Sit then
-                table.insert(potentialTargets, bot)
-            end
-        end
-    end
-
-    if #potentialTargets == 0 then return nil end
-
-    if autoChooseWr.Value then
-        local bestAutoTarget = nil
-        local bestAutoDist = math.huge
-        local qbHRP = lp.Character and lp.Character:FindFirstChild('HumanoidRootPart')
-        local qbPos = qbHRP and qbHRP.Position or Vector3.zero
-
-        for i = 1, #potentialTargets do
-            local char = potentialTargets[i]
-            local hrp = char:FindFirstChild('HumanoidRootPart')
-            if hrp then
-                local _, onScreen = camera:WorldToViewportPoint(hrp.Position)
-                if onScreen and isWROpen(char) then
-                    local dist = tonumber((hrp.Position - qbPos).Magnitude) or 0
-                    if dist < bestAutoDist then
-                        bestAutoDist = dist
-                        bestAutoTarget = char
-                    end
-                end
-            end
-        end
-        
-        if bestAutoTarget then
-            return bestAutoTarget
-        end
-    end
-
-    local mousePos2D = userInputService:GetMouseLocation()
-    local bestManualTarget = nil
-    local bestMouseDist = math.huge
-
-    for i = 1, #potentialTargets do
-        local char = potentialTargets[i]
-        local hrp = char:FindFirstChild('HumanoidRootPart')
-        if hrp then
-            local screenPos, onScreen = camera:WorldToViewportPoint(hrp.Position)
-            if onScreen then
-                local dist = tonumber((Vector2.new(screenPos.X, screenPos.Y) - mousePos2D).Magnitude) or 0
-                if dist < bestMouseDist then
-                    bestMouseDist = dist
-                    bestManualTarget = char
-                end
-            end
-        end
-    end
-
-    return bestManualTarget
-end
-
-local calculateRouteDirection = function(targetChar)
-    if not targetChar then return 'Mag' end
-    local targetHRP = targetChar:FindFirstChild('HumanoidRootPart')
-    if not targetHRP then return 'Mag' end
-    
-    local lpChar = lp.Character
-    local lpHRP = lpChar and lpChar:FindFirstChild('HumanoidRootPart')
-    if not lpHRP then return 'Mag' end
-
-    local route, moveDir = findRoute(targetChar)
-    local dist = tonumber((targetHRP.Position - lpHRP.Position).Magnitude) or 0
-    if dist < 40 then return 'Bullet' end
-    
-    local dbDistance = math.huge
-    local teamCount = 0
-    pcall(function() teamCount = tonumber(#game:GetService('Teams'):GetTeams()) or 0 end)
-
-    local plrs = players:GetPlayers()
-    for i = 1, #plrs do
-        local plr = plrs[i]
-        if plr ~= lp and plr.Character then
-            local eHRP = plr.Character:FindFirstChild('HumanoidRootPart')
-            if eHRP and eHRP ~= targetHRP then
-                local isEnemy = true
-                if teamCount > 1 and lp.Team ~= nil and plr.Team ~= nil and lp.Team == plr.Team then
-                    isEnemy = false
-                end
-                if isEnemy then
-                    local d = tonumber((eHRP.Position - targetHRP.Position).Magnitude) or 0
-                    if d < dbDistance then dbDistance = d end
-                end
-            end
-        end
-    end
-
-    local bots = getActiveBots()
-    for i = 1, #bots do
-        local bot = bots[i]
-        local bHRP = bot:FindFirstChild('HumanoidRootPart')
-        if bHRP and bHRP ~= targetHRP then
-            local d = tonumber((bHRP.Position - targetHRP.Position).Magnitude) or 0
-            if d < dbDistance then dbDistance = d end
-        end
-    end
-
-    local within = function(tbl, val)
-        for i = 1, #tbl do
-            if tbl[i] == val then return true end
-        end
-        return false
-    end
-
-    local forwardRoutes = {'go/fade', 'post/corner', 'seam', 'curl/comeback', 'stationary'}
-    local sidewayRoutes = {'in/out', 'flat', 'wheel'}
-    
-    if route == 'slant' or route == 'hitch' or route == 'drag' or route == 'in/out' or route == 'flat' then
-        return 'Bullet'
-    elseif within(forwardRoutes, route) then
-        if dbDistance > 5 then return ((tonumber(angle) or 45) < 40) and 'Jump' or 'Dime'
-        elseif dbDistance > 2 then return 'Dive' end
-        return 'Mag'
-    elseif within(sidewayRoutes, route) then
-        if dbDistance > 4 then return 'Dime' end
-        return 'Jump'
-    end
-    return 'Dime'
-end
-
-local getModeLead = function(modeName)
-    if modeName == 'Dime' then return leadDime
-    elseif modeName == 'Mag' then return leadMag
-    elseif modeName == 'Dive' then return leadDive
-    elseif modeName == 'Jump' then return leadJump
-    elseif modeName == 'Bullet' then return leadBullet
-    end
-    return 8.6
-end
-
-local getModeYLead = function(modeName)
-    if modeName == 'Dime' then return yLeadDime
-    elseif modeName == 'Mag' then return yLeadMag
-    elseif modeName == 'Dive' then return yLeadDive
-    elseif modeName == 'Jump' then return yLeadJump
-    elseif modeName == 'Bullet' then return yLeadBullet
-    end
-    return 0
-end
-
-local getPing = function()
-    local networkPing = 0
-    pcall(function() networkPing = tonumber(lp:GetNetworkPing()) or 0 end)
-    local dataPing = 0
-    pcall(function() dataPing = (tonumber(stats.Network.ServerStatsItem['Data Ping']:GetValue()) or 0) / 1000 end)
-    if dataPing == 0 then dataPing = networkPing end
-    return networkPing + dataPing
-end
-
-local solveKinematics = function(origin, targetPos, gravityMag)
-    local g = tonumber(gravityMag) or 28
-    local displacement = targetPos - origin
-    local x = tonumber(Vector3.new(displacement.X, 0, displacement.Z).Magnitude) or 0
-    local y = tonumber(displacement.Y) or 0
-    
-    local inner = (x^2) + (y^2)
-    local root = tonumber(math.sqrt(math.max(inner, 0))) or 0
-    
-    local baseAngleRad = math.rad(45)
-    if x > 0.01 then
-        local atanRes = tonumber(math.atan((y + root) / x)) or baseAngleRad
-        if atanRes and atanRes == atanRes then
-            baseAngleRad = atanRes
-        end
-    end
-    
-    local angleRad = tonumber(math.clamp(baseAngleRad * 0.85, math.rad(-15), math.rad(65))) or 0
-    
-    local cosA = tonumber(math.cos(angleRad)) or 1
-    local tanA = tonumber(math.tan(angleRad)) or 0
-    
-    local v0 = 95
-    local denom = 2 * (cosA^2) * (x * tanA - y)
-    
-    if denom > 0.001 then
-        local num = g * (x^2)
-        local res = tonumber(math.sqrt(num / denom)) or v0
-        if res and res == res and res ~= math.huge then
-            v0 = res
-        end
-    end
-    
-    local angleDeg = tonumber(math.deg(angleRad)) or 45
-    return v0, angleDeg
-end
-
-local autoAim = function(targetHRP)
-    local head = lp.Character:FindFirstChild('Head')
-    local origin = head and head.Position or lp.Character.HumanoidRootPart.Position
-    
-    local targetChar = targetHRP.Parent
-    local targetHeadObj = targetChar and targetChar:FindFirstChild('Head')
-    local targetHead = targetHeadObj and targetHeadObj.Position or targetHRP.Position + Vector3.new(0, 1.5, 0)
-    
-    local moveDir = Vector3.zero
-    local targetHum = targetChar and targetChar:FindFirstChildOfClass('Humanoid')
-    if targetHum then
-        local isBot = targetChar:FindFirstAncestor('npcwr') ~= nil
-        if isBot then
-            local wtpDiff = targetHum.WalkToPoint - targetHRP.Position
-            local dir = Vector3.new(wtpDiff.X, 0, wtpDiff.Z)
-            moveDir = dir.Magnitude > 0.1 and dir.Unit or Vector3.zero
-        else
-            local md = targetHum.MoveDirection
-            local flatMd = Vector3.new(md.X, 0, md.Z)
-            moveDir = flatMd.Magnitude > 0.01 and flatMd.Unit or Vector3.zero
-        end
-    end
-    
-    local ping = tonumber(getPing()) or 0
-    local speed = 20
-    
-    local modeName = ModeOrder[modeIndex]
-    local isChestPass = (modeName == 'Bullet' or target and (findRoute(target) == 'slant' or findRoute(target) == 'drag' or findRoute(target) == 'in/out' or findRoute(target) == 'flat' or findRoute(target) == 'hitch' or findRoute(target) == 'curl/comeback'))
-    local routeStr = target and findRoute(target) or 'go/fade'
-    
-    local activePower = tonumber(power) or 60
-    if modeName == 'Bullet' or (autoPower.Value and isChestPass) or highPowerOnly.Value then
-        activePower = 95
-    end
-    
-    local lDivisor = 60
-    if activePower > 75 then
-        lDivisor = 60 + ((activePower - 75) * 1.5)
-    end
-    
-    local distToTarget = tonumber((targetHRP.Position - origin).Magnitude) or 0
-    local estFlightTime = distToTarget / (tonumber(lDivisor) or 60)
-    
-    local currentHVel = activePower * (tonumber(math.cos(math.rad(tonumber(angle) or 45))) or 1)
-    if currentHVel < 30 then currentHVel = 55 end
-    
-    local estHVel = (modeName == 'Bullet' or isChestPass) and 90 or currentHVel
-    
-    local modeLeadScale = (tonumber(getModeLead(modeName)) or 8.6) * 3.05
-    local selectedModeYLead = tonumber(getModeYLead(modeName)) or 0
-    
-    local routeMultipliers = {
-        ['slant'] = 0.45,
-        ['drag'] = 0.6,
-        ['in/out'] = 0.65,
-        ['flat'] = 0.65,
-        ['wheel'] = 0.9,
-        ['go/fade'] = 1.0,
-        ['post/corner'] = 0.85,
-        ['seam'] = 0.85,
-        ['hitch'] = 0.1,
-        ['curl/comeback'] = 0.1,
-        ['stationary'] = 0.0
-    }
-    local rMult = tonumber(routeMultipliers[routeStr]) or 1.0
-    
-    local dirUnit = moveDir.Magnitude > 0.01 and moveDir.Unit or Vector3.zero
-    
-    local targetBase = (isChestPass or modeName == 'Bullet') and targetHRP.Position or targetHead
-    
-    local standingStill = (routeStr == 'stationary')
-    
-    if standingStill then
-        leadPos = targetHead
-    else
-        leadPos = targetBase + (moveDir * speed * estFlightTime * rMult) + (moveDir * speed * ping * rMult) + (dirUnit * modeLeadScale * rMult)
-        leadPos = leadPos + (dirUnit * (tonumber(throwLeadOffset.Value) or 0))
-        
-        if isChestPass or modeName == 'Bullet' then
-            leadPos = Vector3.new(leadPos.X, targetHead.Y, leadPos.Z)
-            selectedModeYLead = 0
-        end
-        
-        leadPos = leadPos + Vector3.new(0, selectedModeYLead, 0)
-        leadPos = leadPos + Vector3.new(0, tonumber(throwHeightOffset.Value) or 0, 0)
-        
-        if routeStr == 'curl/comeback' or routeStr == 'hitch' then
-            leadPos = leadPos + Vector3.new(0, -5, 0)
-        end
-    end
-    
-    local forceAutoAngle = (modeName == 'Bullet' or isChestPass or (tonumber(power) or 60) == 95 or highPowerOnly.Value)
-    if not autoAngle.Value and not forceAutoAngle then
-        leadPos = leadPos + Vector3.new(0, tonumber(customHeight.Value) or 0, 0)
-    end
-    
-    if antiDB.Value then
-        local pushVec = Vector3.zero
-        local plrs = players:GetPlayers()
-        local teamCount = 0
-        pcall(function() teamCount = tonumber(#game:GetService('Teams'):GetTeams()) or 0 end)
-
-        for i = 1, #plrs do
-            local plr = plrs[i]
-            if plr ~= lp and plr.Character then
-                local isEnemy = true
-                if teamCount > 1 and lp.Team ~= nil and plr.Team ~= nil and lp.Team == plr.Team then
-                    isEnemy = false
-                end
-                if isEnemy then
-                    local eHRP = plr.Character:FindFirstChild('HumanoidRootPart')
-                    if eHRP then
-                        local dist = tonumber(Vector3.new(eHRP.Position.X - leadPos.X, 0, eHRP.Position.Z - leadPos.Z).Magnitude) or 0
-                        if dist < (tonumber(antiDBThreshold.Value) or 15) then
-                            local away = (leadPos - eHRP.Position)
-                            away = Vector3.new(away.X, 0, away.Z)
-                            if away.Magnitude > 0 then
-                                pushVec = pushVec + (away.Unit * ((tonumber(antiDBThreshold.Value) or 15) - dist))
-                            end
-                        end
-                    end
-                end
-            end
-        end
-        leadPos = pushVec + leadPos
-    end
-
-    local fPos = Vector3.zero
-    local field = workspace:FindFirstChild('Models')
-    if field then field = field:FindFirstChild('Field') end
-    if field then field = field:FindFirstChild('Ground') end
-    if field then fPos = field.Position end
-
-    if antiOOB.Value and fPos ~= Vector3.zero then
-        local halfWidth = 75 - (tonumber(antiOOBThreshold.Value) or 5)
-        local halfLength = 175 - (tonumber(antiOOBThreshold.Value) or 5)
-        leadPos = Vector3.new(
-            math.clamp(leadPos.X, fPos.X - halfWidth, fPos.X + halfWidth),
-            leadPos.Y,
-            math.clamp(leadPos.Z, fPos.Z - halfLength, fPos.Z + halfLength)
-        )
-    end
-    
-    targetLeadPos = leadPos
-    
-    local gMag = 28 
-    local calcPower, calcAngle = solveKinematics(origin, leadPos, gMag)
-    calcPower = tonumber(calcPower) or 95
-    calcAngle = tonumber(calcAngle) or 45
-    
-    if standingStill and modeName ~= 'Bullet' and not highPowerOnly.Value then
-        local dynamicThreshold = tonumber(math.clamp(4 + (distToTarget * 0.08), 5, 14)) or 10
-        if calcAngle > dynamicThreshold then
-            local displacement = leadPos - origin
-            local x = tonumber(Vector3.new(displacement.X, 0, displacement.Z).Magnitude) or 0
-            local y = tonumber(displacement.Y) or 0
-            local aRad = tonumber(math.rad(dynamicThreshold)) or 0.1
-            local denom = 2 * (math.cos(aRad)^2) * (x * math.tan(aRad) - y)
-            
-            if denom > 0.001 then
-                local newPwr = tonumber(math.sqrt((gMag * x^2) / denom)) or calcPower
-                if newPwr == newPwr and newPwr ~= math.huge then
-                    calcAngle = dynamicThreshold
-                    calcPower = newPwr
-                end
-            end
-        end
-    end
-    
-    if highPowerOnly.Value then
-        power = 95
-        local displacement = leadPos - origin
-        local x = tonumber(Vector3.new(displacement.X, 0, displacement.Z).Magnitude) or 0
-        local y = tonumber(displacement.Y) or 0
-        
-        local v2 = 95^2
-        local v4 = 95^4
-        local gx = gMag * x
-        local discriminant = v4 - gMag * (gMag * x^2 + 2 * y * v2)
-        
-        if discriminant >= 0 then
-            angle = tonumber(math.clamp(math.deg(math.atan((v2 - math.sqrt(discriminant)) / gx)) * 0.94, -15, 85)) or 45
-        else
-            angle = 45
-        end
-    elseif modeName == 'Bullet' or (autoPower.Value and isChestPass) then
-        power = 95
-        local displacement = leadPos - origin
-        local h = tonumber(Vector3.new(displacement.X, 0, displacement.Z).Magnitude) or 0
-        local v = tonumber(displacement.Y) or 0
-        local t_est = h / 95
-        local drop = 0.5 * 28 * t_est * t_est
-        angle = tonumber(math.clamp(math.deg(math.atan2(v + drop, h)), -15, 45)) or 15
-    else
-        if autoPower.Value then
-            power = tonumber(math.clamp(calcPower, 0, 95)) or 60
-        end
-        if autoAngle.Value then
-            angle = tonumber(math.clamp(calcAngle, -15, 90)) or 45
-        end
-    end
-    
-    if not autoAngle.Value and not forceAutoAngle then
-        angle = tonumber(math.clamp(calcAngle, -15, 90)) or 45
-    end
-    
-    local safePower = tonumber(power) or 60
-    local safeAngle = tonumber(angle) or 45
-    local angleRad = tonumber(math.rad(safeAngle)) or 0
-    
-    local hDirRaw = Vector3.new(leadPos.X - origin.X, 0, leadPos.Z - origin.Z)
-    local hDir = hDirRaw.Magnitude > 0.01 and hDirRaw.Unit or head.CFrame.LookVector
-    local dirVelocity = (hDir * (tonumber(math.cos(angleRad)) or 1) + Vector3.new(0, tonumber(math.sin(angleRad)) or 0, 0)) * safePower
-    
-    direction = dirVelocity.Unit * safePower
-    
-    local hVel = safePower * (tonumber(math.cos(angleRad)) or 1)
-    if hVel > 0.1 then
-        local xDist = tonumber(Vector3.new(leadPos.X - origin.X, 0, leadPos.Z - origin.Z).Magnitude) or 0
-        airtime = xDist / hVel
-    else
-        airtime = 0
-    end
-    
-    return safeAngle
-end
-
-local beamProjectile = function(g, v0, x0, t1)
-    local c = 0.5 * 0.5 * 0.5
-    local safeT1 = tonumber(t1) or 0.1
-    local p3 = 0.5 * g * safeT1 * safeT1 + v0 * safeT1 + x0
-    local p2 = p3 - (g * safeT1 * safeT1 + v0 * safeT1) / 3
-    local p1 = (c * g * safeT1 * safeT1 + 0.5 * v0 * safeT1 + x0 - c * (x0 + p3)) / (3 * c) - p2
-
-    local curve0 = tonumber((p1 - x0).Magnitude) or 0
-    local curve1 = tonumber((p2 - p3).Magnitude) or 0
-
-    local b = (x0 - p3).Unit
-    local r1 = (p1 - x0).Unit
-    local u1 = r1:Cross(b).Unit
-    local r2 = (p2 - p3).Unit
-    local u2 = r2:Cross(b).Unit
-    b = u1:Cross(r1).Unit
-
-    local cf1 = CFrame.new(
-        x0.X, x0.Y, x0.Z,
-        r1.X, u1.X, b.X,
-        r1.Y, u1.Y, b.Y,
-        r1.Z, u1.Z, b.Z
-    )
-
-    local cf2 = CFrame.new(
-        p3.X, p3.Y, p3.Z,
-        r2.X, u2.X, b.X,
-        r2.Y, u2.Y, b.Y,
-        r2.Z, u2.Z, b.Z
-    )
-
-    return curve0, -curve1, cf1, cf2
-end
-
-userInputService.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    local char = lp.Character
-    if not char or not char:FindFirstChild('Football') then return end
-    
-    if input.KeyCode == throwBallAwayKeybind.Value then
-        local fPos = Vector3.zero
-        local field = workspace:FindFirstChild('Models')
-        if field then field = field:FindFirstChild('Field') end
-        if field then field = field:FindFirstChild('Ground') end
-        if field then fPos = field.Position end
-        
-        local side = math.random(1, 2) == 1 and -1 or 1
-        local throwTarget = fPos + Vector3.new(side * 120, 0, math.random(-100, 100))
-        
-        local head = char:FindFirstChild('Head')
-        local origin = head and head.Position or char.HumanoidRootPart.Position
-        
-        isThrowingAway = true
-        power = 95
-        angle = 25
-        
-        local angleRad = tonumber(math.rad(angle)) or 0
-        local hDir = Vector3.new(throwTarget.X - origin.X, 0, throwTarget.Z - origin.Z).Unit
-        local dirVelocity = (hDir * (tonumber(math.cos(angleRad)) or 1) + Vector3.new(0, tonumber(math.sin(angleRad)) or 0, 0)) * 95
-        direction = dirVelocity.Unit * 95
-        
-        local hVel = 95 * (tonumber(math.cos(angleRad)) or 1)
-        airtime = hVel > 0.1 and ((tonumber(Vector3.new(throwTarget.X - origin.X, 0, throwTarget.Z - origin.Z).Magnitude) or 0) / hVel) or 1
-        
-        local hum = char:FindFirstChildOfClass('Humanoid')
-        local throwAnim = replicatedStorage:FindFirstChild('Animations') and replicatedStorage.Animations:FindFirstChild('Throw')
-        if hum and throwAnim then
-            local animator = hum:FindFirstChild('Animator')
-            if animator then
-                local track = animator:LoadAnimation(throwAnim)
-                track:Play()
-            end
-        end
-        return
-    end
-
-    if input.KeyCode == increaseAngleKeybind.Value then
-        customHeight.Value = (tonumber(customHeight.Value) or 0) + 5
-    elseif input.KeyCode == decreaseAngleKeybind.Value then
-        customHeight.Value = (tonumber(customHeight.Value) or 0) - 5
-    end
-    
-    if not autoSelectThrowMode.Value and QBKeybinds[input.KeyCode] then
-        local desiredMode = QBKeybinds[input.KeyCode]
-        for i = 1, #ModeOrder do
-            if ModeOrder[i] == desiredMode then
-                modeIndex = i
-                break
-            end
-        end
-    end
-
-    if input.KeyCode == lockKeybind.Value then
-        if target or targetLocked then
-            targetLocked = not targetLocked
-            if targetLocked then
-                lockedTarget = target
-                if LockToggleBtn then LockToggleBtn.TextColor3 = Color3.fromRGB(255, 50, 50) end
-                if LockedLabel then LockedLabel.Visible = true end
-            else
-                lockedTarget = nil
-                if LockToggleBtn then LockToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255) end
-                if LockedLabel then LockedLabel.Visible = false end
-            end
-        end
-    end
-end)
-
-local triggerThrowJump = function()
-    if autoJumpWhenThrow.Value then
-        task.delay(0.05, function()
-            local char = lp.Character
-            if char then
-                local hum = char:FindFirstChildOfClass('Humanoid')
-                if hum and hum:GetState() ~= Enum.HumanoidStateType.Jumping then
-                    hum:ChangeState(Enum.HumanoidStateType.Jumping)
-                end
-            end
-        end)
-    end
-end
-
-task.spawn(function()
-    local bindAnimation = function(char)
-        local humanoid = char:WaitForChild('Humanoid', 5)
-        if not humanoid then return end
-        local animator = humanoid:WaitForChild('Animator', 5)
-        if not animator then return end
-        
-        animator.AnimationPlayed:Connect(function(track)
-            local throwAnim = replicatedStorage:FindFirstChild('Animations') and replicatedStorage.Animations:FindFirstChild('Throw')
-            if throwAnim and track.Animation and (track.Animation == throwAnim or track.Animation.AnimationId == throwAnim.AnimationId) then
-                track:GetPropertyChangedSignal('IsPlaying'):Connect(function()
-                    if track.IsPlaying then
-                        if not isThrowing then
-                            isThrowing = true
-                            triggerThrowJump()
-                            task.delay(0.12, function()
-                                firedRemote = true
-                                performThrow()
-                            end)
-                        end
-                    else
-                        isThrowing = false
-                        firedRemote = false
-                        isThrowingAway = false
-                    end
-                end)
-                
-                if track.IsPlaying and not isThrowing then
-                    isThrowing = true
-                    triggerThrowJump()
-                    task.delay(0.12, function()
-                        firedRemote = true
-                        performThrow()
-                    end)
-                end
-            end
-        end)
-    end
-
-    if lp.Character then
-        bindAnimation(lp.Character)
-    end
-    lp.CharacterAdded:Connect(function(char)
-        bindAnimation(char)
-    end)
-end)
-
-local setupSackHandler = function(character)
-    character.ChildAdded:Connect(function(v)
-        if not autoThrowAfterSack.Value then return end
-        if not v:IsA('LocalScript') then return end
-        if not v.Name:lower():find('tackle') then return end
-
-        task.wait()
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        if not humanoid then return end
-
-        if autoChooseWr.Value then
-            local openWR = nil
-            local bestDist = math.huge
-            local mousePos2D = userInputService:GetMouseLocation()
-            
-            local teamCount = 0
-            pcall(function() teamCount = tonumber(#game:GetService('Teams'):GetTeams()) or 0 end)
-            
-            local plrs = players:GetPlayers()
-            for i = 1, #plrs do
-                local plr = plrs[i]
-                if plr ~= lp and plr.Character then
-                    local isTeammate = true
-                    if teamCount > 1 and lp.Team ~= nil and plr.Team ~= nil and lp.Team ~= plr.Team then
-                        isTeammate = false
-                    end
-                    
-                    if isTeammate then
-                        local eHrp = plr.Character:FindFirstChild('HumanoidRootPart')
-                        local eHum = plr.Character:FindFirstChildOfClass('Humanoid')
-                        if eHrp and (not eHum or not eHum.Sit) and isWROpen(plr.Character) then
-                            local screenPos, onScreen = camera:WorldToViewportPoint(eHrp.Position)
-                            if onScreen then
-                                local dist = tonumber((Vector2.new(screenPos.X, screenPos.Y) - mousePos2D).Magnitude) or 0
-                                if dist < bestDist then
-                                    bestDist = dist
-                                    openWR = plr.Character
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-
-            if openWR then
-                target = openWR
-                targetLocked = true
-                lockedTarget = openWR
-            end
-        end
-
-        if target then
-            local throwAnim = replicatedStorage:FindFirstChild('Animations') and replicatedStorage.Animations:FindFirstChild('Throw')
-            if throwAnim then
-                local animator = humanoid:FindFirstChild('Animator')
-                if animator then
-                    local track = animator:LoadAnimation(throwAnim)
-                    track:Play()
-                end
-            end
-        end
-    end)
-end
-
-if lp.Character then
-    setupSackHandler(lp.Character)
-end
-lp.CharacterAdded:Connect(setupSackHandler)
-
-local updateHighlights = function(isActive)
-    if not isActive then
-        if highlight then highlight:Destroy(); highlight = nil end
-        return
-    end
-
-    if target then
-        if not highlight then
-            highlight = Instance.new('Highlight')
-        end
-        highlight.Adornee = target
-        highlight.Parent = target
-        highlight.FillTransparency = 1
-        highlight.OutlineColor = targetLocked and Color3.new(0, 0, 0) or Color3.fromRGB(255, 255, 255)
-        highlight.OutlineTransparency = 0
-    elseif highlight then
-        highlight:Destroy()
-        highlight = nil
-    end
-end
-
-workspace.ChildAdded:Connect(function(v)
-    if not enableQbAimbot.Value then return end
-    if v:IsA('BasePart') and v.Name == 'Football' then
-        task.wait()
-        local lpChar = lp.Character
-        local lpHead = lpChar and lpChar:FindFirstChild('Head')
-        if not lpHead then return end
-        
-        if v:GetAttribute('LocalAimbotBall') or (v.Position - lpHead.Position).Magnitude < 15 then
-            local tAttach0 = Instance.new('Attachment', workspace.Terrain)
-            local tAttach1 = Instance.new('Attachment', workspace.Terrain)
-            
-            local tBeam = Instance.new('Beam')
-            tBeam.Attachment0 = tAttach0
-            tBeam.Attachment1 = tAttach1
-            tBeam.Segments = 7500
-            tBeam.Width0 = 1
-            tBeam.Width1 = 1
-            tBeam.FaceCamera = true
-            tBeam.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255))
-            tBeam.Transparency = NumberSequence.new({
-                NumberSequenceKeypoint.new(0, 1),
-                NumberSequenceKeypoint.new(0.01, 0),
-                NumberSequenceKeypoint.new(1, 0)
-            })
-            tBeam.Parent = workspace.Terrain
-            
-            local tPosPart = Instance.new('Part', workspace.Terrain)
-            tPosPart.Anchored = true
-            tPosPart.CanCollide = false
-            tPosPart.CastShadow = false
-            tPosPart.Size = Vector3.new(3, 3, 3)
-            tPosPart.Shape = Enum.PartType.Ball
-            tPosPart.Color = Color3.fromRGB(0, 0, 0)
-            
-            local safeDirection = direction or Vector3.new(0, 1, 0)
-            local safeAirtime = math.max(tonumber(airtime) or 0.1, 0.1)
-            local curve0, curve1, cf1, cf2 = beamProjectile(Vector3.new(0, -28, 0), safeDirection, lpHead.Position + (safeDirection.Unit * 5), safeAirtime)
-            
-            tBeam.CurveSize0 = curve0
-            tBeam.CurveSize1 = curve1
-            
-            tAttach0.WorldCFrame = cf1
-            tAttach1.WorldCFrame = cf2
-            
-            tPosPart.Position = Vector3.new(cf2.X, cf2.Y, cf2.Z)
-            
-            task.delay(safeAirtime, function()
-                tBeam:Destroy()
-                tAttach0:Destroy()
-                tAttach1:Destroy()
-                tPosPart:Destroy()
-            end)
-        end
-    end
-end)
-
-runService.RenderStepped:Connect(function()
-    if not enableQbAimbot.Value then
-        updateHUDVisibility(false)
-        updateHighlights(false)
-        if beam then beam.Enabled = false end
-        if posPart then posPart.Position = Vector3.new(0, -9999, 0) end
-        if attach0 then attach0.WorldPosition = Vector3.new(0, -9999, 0) end
-        if attach1 then attach1.WorldPosition = Vector3.new(0, -9999, 0) end
-        target = nil
-        return
-    end
-
-    if not sg or not sg.Parent then return end
-
-    local char = lp.Character
-    if not char then return end
-    
-    local head = char:FindFirstChild('Head')
-    local hrp = char:FindFirstChild('HumanoidRootPart')
-    if not head or not hrp then return end
-
-    local football = char:FindFirstChild('Football')
-    local hasFootball = (football ~= nil)
-    
-    if hasFootball then
-        football:SetAttribute('LocalAimbotBall', true)
-        local fHandle = football:FindFirstChild('Handle')
-        if fHandle then fHandle:SetAttribute('LocalAimbotBall', true) end
-    end
-    
-    local playerGui = lp:WaitForChild('PlayerGui', 10)
-    local ballGui = playerGui and playerGui:FindFirstChild('BallGui')
-    
-    if autoJuke.Value and hasFootball and ballGui then
-        local fPos = Vector3.zero
-        local field = workspace:FindFirstChild('Models')
-        if field then field = field:FindFirstChild('Field') end
-        if field then field = field:FindFirstChild('Ground') end
-        if field then fPos = field.Position end
-        
-        local minX = fPos.X - (155 / 2)
-        local maxX = fPos.X + (155 / 2)
-        local minZ = fPos.Z - (355 / 2)
-        local maxZ = fPos.Z + (355 / 2)
-
-        local dodgeVec = Vector3.zero
-        local threatCount = 0
-
-        local plrs = players:GetPlayers()
-        local teamCount = 0
-        pcall(function() teamCount = tonumber(#game:GetService('Teams'):GetTeams()) or 0 end)
-        
-        for i = 1, #plrs do
-            local plr = plrs[i]
-            if plr ~= lp and plr.Character then
-                local isEnemy = true
-                if teamCount > 1 and lp.Team ~= nil and plr.Team ~= nil and lp.Team == plr.Team then
-                    isEnemy = false
-                end
-                
-                if isEnemy then
-                    local eHrp = plr.Character:FindFirstChild('HumanoidRootPart')
-                    if eHrp then
-                        local distToMe = tonumber((eHrp.Position - hrp.Position).Magnitude) or 0
-                        if distToMe < 45 then
-                            local eVel = eHrp.AssemblyLinearVelocity or eHrp.Velocity or Vector3.zero
-                            local eSpeed = tonumber(Vector3.new(eVel.X, 0, eVel.Z).Magnitude) or 0
-                            local tta = distToMe / math.max(eSpeed, 1)
-                            
-                            local futureTime = math.min(tta, 1)
-                            local eFuture = eHrp.Position + (eVel * futureTime)
-                            local myVel = hrp.AssemblyLinearVelocity or hrp.Velocity or Vector3.zero
-                            local myFuture = hrp.Position + (myVel * futureTime)
-                            
-                            local toThreat = eFuture - myFuture
-                            local futureDist = tonumber(Vector3.new(toThreat.X, 0, toThreat.Z).Magnitude) or 0
-                            
-                            if futureDist < 20 or distToMe < 25 then
-                                threatCount = threatCount + 1
-                                local awayDir = myFuture - eFuture
-                                awayDir = Vector3.new(awayDir.X, 0, awayDir.Z)
-                                if awayDir.Magnitude < 0.1 then
-                                    awayDir = hrp.CFrame.RightVector
-                                end
-                                awayDir = awayDir.Unit
-                                
-                                local weight = math.clamp(45 - distToMe, 0, 45)
-                                dodgeVec = dodgeVec + (awayDir * weight)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-
-        local hum = char:FindFirstChildOfClass('Humanoid')
-        if hum then
-            local checkPos = hrp.Position
-            local outOfBoundsPush = Vector3.zero
-            
-            if checkPos.X < minX + 5 then outOfBoundsPush = outOfBoundsPush + Vector3.new(1, 0, 0) end
-            if checkPos.X > maxX - 5 then outOfBoundsPush = outOfBoundsPush + Vector3.new(-1, 0, 0) end
-            if checkPos.Z < minZ + 5 then outOfBoundsPush = outOfBoundsPush + Vector3.new(0, 0, 1) end
-            if checkPos.Z > maxZ - 5 then outOfBoundsPush = outOfBoundsPush + Vector3.new(0, 0, -1) end
-            
-            local targetJukeDir = Vector3.zero
-            if threatCount > 0 then
-                targetJukeDir = dodgeVec.Unit
-                if outOfBoundsPush.Magnitude > 0 then
-                    targetJukeDir = (targetJukeDir + outOfBoundsPush * 2).Unit
-                end
-            elseif outOfBoundsPush.Magnitude > 0 then
-                targetJukeDir = outOfBoundsPush.Unit
-            end
-            
-            if targetJukeDir.Magnitude > 0 then
-                smoothedJukeDir = smoothedJukeDir:Lerp(targetJukeDir, 0.25)
-                hum:Move(smoothedJukeDir, false)
-            else
-                smoothedJukeDir = Vector3.zero
-            end
-        end
-    end
-
-    local isTracking = hasFootball and (ballGui ~= nil)
-
-    if isTracking then
-        if not hideCards.Value then
-            updateHUDVisibility(true)
-        else
-            updateHUDVisibility(false)
-        end
-        
-        if not isThrowingAway then
-            local newTarget = getTarget()
-            if newTarget then
-                lastValidTarget = newTarget
-            elseif lastValidTarget and not lastValidTarget:FindFirstChild('HumanoidRootPart') then
-                lastValidTarget = nil
-            end
-            
-            if throwAimbot.Value then
-                target = lastValidTarget
-                updateHighlights(false)
-                
-                local targetPos
-                if isThrowing and lockedMousePos then
-                    targetPos = lockedMousePos
-                else
-                    targetPos = mouse.Hit.Position
-                    lockedMousePos = targetPos
-                end
-                
-                local headPos = head.Position
-                local gMag = 28
-                local calcPower, calcAngle = solveKinematics(headPos, targetPos, gMag)
-                calcPower = tonumber(calcPower) or 95
-                calcAngle = tonumber(calcAngle) or 45
-                
-                if autoPower.Value then
-                    power = math.clamp(calcPower, 0, 95)
-                end
-                
-                if autoAngle.Value then
-                    angle = math.clamp(calcAngle, -15, 90)
-                else
-                    angle = math.clamp(tonumber(customHeight.Value) or 0, -15, 90)
-                end
-                
-                local safePower = tonumber(power) or 60
-                local safeAngle = tonumber(angle) or 45
-                local angleRad = tonumber(math.rad(safeAngle)) or 0
-                
-                local hDirRaw = Vector3.new(targetPos.X - headPos.X, 0, targetPos.Z - headPos.Z)
-                local hDir = hDirRaw.Magnitude > 0.01 and hDirRaw.Unit or hrp.CFrame.LookVector
-                
-                local dirVelocity = (hDir * (tonumber(math.cos(angleRad)) or 1) + Vector3.new(0, tonumber(math.sin(angleRad)) or 0, 0)) * safePower
-                direction = dirVelocity.Unit * safePower
-                
-                local hVel = safePower * (tonumber(math.cos(angleRad)) or 1)
-                if hVel > 0.1 then
-                    local xDist = tonumber(Vector3.new(targetPos.X - headPos.X, 0, targetPos.Z - headPos.Z).Magnitude) or 0
-                    airtime = xDist / hVel
-                else
-                    airtime = 0
-                end
-                
-                targetLeadPos = targetPos
-            else
-                target = newTarget or lastValidTarget
-                updateHighlights(true)
-                if target and hrp then
-                    local tHRP = target:FindFirstChild('HumanoidRootPart')
-                    if tHRP then
-                        if autoSelectThrowMode.Value then
-                            local m = calculateRouteDirection(target)
-                            for i = 1, #ModeOrder do
-                                if ModeOrder[i] == m then
-                                    modeIndex = i
-                                    break
-                                end
-                            end
-                            
-                            local targetCurrentRoute = select(1, findRoute(target))
-                            if ModeOrder[modeIndex] == 'Bullet' and (targetCurrentRoute == 'go/fade' or targetCurrentRoute == 'post/corner') then
-                                for i = 1, #ModeOrder do
-                                    if ModeOrder[i] == 'Mag' then
-                                        modeIndex = i
-                                        break
-                                    end
-                                end
-                            end
-                        end
-                        
-                        autoAim(tHRP)
-                    end
-                end
-            end
-        else
-            target = nil
-            updateHighlights(false)
-        end
-        
-        if autoChangePowerUI.Value then
-            if ballGui and ballGui:FindFirstChild('Frame0') then
-                local frame0 = ballGui.Frame0
-                local safePower = tonumber(power) or 60
-                if safePower ~= safePower then safePower = 60 end
-                
-                local displayPower = math.round(safePower / 5) * 5
-                
-                local txt = frame0:FindFirstChildOfClass('TextLabel')
-                if txt then txt.Text = tostring(math.floor(displayPower)) end
-                
-                local frames = frame0:GetChildren()
-                for i = 1, #frames do
-                    local frame = frames[i]
-                    if frame.Name ~= 'Disp' then
-                        local frameNum = tonumber(frame.Name) or 0
-                        frame.BackgroundTransparency = ((tonumber(frameNum) or 0) <= (tonumber(displayPower) or 0)) and 0 or 0.9
-                    end
-                end
-            end
-        end
-        
-        local safePowForCard = tonumber(power) or 60
-        if safePowForCard ~= safePowForCard then safePowForCard = 60 end
-        
-        if HUDCards['Angle'] then 
-            local forceAutoAngle = (ModeOrder[modeIndex] == 'Bullet' or (target and findRoute(target) == 'slant' or findRoute(target) == 'drag' or findRoute(target) == 'in/out' or findRoute(target) == 'flat' or findRoute(target) == 'hitch' or findRoute(target) == 'curl/comeback') or (tonumber(power) or 60) == 95 or highPowerOnly.Value)
-            if not autoAngle.Value and not forceAutoAngle then
-                HUDCards['Angle'].Text = tostring(math.floor(tonumber(customHeight.Value) or 0))
-            else
-                HUDCards['Angle'].Text = tostring(math.floor(tonumber(angle) or 45)) 
-            end
-        end
-        
-        if HUDCards['Power'] then HUDCards['Power'].Text = string.format('%.0f', safePowForCard) end
-        if HUDCards['Airtime'] then HUDCards['Airtime'].Text = string.format('%.1fs', tonumber(airtime) or 0) end
-        if HUDCards['Throw Type'] then HUDCards['Throw Type'].Text = tostring(ModeOrder[modeIndex] or 'N/A') end
-        
-        if HUDCards['Player'] then
-            if throwAimbot.Value then
-                HUDCards['Player'].Text = 'MOUSE'
-            else
-                HUDCards['Player'].Text = tostring((target and target.Name) or 'NONE')
-            end
-        end
-    else
-        updateHUDVisibility(false)
-        updateHighlights(false)
-        target = nil
-        lastValidTarget = nil
-    end
-
-    if beam and isTracking then
-        beam.Enabled = true
-        local startOrigin = head.Position
-        local safePowerForBeam = tonumber(power) or 60
-        local drawDir = direction or Vector3.new(0, 1, 0)
-        
-        if throwAimbot.Value then
-            if (tonumber(drawDir.Magnitude) or 0) < 0.1 then
-                drawDir = Vector3.new(0, 1, 0) * safePowerForBeam
-            end
-        elseif not target or not targetLeadPos then
-            local mouseRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
-            drawDir = mouseRay.Direction.Unit * safePowerForBeam
-            direction = drawDir
-        else
-            if (tonumber(drawDir.Magnitude) or 0) < 0.1 then
-                drawDir = Vector3.new(0, 1, 0) * safePowerForBeam
-            end
-        end
-        
-        local safeAirtime = math.max(tonumber(airtime) or 0.1, 0.1)
-        
-        local curve0, curve1, cf1, cf2 = beamProjectile(Vector3.new(0,-28,0), drawDir, startOrigin + (drawDir.Unit * 5), safeAirtime)
-        
-        beam.CurveSize0 = curve0
-        beam.CurveSize1 = curve1
-        
-        if attach0 and attach1 then
-            attach0.WorldCFrame = cf1
-            attach1.WorldCFrame = cf2
-            
-            attach0.WorldPosition = Vector3.new(cf1.X, cf1.Y, cf1.Z)
-            attach1.WorldPosition = Vector3.new(cf2.X, cf2.Y, cf2.Z)
-            
-            if posPart then posPart.Position = Vector3.new(attach1.WorldPosition.X, attach1.WorldPosition.Y, attach1.WorldPosition.Z) end
-        end
-    else
-        if beam then beam.Enabled = false end
-        if posPart then posPart.Position = Vector3.new(0, -9999, 0) end
-        if attach0 then attach0.WorldPosition = Vector3.new(0, -9999, 0) end
-        if attach1 then attach1.WorldPosition = Vector3.new(0, -9999, 0) end
-    end
-end)
-
-local CatchingTab = Window:CreateTab({ Name = 'Catching', Icon = 'rbxassetid://6034227067' })
-
-footballMagnets = CatchingTab:CreateToggle({
-    Name = 'Enable Football Magnets',
-    Default = false,
-    Tip = 'Automatically pulls nearby footballs into catch range.',
-})
-
-freeFallCheck = CatchingTab:CreateToggle({
-    Name = 'Magnets Freefall Check',
-    Default = false,
-    Tip = 'Only activates football magnets while the ball is airborne.',
-})
-
-showCatchHitbox = CatchingTab:CreateToggle({
-    Name = 'Show Magnets Radius',
-    Default = false,
-    Tip = 'Displays the football magnets catch radius.',
-})
-
-magnetsRadius = CatchingTab:CreateSlider({
-    Name = 'Magnets Catch Distance',
-    Min = 0,
-    Max = 25,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the maximum distance footballs can be caught from.',
-})
-
-magnetsDelay = CatchingTab:CreateSlider({
-    Name = 'Magnets Catch Delay',
-    Min = 0,
-    Max = 1,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the delay before football magnets activate.',
-})
-
-magsType = CatchingTab:CreateDropdown({
-    Name = 'Magnets Type',
-    Options = {'Custom', 'Blatant', 'League', 'Legit'},
-    Default = 'Custom',
-    Tip = 'Selects the football magnets behavior preset.',
-})
-
-local player = game:GetService('Players').LocalPlayer
-
-local part = Instance.new('Part')
-part.Color = Color3.fromRGB(255, 255, 255)
-part.Shape = Enum.PartType.Ball
-part.Material = Enum.Material.ForceField
-part.CastShadow = false
-part.Anchored = true
-part.CanCollide = false
-
-local findClosestBall = function()
-    local character = player.Character
-    if not character then return end
-
-    local humanoidRootPart = character:FindFirstChild('HumanoidRootPart')
-    if not humanoidRootPart then return end
-
-    local dist = math.huge
-    local ball = nil
-
-    for _, v in next, workspace:GetChildren() do
-        if not v:IsA('BasePart') then continue end
-        if v.Name ~= 'Football' then continue end
-
-        local distance = (v.Position - humanoidRootPart.Position).Magnitude
-
-        if distance < dist then
-            dist = distance
-            ball = v
-        end
-    end
-
-    return ball
-end
-
-local selectedRange = function()
-	local range = tonumber(magnetsRadius.Value) or 0
-	local mode = tostring(magsType.Value or 'Custom'):lower()
-
-	if mode == 'legit' then
-		return range / 2
-	elseif mode == 'league' then
-		return range / 1.4
-	elseif mode == 'blatant' then
-		return range * 1.5
-	end
-
-	return range
-end
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        if not humanoid then continue end
-
-        local ball = findClosestBall()
-        if not ball then continue end
-
-        local range = selectedRange()
-
-        part.Size = Vector3.new(range, range, range)
-        part.CFrame = CFrame.new(ball.Position)
-        part.Parent = (footballMagnets.Value and showCatchHitbox.Value) and workspace.Terrain or nil
-
-        for _, v in next, character:GetChildren() do
-            if not v:IsA('BasePart') then continue end
-            if not v.Name:lower():find('catch') then continue end
-
-            local distance = (ball.Position - v.Position).Magnitude
-
-            if freeFallCheck.Value and humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then continue end
-
-            if footballMagnets.Value and distance < range then
-                pcall(function()
-                    firetouchinterest(v, ball, 0)
-                    firetouchinterest(v, ball, 1)
-                end)
-            end
-        end
-    end
-end)
-
-CatchingTab:CreateDivider()
-
-magEnhancer = CatchingTab:CreateToggle({
-    Name = 'Enable Mag Enhancer',
-    Default = false,
-    Tip = 'Enhances catches on footballs already within range.',
-})
-
-magEnhancerRadius = CatchingTab:CreateSlider({
-    Name = 'Mag Catch Distance',
-    Min = 0,
-    Max = 25,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the maximum distance the enhancer can assist catches.',
-})
-
-magEnhancerMaxAngle = CatchingTab:CreateSlider({
-    Name = 'Mag Max Angle',
-    Min = 50,
-    Max = 70,
-    Default = 50,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the maximum catch angle the enhancer can assist.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait(0.1)
-
-        if not magEnhancer.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoidRootPart = character:FindFirstChild('HumanoidRootPart')
-        if not humanoidRootPart then continue end
-
-        local ball = findClosestBall()
-        if not ball then continue end
-
-        local verticalDistance = ball.Position.Y - humanoidRootPart.Position.Y
-
-        if verticalDistance > magEnhancerMaxAngle.Value then
-            continue
-        end
-
-        local lookVector = humanoidRootPart.CFrame.LookVector
-        local direction = (ball.Position - humanoidRootPart.Position).Unit
-        local dot = lookVector:Dot(direction)
-
-        for _, v in next, character:GetChildren() do
-            if not v:IsA('BasePart') then continue end
-            if not v.Name:lower():find('catch') then continue end
-
-            local distance = (ball.Position - v.Position).Magnitude
-
-            if dot > 0 and distance <= magEnhancerRadius.Value then
-                pcall(function()
-                    firetouchinterest(v, ball, 0)
-                    firetouchinterest(v, ball, 1)
-                end)
-            end
-        end
-    end
-end)
-    
-CatchingTab:CreateDivider()
-
-pullVector = CatchingTab:CreateToggle({
-    Name = 'Enable Pull Vector',
-    Default = false,
-    Tip = 'Pulls nearby footballs toward your catch position.',
-})
-
-pullVectorRadius = CatchingTab:CreateSlider({
-    Name = 'Pull Vector Radius',
-    Min = 0,
-    Max = 45,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the maximum distance footballs can be pulled from.',
-})
-
-pullVectorPower = CatchingTab:CreateSlider({
-    Name = 'Pull Vector Power',
-    Min = 0,
-    Max = 5,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Controls how strongly footballs are pulled toward you.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not pullVector.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoidRootPart = character:FindFirstChild('HumanoidRootPart')
-        if not humanoidRootPart then continue end
-
-        local ball = findClosestBall()
-        if not ball then continue end
-
-        local distance = (ball.Position - humanoidRootPart.Position).Magnitude
-        if distance > pullVectorRadius.Value then continue end
-
-        local direction = (ball.Position - humanoidRootPart.Position).Unit
-        humanoidRootPart.AssemblyLinearVelocity = direction * (pullVectorPower.Value * 25)
-    end
-end)
-
-CatchingTab:CreateDivider()
-
-increaseArmSize = CatchingTab:CreateToggle({
-    Name = 'Increase Arm Size',
-    Default = false,
-    Tip = 'Increases arm size to improve catch reach.',
-})
-
-armSizeValue = CatchingTab:CreateSlider({
-    Name = 'Arm Size Value',
-    Min = 2,
-    Max = 25,
-    Default = 2,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the size applied to both arms.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        local character = player.Character
-        if not character then continue end
-
-        for _, v in next, character:GetChildren() do
-            if not v:IsA('BasePart') then continue end
-            if not v.Name:lower():find('t arm') then continue end
-
-            v.Size = Vector3.new(v.Size.X, increaseArmSize.Value and armSizeValue.Value or 2, v.Size.Z)
-        end
-    end
-end)
-    
-local PlayerTab = Window:CreateTab({ Name = 'Player', Icon = 'rbxassetid://103807548355126' })
-
-customWalkSpeed = PlayerTab:CreateToggle({
-    Name = 'Custom WalkSpeed',
-    Default = false,
-    Tip = 'Overrides your character movement speed.',
-})
-
-walkSpeedValue = PlayerTab:CreateSlider({
-    Name = 'WalkSpeed Value',
-    Min = 20,
-    Max = 23,
-    Default = 20,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the movement speed value.',
-})
-
-walkspeedType = PlayerTab:CreateDropdown({
-    Name = 'WalkSpeed Type',
-    Options = {'Normal', 'CFrame'},
-    Default = 'Normal',
-    Tip = 'Selects how movement speed is applied.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-        
-        if not customWalkSpeed.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        if not humanoid then continue end
-        if humanoid.PlatformStand then continue end
-        if humanoid.WalkSpeed == 0 then continue end
-
-        local root = character:FindFirstChild('HumanoidRootPart')
-        if not root then continue end
-
-        local direction = Vector3.new(humanoid.MoveDirection.X, 0, humanoid.MoveDirection.Z)
-        if direction.Magnitude <= 0 then continue end
-
-        local velocity = direction.Unit * (walkspeedType.Value == 'CFrame' and (walkSpeedValue.Value / 75) or walkSpeedValue.Value)
-
-        if humanoid:GetState() == Enum.HumanoidStateType.Running then
-            local scale = walkSpeedValue.Value / math.max(humanoid.WalkSpeed, 1)
-
-            local animator = humanoid:FindFirstChildOfClass('Animator')
-            if animator then
-                for _, track in next, animator:GetPlayingAnimationTracks() do
-                    track:AdjustSpeed(scale)
-                end
-            end
-        end
-
-        if walkspeedType.Value ~= 'CFrame' then
-            root.AssemblyLinearVelocity = Vector3.new(velocity.X, root.AssemblyLinearVelocity.Y, velocity.Z)
-        else
-            root.CFrame = root.CFrame + velocity
-        end
-    end
-end)
-
-PlayerTab:CreateDivider()
-
-customJumpPower = PlayerTab:CreateToggle({
-    Name = 'Custom JumpPower',
-    Default = false,
-    Tip = 'Overrides your character jump power.',
-})
-
-jumpPowerValue = PlayerTab:CreateSlider({
-    Name = 'JumpPower Value',
-    Min = 50,
-    Max = 70,
-    Default = 50,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the custom jump power.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not customJumpPower.Value then continue end
-        local character = player.Character
-        if not character then continue end
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        if not humanoid then continue end
-
-        local root = character:FindFirstChild('HumanoidRootPart')
-        if not root then continue end
-
-        if humanoid:GetState() ~= Enum.HumanoidStateType.Jumping then continue end
-        
-        task.wait()
-        root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, jumpPowerValue.Value, root.AssemblyLinearVelocity.Z)
-    end
-end)
-    
-PlayerTab:CreateDivider()
-
-angleEnhancer = PlayerTab:CreateToggle({
-    Name = 'Angle Enhancer',
-    Default = false,
-    Tip = 'Boosts jump height when directional look changes while jumping.',
-})
-
-angleEnhancerIndicator = PlayerTab:CreateToggle({
-    Name = 'Angle Enhancer Indicator',
-    Default = false,
-    Tip = 'Showsa notification when an angle boost is triggered.',
-})
-    
-    autoFlip = PlayerTab:CreateToggle({
-    Name = 'Auto Flip Before Landing',
-    Default = false,
-    Tip = 'Automatically adjusts player orientation before landing.',
-})
-
-angleEnhanceBoost = PlayerTab:CreateSlider({
-    Name = 'Angle Boost Value',
-    Min = 50,
-    Max = 70,
-    Default = 50,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the vertical velocity applied during angle boost.',
-})
-    
-local lastTick = 0
-local oldLookVector = nil
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not angleEnhancer.Value then continue end
-
-        local character = player.Character
-        if not character then oldLookVector = nil continue end
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        local hrp = character:FindFirstChild('HumanoidRootPart')
-        if not humanoid or not hrp then oldLookVector = nil continue end
-
-        if humanoid:GetState() ~= Enum.HumanoidStateType.Jumping then
-            continue
-        end
-
-        local currentTime = tick()
-        local newLookVector = hrp.CFrame.LookVector
-
-        if not oldLookVector then
-            oldLookVector = newLookVector
-            lastTick = currentTime
-            continue
-        end
-
-        local angleChange = math.acos(math.clamp(oldLookVector:Dot(newLookVector), -1, 1))
-        local shiftLockEnabled = userInputService.MouseBehavior == Enum.MouseBehavior.LockCenter
-
-        if currentTime - lastTick >= 0.2 and angleChange > math.rad(5) then
-            lastTick = currentTime
-            oldLookVector = newLookVector
-        end
-
-        if angleChange > math.rad(25) and currentTime - lastTick <= 2.5 then
-            lastTick = currentTime
-            oldLookVector = newLookVector
-
-            task.wait()
-
-            local vel = hrp.AssemblyLinearVelocity
-            hrp.AssemblyLinearVelocity = Vector3.new(vel.X, angleEnhanceBoost.Value, vel.Z)
-
-            if angleEnhancerIndicator.Value and (shiftLockEnabled or true) then
-                local hint = Instance.new('Hint')
-                hint.Text = 'Angled!'
-                hint.Parent = workspace.Terrain
-
-                task.delay(2.5, function()
-                    if hint then
-                        hint:Destroy()
-                    end
-                end)
-            end
-        end
-    end
-end)
-    
-local runtime, jumptime, hittime = 0, 0, 0
-local arm, vLine, used, prevPs = false, nil, false, false
-local seq = 0
-local pack = nil
-
-local xz = function(v: Vector3)
-	local f = Vector3.new(v.X, 0, v.Z)
-	return f.Magnitude > 0.001 and f.Unit or nil
-end
-
-local reset = function()
-	if not pack then return end
-	for _, o in next, { pack.spin, pack.ra, pack.pivot, pack.ha } do
-		if o then o:Destroy() end
-	end
-	pack = nil
-end
-
-local flip = function(root: BasePart, head: BasePart)
-	reset()
-
-	local m = math.max(root.AssemblyMass, 1)
-
-	local ha = Instance.new("Attachment")
-	ha.Parent = head
-
-	local pivot = Instance.new("AlignPosition")
-	pivot.Mode = Enum.PositionAlignmentMode.OneAttachment
-	pivot.Attachment0 = ha
-	pivot.Position = head.Position + Vector3.new(0, 0.15, 0)
-	pivot.MaxForce = 180000
-	pivot.Responsiveness = 120
-	pivot.RigidityEnabled = false
-	pivot.ApplyAtCenterOfMass = false
-	pivot.Parent = head
-
-	local ra = Instance.new("Attachment")
-	ra.Parent = root
-
-	local spin = Instance.new("AngularVelocity")
-	spin.Attachment0 = ra
-	spin.RelativeTo = Enum.ActuatorRelativeTo.Attachment0
-	spin.AngularVelocity = Vector3.new(-9, 0, 0)
-	spin.MaxTorque = 50000
-	spin.Parent = root
-
-	root:ApplyAngularImpulse(root.CFrame.RightVector * (-16 * m))
-
-	pack = { ha = ha, pivot = pivot, ra = ra, spin = spin }
-end
-
-task.spawn(function()
-	while true do
-		task.wait()
-	    
-	    if not autoFlip.Value then continue end
-	    
-		local char = player.Character
-		if not char then
-			reset()
-			arm, vLine, used, prevPs = false, nil, false, false
-			continue
-		end
-
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		local hrp = char:FindFirstChild("HumanoidRootPart")
-		local head = char:FindFirstChild("Head")
-
-		if not hum or not hrp or not head then continue end
-
-		local now = tick()
-
-		if hum:GetState() == Enum.HumanoidStateType.Running then runtime = now end
-		if hum:GetState() == Enum.HumanoidStateType.Jumping then jumptime = now end
-
-		local ps = hum.PlatformStand
-		if ps ~= prevPs then
-			if ps then
-				arm = (now - runtime <= 0.5) and (now - jumptime <= 0.7)
-				vLine = xz(hrp.AssemblyLinearVelocity) or xz(hrp.CFrame.LookVector)
-				used = false
-			else
-				arm, vLine, used = false, nil, false
-				seq += 1
-				reset()
-			end
-			prevPs = ps
-		end
-
-		if not ps or not arm or pack then continue end
-
-		local params = RaycastParams.new()
-		params.FilterType = Enum.RaycastFilterType.Exclude
-		params.FilterDescendantsInstances = { char }
-
-		local result = workspace:Raycast(head.Position, Vector3.new(0, -3, 0), params)
-		local ground = result and result.Instance ~= nil
-
-		if used or not ground or now - hittime < 0.12 then continue end
-
-		local dist = result and (head.Position - result.Position).Magnitude or math.huge
-		if dist > 1.6 then continue end
-
-		local move = xz(hrp.AssemblyLinearVelocity) or vLine
-		local face = xz(hrp.CFrame.LookVector)
-
-		if not move or not face or face:Dot(move) < 0.78 then continue end
-
-		hittime = now
-		used = true
-		seq += 1
-		local k = seq
-
-		flip(hrp, head)
-
-		task.delay(0.24, function()
-			if k == seq then
-				reset()
-			end
-		end)
-	end
-end)
-
-PlayerTab:CreateDivider()
-
-PlayerTab:CreateButton({
-    Name = 'Unlock All Gamepass',
-    Tip = 'Enables all gamepass-related checks locally.',
-    Callback = function()
-        local replicatedFirst = game:GetService('ReplicatedFirst')
-
-        local module
-        local success = pcall(function()
-            module = require(replicatedFirst:FindFirstChild('LocalSave'))
-        end)
-
-        if not success or not module then
-            return
-        end
-
-        module.PlayerOwnsPass = function(a, b)
-            return true
-        end
-    end
-})
-
-local PhysicsTab = Window:CreateTab({ Name = 'Physics', Icon = 'rbxassetid://11537490966' })
-    
-local boundaries = {}
-
-if not isPractice then
-    for i, v in next, workspace.Models.Boundaries:GetChildren() do
-        boundaries[#boundaries + 1] = v
-    end
-end
-
-antiBoundaries = PhysicsTab:CreateToggle({
-    Name = 'Anti OOB',
-    Default = false,
-    Tip = 'Prevents players from triggering out-of-bounds zones.',
-    Callback = function(v)
-        for i, b in next, boundaries do
-            if b then
-                b.Parent = not v and workspace.Models.Boundaries or nil
-            end
-        end
-    end
-})
-    
-    antiBench = PhysicsTab:CreateToggle({
-    Name = 'Anti Bench',
-    Default = false,
-    Tip = 'Prevents automatic benching.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not antiBench.Value then continue end
-
-        local playerGui = player:FindFirstChild('PlayerGui')
-        if not playerGui then continue end
-
-        local benchButton = playerGui:FindFirstChild('Benched', true)
-        if not benchButton then continue end
-
-        if benchButton.BackgroundColor3 == Color3.fromRGB(120, 120, 120) then
-            replicatedStorage.Remotes.CharacterSoundEvent:FireServer('Game', 'ToggleBench')
-        end
-    end
-end)
---[[
-local scrambleWall = workspace:FindFirstChild('ScrambleWall')
-
-antiQbBoundaries = PhysicsTab:CreateToggle({
-    Name = 'Anti QB Boundaries',
-    Default = false,
-    Tip = 'Disables invisible QB boundary walls.',
-    Callback = function(v)
-        if not scrambleWall then return end
-        scrambleWall.Parent = v and nil or workspace
-    end
-})
-    ]]
-PhysicsTab:CreateDivider()
-
-antiJam = PhysicsTab:CreateToggle({
-    Name = 'Anti Jam',
-    Default = false,
-    Tip = 'Reduces player collision while moving.',
-})
-
-antiJumpCooldown = PhysicsTab:CreateToggle({
-    Name = 'Anti Jump Cooldown',
-    Default = false,
-    Tip = 'Removes the delay between jumps.',
-})
-
-antiFreeze = PhysicsTab:CreateToggle({
-    Name = 'Anti Freeze',
-    Default = false,
-    Tip = 'Prevents movement speed from being reduced.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-        
-        if antiJumpCooldown.Value then
-            player.Character.Humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
-        end
-        
-        if antiFreeze.Value then
-            if player.Character.Humanoid.WalkSpeed ~= 20 then
-                player.Character.Humanoid.WalkSpeed = 20
-            end
-        end
-
-        for _, v in next, players:GetPlayers() do
-            if v == player then continue end
-
-            local character = v.Character
-            if not character then continue end
-
-            local hum = character:FindFirstChildOfClass('Humanoid')
-            if not hum then continue end
-
-            for _, part in next, character:GetChildren() do
-                if not part:IsA('BasePart') then continue end
-                if part.Name == 'Head' or part.Name == 'Torso' then
-                    if hum:GetState() == Enum.HumanoidStateType.Running then
-                        part.CanCollide = not antiJam.Value
-                    else
-                        part.CanCollide = true
-                    end
-                end
-            end
-        end
-    end
-end)
-
-antiBlock = PhysicsTab:CreateToggle({
-    Name = 'Anti Block',
-    Default = false,
-    Tip = 'Reduces player collision while moving.',
-})
-    
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not antiBlock.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        if not humanoid then continue end
-
-        for _, v in next, character:GetDescendants() do
-            if not v:IsA('BodyVelocity') then continue end
-            -- if not v.Name:lower():find('ffmover') then continue end
-
-            v.Velocity = Vector3.zero
-            v.MaxForce = Vector3.zero
-            humanoid.WalkSpeed = 20
-
-            pcall(function()
-                v:Destroy()
-            end)
-        end
-    end
-end)
-
-PhysicsTab:CreateDivider()
-
-quickTP = PhysicsTab:CreateToggle({
-    Name = 'Quick TP',
-    Default = false,
-    Tip = 'Teleports forward in the direction you are facing.',
-})
-
-quickTPPower = PhysicsTab:CreateSlider({
-    Name = 'Quick TP Power',
-    Min = 0,
-    Max = 5,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the teleport distance.',
-})
-
-HideKeybind = PhysicsTab:CreateKeybind({
-    Name = 'Quick TP Keybind',
-    Default = Enum.KeyCode.Q,
-    Tip = 'Key used to activate Quick TP.',
-})
-
-userInputService.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if not quickTP.Value then return end
-    if input.KeyCode ~= HideKeybind.Value and input.UserInputType ~= Enum.UserInputType.Touch then return end
-
-    local character = player.Character
-    if not character then return end
-
-    local hrp = character:FindFirstChild('HumanoidRootPart')
-    if not hrp then return end
-
-    hrp.CFrame += hrp.CFrame.LookVector * quickTPPower.Value
-end)
-    
-PhysicsTab:CreateDivider()
-
-bigHead = PhysicsTab:CreateToggle({
-    Name = 'Big Head Players',
-    Default = false,
-    Tip = 'Increases the size of other players heads.',
-})
-
-bigHeadSize = PhysicsTab:CreateSlider({
-    Name = 'Big Head Size',
-    Min = 1,
-    Max = 6,
-    Default = 1,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the size applied to player heads.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        for _, v in next, players:GetPlayers() do
-            if v == player then continue end
-
-            local character = v.Character
-            if not character then continue end
-
-            local head = character:FindFirstChild('Head')
-            if not head then continue end
-
-            head.Size = Vector3.new(bigHead.Value and bigHeadSize.Value or 1, bigHead.Value and bigHeadSize.Value or 1, bigHead.Value and bigHeadSize.Value or 1)
-        end
-    end
-end)
-    
-local VisualTab = Window:CreateTab({ Name = 'Visual', Icon = 'rbxassetid://88610077537468' })
-
-jumpSpot = VisualTab:CreateToggle({
-    Name = 'Visualise Football Jump Spot',
-    Default = false,
-    Tip = 'Displays the predicted jump location of incoming footballs.',
-})
-
-workspace.ChildAdded:Connect(function(v)
-    if not jumpSpot.Value then return end
-    if not v:IsA('BasePart') or v.Name ~= 'Football' then return end
-
-    task.wait()
-
-    local position = v.Position
-    local velocity = v.AssemblyLinearVelocity
-    local gravity = Vector3.new(0, -28, 0)
-    local deltaTime = 1 / 30
-
-    local positions = {position}
-
-    local raycastParams = RaycastParams.new()
-    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-    raycastParams.FilterDescendantsInstances = {v}
-    raycastParams.IgnoreWater = true
-
-    for _ = 1, 300 do
-        local nextPosition = position + velocity * deltaTime + 0.5 * gravity * deltaTime ^ 2
-        velocity += gravity * deltaTime
-
-        if velocity.Y < 0 then
-            local direction = nextPosition - position
-            local result = workspace:Raycast(position, direction + Vector3.new(0, -14.4, 0), raycastParams)
-
-            if result then
-                nextPosition = result.Position
-                table.insert(positions, nextPosition)
-                break
-            end
-        end
-
-        table.insert(positions, nextPosition)
-        position = nextPosition
-    end
-
-    local optimalPoint = positions[#positions]
-    
-    local model = Instance.new('Model')
-    model.Parent = workspace
-
-    local baseY = optimalPoint.Y - 1.5
-    local undergroundY = baseY - 6
-
-    local gradientCylinder = Instance.new('MeshPart')
-    gradientCylinder.MeshId = 'rbxassetid://8091779363'
-    gradientCylinder.Material = Enum.Material.Plastic
-    gradientCylinder.Size = Vector3.new(2, 4, 2)
-    gradientCylinder.Rotation = Vector3.new(180, 0, 180)
-    gradientCylinder.Transparency = 1
-    gradientCylinder.Anchored = true
-    gradientCylinder.CanCollide = false
-    gradientCylinder.Position = Vector3.new(optimalPoint.X, undergroundY, optimalPoint.Z)
-    gradientCylinder.Parent = model
-
-    local faces = {
-        Enum.NormalId.Front,
-        Enum.NormalId.Back,
-        Enum.NormalId.Left,
-        Enum.NormalId.Right
-    }
-
-    for _, face in next, faces do
-        local decal = Instance.new('Decal')
-        decal.Face = face
-        decal.Texture = 'rbxassetid://8097185954'
-        decal.Transparency = 0
-        decal.Color3 = Color3.fromRGB(255, 255, 255)
-        decal.Parent = gradientCylinder
-    end
-
-    local glowCircle = Instance.new('MeshPart')
-    glowCircle.MeshId = 'rbxassetid://8091848285'
-    glowCircle.Material = Enum.Material.Neon
-    glowCircle.Color = Color3.fromRGB(255, 255, 255)
-    glowCircle.Size = Vector3.new(3.731, 0.031, 3.731)
-    glowCircle.Rotation = Vector3.new(180, 0, 180)
-    glowCircle.Transparency = 1
-    glowCircle.Anchored = true
-    glowCircle.CanCollide = false
-    glowCircle.Position = Vector3.new(optimalPoint.X, undergroundY, optimalPoint.Z)
-    glowCircle.Parent = model
-
-    local emitter = Instance.new('ParticleEmitter')
-    emitter.Texture = 'rbxasset://textures/particles/sparkles_main.dds'
-    emitter.Rate = 5
-    emitter.Speed = NumberRange.new(5, 5)
-    emitter.Lifetime = NumberRange.new(0.5, 0.5)
-    emitter.EmissionDirection = Enum.NormalId.Top
-    emitter.TimeScale = 0.3
-    emitter.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255))
-    emitter.Parent = gradientCylinder
-
-    local bottomPart = Instance.new('Part')
-    bottomPart.Size = Vector3.new(0.311, 0.311, 0.311)
-    bottomPart.Transparency = 1
-    bottomPart.Material = Enum.Material.Plastic
-    bottomPart.Anchored = true
-    bottomPart.CanCollide = false
-    bottomPart.Position = Vector3.new(optimalPoint.X, undergroundY, optimalPoint.Z)
-    bottomPart.Parent = model
-
-    local pointLight = Instance.new('PointLight')
-    pointLight.Color = Color3.fromRGB(255, 255, 255)
-    pointLight.Range = 12
-    pointLight.Brightness = 2
-    pointLight.Parent = bottomPart
-
-    local tweenInfo = TweenInfo.new(0.55, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-
-    local upGoal = {
-        Position = Vector3.new(optimalPoint.X, baseY, optimalPoint.Z)
-    }
-
-    local downGoal = {
-        Position = Vector3.new(optimalPoint.X, undergroundY, optimalPoint.Z)
-    }
-
-    local upTweens = {
-        tweenService:Create(gradientCylinder, tweenInfo, upGoal),
-        tweenService:Create(glowCircle, tweenInfo, upGoal),
-        tweenService:Create(bottomPart, tweenInfo, upGoal)
-    }
-
-    for _, t in next, upTweens do
-        t:Play()
-    end
-
-    task.spawn(function()
-        while v and v.Parent and v.AssemblyLinearVelocity.Magnitude > 1 do
-            task.wait()
-        end
-
-        local downTweens = {
-            tweenService:Create(gradientCylinder, tweenInfo, downGoal),
-            tweenService:Create(glowCircle, tweenInfo, downGoal),
-            tweenService:Create(bottomPart, tweenInfo, downGoal)
-        }
-
-        for _, t in next, downTweens do
-            t:Play()
-        end
-
-        task.wait(0.4)
-
-        if model.Parent then
-            model:Destroy()
-        end
-    end)
-end)
-    
-    throwSpot = VisualTab:CreateToggle({
-    Name = 'Visualise Football Throw Spot',
-    Default = false,
-    Tip = 'Shows the predicted landing point of thrown footballs.',
-})
-    
-    workspace.ChildAdded:Connect(function(v)
-        if not throwSpot.Value then return end
-    if not v:IsA('BasePart') or v.Name ~= 'Football' then return end
-
-    task.wait()
-
-    local pos = v.Position
-    local vel = v.AssemblyLinearVelocity
-    local gravity = Vector3.new(0, -28, 0)
-
-    local positions = {}
-    local parts = {}
-
-    local dt = 0.05
-    local maxTime = 8
-
-    local lastPos = pos
-    local spawnY = pos.Y
-
-    for t = 0, maxTime, dt do
-        local projectilePos = pos + (vel * t) + (0.5 * gravity * t * t)
-
-        table.insert(positions, projectilePos)
-
-        if projectilePos.Y < spawnY then
-            break
-        end
-
-        local ray = workspace:Raycast(lastPos, projectilePos - lastPos)
-        if ray then
-            positions[#positions] = ray.Position
-            break
-        end
-
-        lastPos = projectilePos
-    end
-
-    local endPos = positions[#positions]
-    if not endPos then return end
-
-    local posPart = Instance.new('Part', workspace.Terrain)
-    posPart.Anchored = true
-    posPart.CanCollide = false
-    posPart.CastShadow = false
-    posPart.Size = Vector3.new(3, 3, 3)
-    posPart.Shape = Enum.PartType.Ball
-    posPart.Color = Color3.fromRGB(0, 0, 0)
-    posPart.Position = endPos
-
-    for i = 1, #positions - 1 do
-        local p0 = positions[i]
-        local p1 = positions[i + 1]
-
-        local beamPart = Instance.new('Part', workspace.Terrain)
-        beamPart.Anchored = true
-        beamPart.CanCollide = false
-        beamPart.CastShadow = false
-        beamPart.Material = Enum.Material.Neon
-        beamPart.Color = Color3.fromRGB(255, 255, 255)
-
-        local dist = (p1 - p0).Magnitude
-
-        beamPart.Size = Vector3.new(0.4, 0.4, dist)
-        beamPart.CFrame = CFrame.lookAt((p0 + p1) / 2, p1)
-
-        table.insert(parts, beamPart)
-    end
-
-    task.spawn(function()
-        local speed = math.max(vel.Magnitude, 1)
-        local delayTime = math.clamp(300 / speed, 0.01, 0.04)
-
-        for _, part in next, parts do
-            task.wait(delayTime)
-
-            if part.Parent then
-                part:Destroy()
-            end
-        end
-
-        if posPart.Parent then
-            posPart:Destroy()
-        end
-    end)
-end)
-    
-VisualTab:CreateDivider()
-    
-enableGloves = VisualTab:CreateToggle({
-    Name = 'Enable Uniform Gloves',
-    Default = true,
-    Tip = 'Toggles visibility of uniform gloves.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        local character = player.Character
-        if not character then continue end
-
-        local uniform = character:FindFirstChild('Uniform')
-        if not uniform then continue end
-
-        local gloveVisible
-
-        for _, v in next, uniform:GetDescendants() do
-            if not v:IsA('BasePart') then continue end
-            if not v.Name:lower():find('glove') then continue end
-
-            gloveVisible = v.Transparency == 0
-            break
-        end
-
-        if gloveVisible == nil then continue end
-
-        if enableGloves.Value and not gloveVisible then
-            replicatedStorage.Remotes.CharacterSoundEvent:FireServer('Game', 'Customization', 'Toggle', 'LeftGlove')
-            replicatedStorage.Remotes.CharacterSoundEvent:FireServer('Game', 'Customization', 'Toggle', 'RightGlove')
-        elseif not enableGloves.Value and gloveVisible then
-            replicatedStorage.Remotes.CharacterSoundEvent:FireServer('Game', 'Customization', 'Toggle', 'LeftGlove')
-            replicatedStorage.Remotes.CharacterSoundEvent:FireServer('Game', 'Customization', 'Toggle', 'RightGlove')
-        end
-    end
-end)
-
-VisualTab:CreateDivider()
-    
-noBallTrail = VisualTab:CreateToggle({
-    Name = 'No Ball Trail',
-    Default = false,
-    Tip = 'Removes football trail effects.',
-})
-
-workspace.ChildAdded:Connect(function(v)
-    if not noBallTrail.Value then return end
-
-    if v:IsA('BasePart') and v.Name == 'Football' then
-        local trail = v:FindFirstChildOfClass('Trail')
-        if trail then
-            trail:Destroy()
-        end
-    end
-end)
-
-local stadiumParts = {}
-
-for _, v in next, workspace.Models.Stadium:GetDescendants() do
-    if not v:IsA('BasePart') then continue end
-
-    stadiumParts[#stadiumParts + 1] = {
-        Part = v,
-        Transparency = v.Transparency,
-        CanCollide = v.CanCollide
-    }
-end
-
-hideStadium = VisualTab:CreateToggle({
-    Name = 'Hide Stadium',
-    Default = false,
-    Tip = 'Hides visible stadium structures.',
-    Callback = function(v)
-        for _, p in next, stadiumParts do
-            p.Part.Transparency = v and 1 or p.Transparency
-            p.Part.CanCollide = v and false or p.CanCollide
-        end
-    end
-})
-
-VisualTab:CreateDivider()
-
-local lighting = game:GetService('Lighting')
-
-local function ApplySkyBox(name)
-    for _, v in next, lighting:GetChildren() do
-        if v:IsA("Sky") or v:IsA("PostEffect") or v:IsA("Atmosphere") then
-            v:Destroy()
-        end
-    end
-
-    if name == "Golden Twilight" then
-        local Sky = Instance.new("Sky")
-        Sky.Name = name
-        Sky.Parent = lighting
-        Sky.SkyboxBk = "rbxassetid://541743453"
-        Sky.SkyboxDn = "rbxassetid://541743443"
-        Sky.SkyboxFt = "rbxassetid://541743446"
-        Sky.SkyboxLf = "rbxassetid://541743436"
-        Sky.SkyboxRt = "rbxassetid://541743435"
-        Sky.SkyboxUp = "rbxassetid://541743441"
-
-    elseif name == "Infernal Horizon" then
-        local Sky = Instance.new("Sky")
-        Sky.Name = name
-        Sky.Parent = lighting
-        Sky.SkyboxBk = "http://www.roblox.com/asset/?id=169210090"
-        Sky.SkyboxDn = "http://www.roblox.com/asset/?id=169210108"
-        Sky.SkyboxFt = "http://www.roblox.com/asset/?id=169210121"
-        Sky.SkyboxLf = "http://www.roblox.com/asset/?id=169210133"
-        Sky.SkyboxRt = "http://www.roblox.com/asset/?id=169210143"
-        Sky.SkyboxUp = "http://www.roblox.com/asset/?id=169210149"
-        Sky.StarCount = 100
-        Sky.SunTextureId = " "
-
-        local BlurEffect = Instance.new("BlurEffect")
-        BlurEffect.Parent = lighting
-        BlurEffect.Size = 6
-
-        local ColorCorrectionEffect = Instance.new("ColorCorrectionEffect")
-        ColorCorrectionEffect.Parent = lighting
-        ColorCorrectionEffect.Brightness = 0.01
-        ColorCorrectionEffect.Contrast = 0.15
-        ColorCorrectionEffect.Saturation = 0.4
-        ColorCorrectionEffect.TintColor = Color3.new(0.815686, 0.776471, 0.690196)
-
-    elseif name == "Nebula Peaks" then
-        local Sky = Instance.new("Sky")
-        Sky.Name = name
-        Sky.Parent = lighting
-        Sky.CelestialBodiesShown = false
-        Sky.SkyboxBk = "http://www.roblox.com/asset/?id=17124357467"
-        Sky.SkyboxDn = "http://www.roblox.com/asset/?id=17124359797"
-        Sky.SkyboxFt = "http://www.roblox.com/asset/?id=17124362093"
-        Sky.SkyboxLf = "http://www.roblox.com/asset/?id=17124365127"
-        Sky.SkyboxRt = "http://www.roblox.com/asset/?id=17124367200"
-        Sky.SkyboxUp = "http://www.roblox.com/asset/?id=17124369657"
-
-        local cc = Instance.new("ColorCorrectionEffect")
-        cc.Parent = lighting
-        cc.Brightness = 0.1
-        cc.Contrast = 0.3
-        cc.Saturation = 0.2
-        cc.TintColor = Color3.fromRGB(140, 190, 255)
-
-        local bloom = Instance.new("BloomEffect")
-        bloom.Parent = lighting
-        bloom.Intensity = 1.2
-        bloom.Threshold = 0.8
-        bloom.Size = 56
-
-        local atmosphere = Instance.new("Atmosphere")
-        atmosphere.Parent = lighting
-        atmosphere.Density = 0.25
-        atmosphere.Offset = 0.2
-        atmosphere.Glare = 0.3
-        atmosphere.Haze = 1
-        atmosphere.Color = Color3.fromRGB(80, 110, 150)
-        atmosphere.Decay = Color3.fromRGB(25, 30, 35)
-
-    elseif name == "Rose Glow" then
-        local Sky = Instance.new("Sky")
-        Sky.Name = name
-        Sky.Parent = lighting
-        Sky.CelestialBodiesShown = false
-        Sky.SkyboxBk = "http://www.roblox.com/asset/?id=109305193"
-        Sky.SkyboxDn = "http://www.roblox.com/asset?id=58372722"
-        Sky.SkyboxFt = "http://www.roblox.com/asset/?id=109305200"
-        Sky.SkyboxLf = "http://www.roblox.com/asset/?id=109305185"
-        Sky.SkyboxRt = "http://www.roblox.com/asset/?id=109305189"
-        Sky.SkyboxUp = "http://www.roblox.com/asset/?id=109305207"
-
-    elseif name == "Night Sky" then
-        local Sky = Instance.new("Sky")
-        Sky.Name = name
-        Sky.Parent = lighting
-        Sky.CelestialBodiesShown = false
-        Sky.SkyboxBk = "http://www.roblox.com/Asset/?ID=12064107"
-        Sky.SkyboxDn = "http://www.roblox.com/Asset/?ID=12064152"
-        Sky.SkyboxFt = "http://www.roblox.com/Asset/?ID=12064121"
-        Sky.SkyboxLf = "http://www.roblox.com/Asset/?ID=12063984"
-        Sky.SkyboxRt = "http://www.roblox.com/Asset/?ID=12064115"
-        Sky.SkyboxUp = "http://www.roblox.com/Asset/?ID=12064131"
-        Sky.StarCount = 0
-
-    elseif name == "Northern Lights" then
-        local Sky = Instance.new("Sky")
-        Sky.Name = name
-        Sky.Parent = lighting
-        Sky.CelestialBodiesShown = false
-        Sky.SkyboxBk = "http://www.roblox.com/asset/?id=16563478983"
-        Sky.SkyboxDn = "http://www.roblox.com/asset/?id=16563481302"
-        Sky.SkyboxFt = "http://www.roblox.com/asset/?id=16563484084"
-        Sky.SkyboxLf = "http://www.roblox.com/asset/?id=16563485362"
-        Sky.SkyboxRt = "http://www.roblox.com/asset/?id=16563487078"
-        Sky.SkyboxUp = "http://www.roblox.com/asset/?id=16563489821"
-    end
-end
-
-local skyNames = {'Golden Twilight', 'Infernal Horizon', 'Nebula Peaks', 'Rose Glow', 'Night Sky', 'Northern Lights'}
-
-for _, skyName in next, skyNames do
-    VisualTab:CreateButton({
-        Name = skyName,
-        Tip = 'Applies the ' .. skyName .. ' skybox.',
-        Callback = function()
-            ApplySkyBox(skyName)
-        end
-    })
-end
-
-local DefenseTab = Window:CreateTab({ Name = 'Defense', Icon = 'rbxassetid://14939023862' })
-
-swatReach = DefenseTab:CreateToggle({
-    Name = 'Swat Reach',
-    Default = false,
-    Tip = 'Extends swat range on nearby footballs.',
-})
-
-swatReachDistance = DefenseTab:CreateSlider({
-    Name = 'Swat Reach Radius',
-    Min = 0,
-    Max = 25,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the maximum swat distance.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not swatReach.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local ball = findClosestBall()
-        if not ball then continue end
-
-        for _, v in next, character:GetChildren() do
-            if v:IsA('BasePart') and v.Name:lower():find('catch') then
-                local distance = (ball.Position - v.Position).Magnitude
-                if distance < swatReachDistance.Value then
-                    if v.Size.X > 2 then
-                        firetouchinterest(v, ball, 0)
-                        firetouchinterest(v, ball, 1)
-                    end
-                end
-            end
-        end
-    end
-end)
-
-DefenseTab:CreateDivider()
-
-tackleReach = DefenseTab:CreateToggle({
-    Name = 'Extend Tackle Reach',
-    Default = false,
-    Tip = 'Extends tackle range against ball carriers.',
-})
-
-tackleAimbot = DefenseTab:CreateToggle({
-    Name = 'Tackle Aimbot',
-    Default = false,
-    Tip = 'Automatically targets nearby ball carriers.',
-})
-
-tackleAimbotRange = DefenseTab:CreateSlider({
-    Name = 'Tackle Aimbot Distance',
-    Min = 0,
-    Max = 25,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the maximum targeting distance.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        local character = player.Character
-        if not character then continue end
-
-        if tackleReach.Value then
-            for _, v in next, players:GetPlayers() do
-                if v ~= player and v.Team ~= player.Team and v.Character and v.Character:FindFirstChild('Football') then
-                    local bodyParts = {'Torso', 'Head', 'HumanoidRootPart', 'Left Arm', 'Left Leg', 'Right Arm', 'Right Leg'}
-                    local randomPart = bodyParts[math.random(1, #bodyParts)]
-
-                    replicatedStorage.Remotes.CharacterSoundEvent:FireServer('Game', 'TackleTouch', randomPart, randomPart)
-                end
-            end
-        end
-
-        if tackleAimbot.Value then
-            for _, v in next, players:GetPlayers() do
-                if v ~= player and v.Team ~= player.Team and v.Character and v.Character.Humanoid.WalkSpeed > 0 and v.Character:FindFirstChild('Football') then
-                    local distance = (v.Character.HumanoidRootPart.Position - character.HumanoidRootPart.Position).Magnitude
-                    if distance < tackleAimbotRange.Value then
-                        character.HumanoidRootPart.CFrame = v.Character.HumanoidRootPart.CFrame
-                        character.HumanoidRootPart.CFrame = v.Character.HumanoidRootPart.CFrame
-                    end
-                end
-            end
-        end
-    end
-end)
-
-local AutomaticsTab = Window:CreateTab({ Name = 'Automatics', Icon = 'rbxassetid://86084882582277' })
-
-autoRush = AutomaticsTab:CreateToggle({
-    Name = 'Auto Rush',
-    Default = false,
-    Tip = 'Automatically moves toward the opposing ball carrier in range.',
-})
-
-walkToLine = AutomaticsTab:CreateToggle({
-    Name = 'Walk To Line',
-    Default = false,
-    Tip = 'Moves the player to the line before play starts.',
-})
-
-autoRushReactionTime = AutomaticsTab:CreateSlider({
-    Name = 'Reaction Time',
-    Min = 0,
-    Max = 1,
-    Default = 0.15,
-    Increment = 0.01,
-    Suffix = '',
-    Tip = 'Adjusts how quickly the feature responds.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not autoRush.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        if not humanoid then continue end
-
-        local hrp = character:FindFirstChild('HumanoidRootPart')
-        if not hrp then continue end
-
-        if walkToLine.Value then
-            if replicatedStorage:FindFirstChild('Flags')
-                and replicatedStorage.Flags:FindFirstChild('PossessionTag')
-                and replicatedStorage.Flags:FindFirstChild('Status')
-                and replicatedStorage.Flags.PossessionTag.Value ~= player.Team.Name
-                and replicatedStorage.Flags.Status.Value == 'PrePlay' then
-
-                local line = workspace:FindFirstChild('LineDown')
-                if line then
-                    humanoid:MoveTo(line.Position)
-                end
-            end
-        end
-
-        for _, v in next, players:GetPlayers() do
-            if v == player then continue end
-            if v.Team == player.Team then continue end
-            if not v.Character then continue end
-
-            local enemyChar = v.Character
-            local enemyHumanoid = enemyChar:FindFirstChildOfClass('Humanoid')
-            local enemyHrp = enemyChar:FindFirstChild('HumanoidRootPart')
-            if not enemyHumanoid or not enemyHrp then continue end
-
-            local football = enemyChar:FindFirstChild('Football')
-            if not football then continue end
-
-            local footballPart = football:FindFirstChildWhichIsA('BasePart')
-            if not footballPart then continue end
-
-            if enemyHumanoid.WalkSpeed <= 0 then continue end
-            if enemyHumanoid.PlatformStand then continue end
-
-            local ping = 0
-            if stats and stats:FindFirstChild('Network') 
-                and stats.Network:FindFirstChild('ServerStatsItem')
-                and stats.Network.ServerStatsItem:FindFirstChild('Data Ping') then
-                ping = stats.Network.ServerStatsItem['Data Ping']:GetValue() / 1000
-            end
-
-            local speed = enemyHumanoid.MoveDirection.Magnitude > 0 and enemyHumanoid.WalkSpeed or 0
-            local predictionTime = ping + autoRushReactionTime.Value
-
-            local pos = footballPart.Position + (enemyHumanoid.MoveDirection * speed * predictionTime * 20)
-
-            local direction = pos - enemyHrp.Position
-            if direction.Magnitude > 0 then
-                pos += direction.Unit * ((hrp.Position - pos).Magnitude / 20)
-            end
-
-            humanoid:MoveTo(pos)
-        end
-    end
-end)
-
-AutomaticsTab:CreateDivider()
-
-autoCatch = AutomaticsTab:CreateToggle({
-    Name = 'Auto Catch',
-    Default = false,
-    Tip = 'Automatically moves toward nearby catch opportunities.',
-})
-
-autoCatchRadius = AutomaticsTab:CreateSlider({
-    Name = 'Auto Catch Distance',
-    Min = 0,
-    Max = 25,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets how far the auto catch detection can reach.',
-})
-    
-AutomaticsTab:CreateDivider()
-
-autoSwat = AutomaticsTab:CreateToggle({
-    Name = 'Auto Swat',
-    Default = false,
-    Tip = 'Automatically reacts to nearby incoming balls.',
-})
-
-autoSwatRadius = AutomaticsTab:CreateSlider({
-    Name = 'Auto Swat Distance',
-    Min = 0,
-    Max = 25,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets how far the auto swat detection can reach.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not autoCatch.Value and not autoSwat.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoidRootPart = character:FindFirstChild('HumanoidRootPart')
-        if not humanoidRootPart then continue end
-
-        local ball = findClosestBall()
-        if not ball then continue end
-
-        local distance = (ball.Position - humanoidRootPart.Position).Magnitude
-
-        if autoCatch.Value and distance <= autoCatchRadius.Value then
-            replicatedStorage.Remotes.CharacterSoundEvent:FireServer('PlayerActions', isPractice and 'catch ' or 'catch')
-        end
-
-        if autoSwat.Value and distance <= autoSwatRadius.Value then
-            replicatedStorage.Remotes.CharacterSoundEvent:FireServer('PlayerActions', 'swat')
-        end
-    end
-end)
-    
-AutomaticsTab:CreateDivider()
-    
-autoCaptain = AutomaticsTab:CreateToggle({
-    Name = 'Auto Win Captain',
-    Default = false,
-    Tip = 'Automatically moves toward the finish line during captain selection.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not autoCaptain.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local hrp = character:FindFirstChild('HumanoidRootPart')
-        if not hrp then continue end
-
-        for _, v in next, workspace.Models.LockerRoomA:GetChildren() do
-            if v.Name:lower():find('finishline') and not player.Team then
-                v:GetPropertyChangedSignal('CFrame'):Connect(function()
-                    for i = 1, 4 do
-                        task.wait()
-
-                        hrp.CFrame = v.CFrame
-                    end
-                end)
-            end
-        end
-    end
-end)
-    
-AutomaticsTab:CreateDivider()
-    
-autoFreeze = AutomaticsTab:CreateToggle({
-    Name = 'Auto Freeze',
-    Default = false,
-    Tip = 'Temporarily anchors your character on input.',
-})
-
-freezeDuration = AutomaticsTab:CreateSlider({
-    Name = 'Freeze Duration',
-    Min = 0,
-    Max = 3,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Duration the freeze state lasts.',
-})
-
-freezeKeybind = AutomaticsTab:CreateKeybind({
-    Name = 'Freeze Keybind',
-    Default = nil,
-    Tip = 'Key used to trigger freeze.',
-})
-
-userInputService.InputBegan:Connect(function(input)
-    if not autoFreeze.Value then return end
-    if freezeKeybind.Value and input.KeyCode ~= freezeKeybind.Value then return end
-
-    local character = player.Character
-    if not character then return end
-
-    local hrp = character:FindFirstChild('HumanoidRootPart')
-    if not hrp then return end
-
-    hrp.Anchored = true
-
-    task.delay(freezeDuration.Value, function()
-        if hrp then
-            hrp.Anchored = false
-        end
-    end)
-end)
-
-AutomaticsTab:CreateDivider()
-
-autoQb = AutomaticsTab:CreateToggle({
-    Name = 'Auto QB',
-    Default = false,
-    Tip = 'Automatically positions your character for quarterback play.',
-})
-
-autoQbMethod = AutomaticsTab:CreateDropdown({
-    Name = 'Auto QB Method',
-    Options = {'Walk', 'Teleport'},
-    Default = 'Walk',
-    Tip = 'Selects how automatic positioning is performed.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        if not autoQb.Value then continue end
-
-        local character = player.Character
-        if not character then continue end
-
-        local humanoid = character:FindFirstChildOfClass('Humanoid')
-        local humanoidRootPart = character:FindFirstChild('HumanoidRootPart')
-        if not humanoid or not humanoidRootPart then continue end
-
-        local ball = findClosestBall()
-        if not ball then continue end
-
-        if replicatedStorage:FindFirstChild('Flags')
-            and replicatedStorage.Flags:FindFirstChild('PossessionTag')
-            and replicatedStorage.Flags:FindFirstChild('Status')
-            and replicatedStorage.Flags.PossessionTag.Value == player.Team.Name
-            and replicatedStorage.Flags.Status.Value == 'PrePlay' then
-
-            if autoQbMethod.Value == 'Walk' then
-                humanoid:MoveTo(ball.Position)
-            elseif autoQbMethod.Value == 'Teleport' then
-                humanoidRootPart.CFrame = ball.CFrame
-            end
-        else
-            pcall(function()
-                ball.CFrame = humanoidRootPart.CFrame
-            end)
-        end
-    end
-end)
-    
-AutomaticsTab:CreateDivider()
-    
-    autoBoost = AutomaticsTab:CreateToggle({
-    Name = 'Auto Boost',
-    Default = false,
-    Tip = 'Automatically assists aerial movement near incoming footballs.',
-})
-
-targetClosestPlayer = AutomaticsTab:CreateToggle({
-    Name = 'Target Player Closer To The Ball',
-    Default = false,
-    Tip = 'Prioritizes players closest to the football.',
-})
-
-boostStrength = AutomaticsTab:CreateSlider({
-    Name = 'Boost Strength',
-    Min = 0,
-    Max = 3,
-    Default = 1.5,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Adjusts the strength of the boost effect.',
-})
-
-boostRadius = AutomaticsTab:CreateSlider({
-    Name = 'Boost Radius',
-    Min = 0,
-    Max = 15,
-    Default = 0,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Sets the activation distance for boosting.',
-})
-
-boostPower = AutomaticsTab:CreateSlider({
-    Name = 'Boost Power',
-    Min = 50,
-    Max = 70,
-    Default = 50,
-    Increment = 0.1,
-    Suffix = '',
-    Tip = 'Controls the upward force applied during a boost.',
-})
-
-task.spawn(function()
-    local activeTween
-
-    while true do
-        task.wait()
-
-        if not autoBoost.Value then
-            if activeTween then
-                activeTween:Cancel()
-                activeTween = nil
-            end
-
-            continue
-        end
-
-        local char = player.Character
-        if not char then continue end
-
-        local hum = char:FindFirstChildOfClass('Humanoid')
-        if not hum then continue end
-
-        local hrp = char:FindFirstChild('HumanoidRootPart')
-        if not hrp then continue end
-
-        if hum:GetState() == Enum.HumanoidStateType.Landed then
-            if activeTween then
-                activeTween:Cancel()
-                activeTween = nil
-            end
-
-            continue
-        end
-
-        local myHead = char:FindFirstChild('Head')
-        if not myHead then continue end
-
-        local targetPlayer
-
-        if targetClosestPlayer.Value then
-            local nearestBall
-            local nearestBallDist = math.huge
-
-            for _, ball in next, workspace:GetChildren() do
-                if not ball:IsA('BasePart') then continue end
-                if not ball.Name:lower():find('ball') then continue end
-
-                local dist = (ball.Position - myHead.Position).Magnitude
-
-                if dist < nearestBallDist then
-                    nearestBallDist = dist
-                    nearestBall = ball
-                end
-            end
-
-            if not nearestBall then continue end
-
-            local closestDist = math.huge
-
-            for _, v in next, players:GetPlayers() do
-                if v == player then continue end
-
-                local character = v.Character
-                if not character then continue end
-
-                local head = character:FindFirstChild('Head')
-                if not head then continue end
-
-                local dist = (head.Position - nearestBall.Position).Magnitude
-
-                if dist < closestDist then
-                    closestDist = dist
-                    targetPlayer = v
-                end
-            end
-        else
-            local closestDist = math.huge
-
-            for _, v in next, players:GetPlayers() do
-                if v == player then continue end
-
-                local character = v.Character
-                if not character then continue end
-
-                local head = character:FindFirstChild('Head')
-                if not head then continue end
-
-                local dist = (head.Position - myHead.Position).Magnitude
-
-                if dist < closestDist then
-                    closestDist = dist
-                    targetPlayer = v
-                end
-            end
-        end
-
-        if not targetPlayer then continue end
-
-        local character = targetPlayer.Character
-        if not character then continue end
-
-        local head = character:FindFirstChild('Head')
-        if not head then continue end
-
-        local targetHumanoid = character:FindFirstChildOfClass('Humanoid')
-        if not targetHumanoid then continue end
-
-        local myState = hum:GetState()
-        local targetState = targetHumanoid:GetState()
-
-        local distance = (head.Position - myHead.Position).Magnitude
-
-        if distance > boostRadius.Value then
-            continue
-        end
-
-        if myState ~= Enum.HumanoidStateType.Jumping
-            and myState ~= Enum.HumanoidStateType.Freefall then
-            continue
-        end
-
-        if targetState ~= Enum.HumanoidStateType.Jumping
-            and targetState ~= Enum.HumanoidStateType.Freefall then
-            continue
-        end
-
-        local speed = math.max(hum.WalkSpeed * boostStrength.Value, 1)
-        local targetPos = head.Position
-
-        local duration = math.max((hrp.Position - targetPos).Magnitude / speed, 0.01)
-
-        if activeTween then
-            activeTween:Cancel()
-        end
-
-        activeTween = tweenService:Create(
-            hrp,
-            TweenInfo.new(duration, Enum.EasingStyle.Linear),
-            {
-                CFrame = CFrame.new(targetPos)
-            }
-        )
-
-        activeTween:Play()
-
-        activeTween.Completed:Once(function(state)
-            if state ~= Enum.PlaybackState.Completed then
-                return
-            end
-
-            hrp.AssemblyLinearVelocity = Vector3.new(
-                hrp.AssemblyLinearVelocity.X,
-                boostPower.Value,
-                hrp.AssemblyLinearVelocity.Z
-            )
-        end)
-    end
-end)
-
-local MiscTab = Window:CreateTab({ Name = 'Misc', Icon = 'rbxassetid://129082556946713' })
-
-fpsCap = MiscTab:CreateSlider({
-    Name = 'Uncap FPS Amount',
-    Min = 30,
-    Max = 240,
-    Default = 240,
-    Increment = 1,
-    Suffix = '',
-    Tip = 'Sets the maximum FPS limit.',
-})
-
-task.spawn(function()
-    while true do
-        task.wait()
-
-        setfpscap(fpsCap.Value)
-    end
-end)
-
-antiAdmin = MiscTab:CreateToggle({
-    Name = 'Anti Admin',
-    Default = false,
-    Tip = 'Automatically reacts when administrators are detected.',
-    Keybind = nil,
-})
-
-task.spawn(function()
-    while task.wait() do
-        local playerGui = player:FindFirstChild("PlayerGui")
-        if not playerGui then continue end
-        
-        local miscText = playerGui:FindFirstChild("MiscText")
-        if not miscText then continue end
-        
-        local isVIP = miscText:FindFirstChild("IsVIP")
-        if not isVIP then continue end
-        
-        if isVIP.Visible == true then continue end
-        
-        for _, admin in next, players:GetPlayers() do
-            if admin == player then continue end
-            
-            local swagData = admin:FindFirstChild("SwagData")
-            if not swagData then continue end
-            
-            local adminTag = swagData:FindFirstChild("Admin")
-            if not adminTag then continue end
-            
-            if adminTag.Value ~= "" and antiAdmin.Value then
-                player:Kick("[Aero] Detected Admin\
-Name: " .. admin.Name .. "\
-ID: " .. admin.UserId)
-            end
-        end
-    end
-end)
-
-smoothReplay = MiscTab:CreateToggle({
-		Name = 'Smooth Replay',
-		Default = false,
-		Tip = 'Smooths replay playback for improved visual quality.',
-		Keybind = nil,
-	})
-
-	replayFPS = MiscTab:CreateSlider({
-		Name = 'Replay Frame Per Second',
-		Min = 9,
-		Max = 120,
-		Default = 9,
-		Increment = 1,
-		Tip = 'Sets the replay playback frame rate.',
-	})
-    
-if not isPractice then
-
-	local player = game:GetService('Players').LocalPlayer
-	local replicatedStorage = game:GetService('ReplicatedStorage')
-	local runService = game:GetService('RunService')
-
-	local remote = replicatedStorage:WaitForChild('Remotes'):WaitForChild('CharacterSoundEvent')
-	local heartbeat = runService.Heartbeat
-
-	local transition = player:WaitForChild('PlayerGui'):WaitForChild('MainGui'):WaitForChild('Transition')
-
-	local homeCamera = CFrame.Angles(-0.2617993877991494, 0, 0)
-	local awayCamera = CFrame.Angles(0.2617993877991494, math.pi, 0)
-
-	local cameraOffset = CFrame.new(0, 0, 19)
-
-	local limbs = {
-		'Torso',
-		'Left Arm',
-		'Right Arm',
-		'Left Leg',
-		'Right Leg',
-		'Head'
-	}
-
-	task.spawn(function()
-		while true do
-			task.wait()
-
-			local replayScript = player.PlayerScripts:FindFirstChild('ClientReplay')
-			if replayScript then
-				replayScript.Enabled = not smoothReplay.Value
-			end
-		end
-	end)
-
-	local replay = function(data, characters)
-		local replayBall = workspace:WaitForChild('ReplayBall')
-		local camera = workspace.CurrentCamera
-
-		camera.CameraType = Enum.CameraType.Scriptable
-		camera.CameraSubject = replayBall
-
-		local cameraRotation = data.changes[1].poss == 'h' and homeCamera or awayCamera
-
-		local currentChange = 1
-		local highestY = 18
-		local cameraTilt = true
-
-		local playback = 1
-		local recordedFPS = data.fps
-
-		local accumulator = 0
-		local last = tick()
-
-		local getFrame = function(index)
-			local maxFrames = #data.ball
-			if index < 1 then return 1 end
-			if index > maxFrames then return maxFrames end
-			return index
-		end
-
-		local interpolate = function(a, b, alpha)
-			return a:Lerp(b, alpha)
-		end
-
-		while playback < #data.ball do
-			if replicatedStorage.Flags.StatusTag.Value ~= 'REPLAY' then
-				break
-			end
-
-			if camera.CameraType ~= Enum.CameraType.Scriptable then
-				break
-			end
-
-			local replayFPSValue = replayFPS.Value
-			local replayDelta = 1 / replayFPSValue
-
-			local now = tick()
-			accumulator += now - last
-			last = now
-
-			while accumulator >= replayDelta do
-				playback += recordedFPS / replayFPSValue
-				accumulator -= replayDelta
-			end
-
-			local frame1 = getFrame(math.floor(playback))
-			local frame2 = getFrame(math.ceil(playback))
-			local alpha = playback - frame1
-
-			for _, character in next, characters do
-				local characterData = data.limbs[character.Name]
-				if not characterData then character.Parent = nil continue end
-
-				local limbData = characterData[1]
-				local accessoryData = characterData[2]
-
-				if not limbData[1] then
-					character.Parent = nil
-					continue
-				end
-
-				local torso1 = limbData[1][2][frame1]
-				local torso2 = limbData[1][2][frame2]
-
-				if not torso1 or not torso2 then
-					character.Parent = nil
-					continue
-				end
-
-				local torso = interpolate(torso1, torso2, alpha)
-
-				for i = 1, #limbs do
-					local limbName = limbs[i]
-					local limb = character:FindFirstChild(limbName)
-					if not limb then continue end
-
-					local replayLimb = limbData[i]
-					if not replayLimb then continue end
-
-					local cf1 = replayLimb[2][frame1]
-					local cf2 = replayLimb[2][frame2]
-
-					if i == 4 then
-						if cf1 and cf2 then
-							local angle = cf1 + ((cf2 - cf1) * alpha)
-
-							limb.CFrame =
-								torso *
-								CFrame.new(-0.5, -1, 0) *
-								CFrame.fromOrientation(angle, 0, 0) *
-								CFrame.new(0, -1, 0)
-						end
-					elseif i == 5 then
-						if cf1 and cf2 then
-							local angle = cf1 + ((cf2 - cf1) * alpha)
-
-							limb.CFrame =
-								torso *
-								CFrame.new(0.5, -1, 0) *
-								CFrame.fromOrientation(angle, 0, 0) *
-								CFrame.new(0, -1, 0)
-						end
-					else
-						if cf1 and cf2 then
-							limb.CFrame = interpolate(cf1, cf2, alpha)
-						elseif i == 6 then
-							limb.CFrame = torso * CFrame.new(0, 1.5, 0)
-						end
-					end
-				end
-
-				local uniform = character:FindFirstChild('Uniform')
-				if accessoryData and uniform then
-					for name, info in next, accessoryData do
-						if uniform:FindFirstChild(name) and character:FindFirstChild(info[1]) then
-							uniform[name].CFrame =
-								character[info[1]].CFrame * info[2]
-						end
-					end
-				end
-			end
-
-			local ball1 = data.ball[frame1]
-			local ball2 = data.ball[frame2]
-
-			if ball1 and ball2 then
-				replayBall.CFrame = interpolate(ball1, ball2, alpha)
-			end
-
-			if highestY < replayBall.Position.Y then
-				highestY = replayBall.Position.Y
-			elseif highestY > 49 and cameraTilt then
-				local x = select(1, cameraRotation:ToOrientation())
-
-				cameraRotation *= CFrame.Angles(
-					x * 3 * math.clamp((highestY - 50) / 99, 0, 1),
-					0,
-					0
-				)
-
-				cameraTilt = false
-			end
-
-			local targetCamera
-
-			if highestY > 49 and cameraTilt then
-				local x = select(1, cameraRotation:ToOrientation())
-
-				targetCamera =
-					CFrame.new(replayBall.Position) *
-					cameraRotation *
-					CFrame.Angles(
-						x * 3 * math.clamp((highestY - 50) / 99, 0, 1),
-						0,
-						0
-					) *
-					cameraOffset
-			else
-				targetCamera =
-					CFrame.new(replayBall.Position) *
-					cameraRotation *
-					cameraOffset
-			end
-
-			camera.CFrame = targetCamera
-
-			local change = data.changes[currentChange]
-
-			if change and change.frame <= frame1 then
-				currentChange += 1
-
-				if change.frame == frame1 then
-					if change.poss and (frame1 > 9 and (change.turnover or highestY > 49)) then
-						local nextRotation =
-							change.poss == 'h' and homeCamera or awayCamera
-
-						local duration =
-							(change.turnover == true or replayBall.Position.Y >= 13)
-							and 0.5
-							or (highestY / 500)
-
-						local elapsed = 0
-						local startRotation = cameraRotation
-
-						while elapsed < duration do
-							elapsed += heartbeat:Wait()
-
-							cameraRotation = startRotation:Lerp(
-								nextRotation,
-								math.clamp(elapsed / duration, 0, 1)
-							)
-
-							camera.CFrame =
-								CFrame.new(replayBall.Position) *
-								cameraRotation *
-								cameraOffset
-						end
-
-						cameraRotation = nextRotation
-
-					elseif change.freeze then
-						task.wait(change.freeze)
-					end
-				end
-			end
-
-			heartbeat:Wait()
-		end
-
-		remote:FireServer('ReplayFinished')
-
-		if replicatedStorage.Flags.StatusTag.Value == 'REPLAY' then
-			replicatedStorage.Flags.StatusTag.Value = ''
-		end
-
-		task.wait(0.2)
-
-		replayBall:Destroy()
-
-		for _, character in next, characters do
-			character:Destroy()
-		end
-
-		data.t = nil
-		data.limbs = nil
-		data.ball = nil
-
-		camera.CameraType = Enum.CameraType.Custom
-		camera.CameraSubject = player.Character.Humanoid
-	end
-
-	remote.OnClientEvent:Connect(function(action, ...)
-		if action == 'ClientReplay' then
-			while transition.Position.X.Scale > -2 and transition.Position.X.Scale < -0.5 do
-				task.wait()
-			end
-
-			replay(...)
-		end
-	end)
-
-end
+local f,e=loadstring(s)
+if not f then error("Aero load error: "..tostring(e)) end
+f()

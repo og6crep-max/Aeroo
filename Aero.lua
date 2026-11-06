@@ -1,7 +1,7 @@
 --[[
 	Aero Key System
-	- Keys are ONLY stored remotely (never hardcoded in the script)
-	- Optional HWID lock so a shared key only works on one PC
+	Supports: weekly / monthly / lifetime keys
+	Keys are stored only in remote keys.txt
 ]]
 local UserInputService = game:GetService('UserInputService')
 local TweenService = game:GetService('TweenService')
@@ -11,39 +11,15 @@ local HttpService = game:GetService('HttpService')
 local LocalPlayer = Players.LocalPlayer
 
 -- ======================== KEY CONFIG ========================
--- Put your keys in a raw GitHub / paste text file (ONE key per line)
--- Example keys.txt content:
--- AERO-XXXX-XXXX
--- AERO-YYYY-YYYY
 local REMOTE_KEYS_URL = "https://raw.githubusercontent.com/og6crep-max/Aeroo/main/keys.txt"
 
--- Set to true if you want each key locked to the first PC that uses it
-local HWID_LOCK = true
-
 local KEY_SAVE_FILE = "aero_key.txt"
-local HWID_SAVE_FILE = "aero_hwid.txt"
+local KEY_DATA_FILE = "aero_key_data.txt"   -- stores activation time + type
 -- ============================================================
 
 local function getUIParent()
     local success = pcall(function() return CoreGui.Name end)
     return success and CoreGui or LocalPlayer:WaitForChild('PlayerGui')
-end
-
-local function getHWID()
-    -- Simple stable identifier (executor / place based)
-    local id = tostring(game.JobId ~= "" and game.JobId or "local")
-    local uid = tostring(LocalPlayer.UserId)
-    local place = tostring(game.PlaceId)
-    -- Prefer executor functions if available
-    if gethwid then
-        local ok, h = pcall(gethwid)
-        if ok and h then return tostring(h) end
-    end
-    if getexecutorname then
-        local ok, n = pcall(getexecutorname)
-        if ok and n then id = id .. n end
-    end
-    return HttpService:GenerateGUID(false):gsub("-", "")  -- fallback random (will be saved)
 end
 
 local function saveKey(key)
@@ -62,22 +38,34 @@ local function loadSavedKey()
     return nil
 end
 
-local function saveHWID(hwid)
+local function saveKeyData(data)
     if writefile then
-        pcall(writefile, HWID_SAVE_FILE, hwid)
+        pcall(writefile, KEY_DATA_FILE, HttpService:JSONEncode(data))
     end
 end
 
-local function loadSavedHWID()
-    if isfile and readfile and isfile(HWID_SAVE_FILE) then
-        local ok, h = pcall(readfile, HWID_SAVE_FILE)
-        if ok and h and h ~= "" then
-            return h:gsub("%s+", "")
+local function loadKeyData()
+    if isfile and readfile and isfile(KEY_DATA_FILE) then
+        local ok, raw = pcall(readfile, KEY_DATA_FILE)
+        if ok and raw and raw ~= "" then
+            local success, data = pcall(function()
+                return HttpService:JSONDecode(raw)
+            end)
+            if success and type(data) == "table" then
+                return data
+            end
         end
     end
     return nil
 end
 
+-- Parse keys.txt
+-- Supported formats (one per line):
+--   KEY                    → lifetime
+--   KEY | lifetime
+--   KEY | weekly
+--   KEY | monthly
+--   KEY | weekly | 2026-11-12     (optional fixed expiry date YYYY-MM-DD)
 local function fetchRemoteKeys()
     if not REMOTE_KEYS_URL or REMOTE_KEYS_URL == "" then
         return {}
@@ -88,15 +76,84 @@ local function fetchRemoteKeys()
     if not ok or not result or result == "" then
         return {}
     end
+
     local keys = {}
     for line in result:gmatch("[^\r\n]+") do
-        local k = line:gsub("%s+", "")
-        -- ignore comments
-        if k ~= "" and not k:match("^#") and not k:match("^//") then
-            table.insert(keys, k)
+        line = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if line ~= "" and not line:match("^#") and not line:match("^//") then
+            local parts = {}
+            for part in line:gmatch("[^|]+") do
+                table.insert(parts, part:gsub("^%s+", ""):gsub("%s+$", ""))
+            end
+
+            local key = parts[1]
+            local keyType = (parts[2] or "lifetime"):lower()
+            local expiryDate = parts[3]  -- optional YYYY-MM-DD
+
+            if key and key ~= "" then
+                keys[key] = {
+                    type = keyType,
+                    expiry = expiryDate
+                }
+            end
         end
     end
     return keys
+end
+
+local function getDurationSeconds(keyType)
+    if keyType == "weekly" then
+        return 7 * 24 * 60 * 60
+    elseif keyType == "monthly" then
+        return 30 * 24 * 60 * 60
+    else
+        return nil  -- lifetime
+    end
+end
+
+local function isKeyStillValid(key, keyInfo)
+    if not keyInfo then return false end
+
+    local data = loadKeyData()
+    local now = os.time()
+
+    -- Fixed expiry date in keys.txt (YYYY-MM-DD)
+    if keyInfo.expiry and keyInfo.expiry ~= "" then
+        local y, m, d = keyInfo.expiry:match("(%d+)-(%d+)-(%d+)")
+        if y and m and d then
+            local exp = os.time({year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 23, min = 59, sec = 59})
+            if now > exp then
+                return false
+            end
+        end
+    end
+
+    local duration = getDurationSeconds(keyInfo.type)
+
+    -- Lifetime
+    if not duration then
+        return true
+    end
+
+    -- First time using this key → activate it now
+    if not data or data.key ~= key then
+        saveKeyData({
+            key = key,
+            type = keyInfo.type,
+            activated = now
+        })
+        return true
+    end
+
+    -- Already activated → check remaining time
+    local activated = tonumber(data.activated) or now
+    local expiresAt = activated + duration
+
+    if now > expiresAt then
+        return false  -- expired
+    end
+
+    return true
 end
 
 local function isValidKey(inputKey)
@@ -104,35 +161,39 @@ local function isValidKey(inputKey)
     inputKey = inputKey:gsub("%s+", "")
 
     local remote = fetchRemoteKeys()
-    if #remote == 0 then
-        return false  -- no keys available = reject
+    local keyInfo = remote[inputKey]
+    if not keyInfo then
+        return false
     end
 
-    local found = false
-    for _, k in ipairs(remote) do
-        if inputKey == k then
-            found = true
-            break
-        end
-    end
-    if not found then return false end
+    return isKeyStillValid(inputKey, keyInfo)
+end
 
-    -- HWID lock
-    if HWID_LOCK then
-        local currentHWID = loadSavedHWID()
-        if not currentHWID then
-            -- first time this key is used on this machine → bind it
-            local hwid = getHWID()
-            saveHWID(hwid)
-            return true
-        else
-            -- already bound, check match (simple local bind)
-            -- For stronger lock you would store key→hwid on a server
-            return true  -- local file already proves previous unlock on this PC
-        end
+local function getKeyStatusText(key)
+    local remote = fetchRemoteKeys()
+    local keyInfo = remote[key]
+    if not keyInfo then return "Invalid" end
+
+    if keyInfo.type == "lifetime" or not getDurationSeconds(keyInfo.type) then
+        return "Lifetime"
     end
 
-    return true
+    local data = loadKeyData()
+    if not data or data.key ~= key then
+        return keyInfo.type:upper()
+    end
+
+    local duration = getDurationSeconds(keyInfo.type)
+    local activated = tonumber(data.activated) or os.time()
+    local remaining = (activated + duration) - os.time()
+
+    if remaining <= 0 then
+        return "Expired"
+    end
+
+    local days = math.floor(remaining / 86400)
+    local hours = math.floor((remaining % 86400) / 3600)
+    return string.format("%s (%dd %dh left)", keyInfo.type:upper(), days, hours)
 end
 
 -- Auto-check saved key
@@ -140,7 +201,6 @@ local saved = loadSavedKey()
 local alreadyValid = saved and isValidKey(saved)
 
 if not alreadyValid then
-    -- Show key UI
     local uiParent = getUIParent()
 
     local ScreenGui = Instance.new("ScreenGui")
@@ -266,17 +326,17 @@ if not alreadyValid then
 
         task.spawn(function()
             if isValidKey(key) then
-                Status.Text = "Key accepted"
+                Status.Text = "Key accepted - " .. getKeyStatusText(key)
                 Status.TextColor3 = Color3.fromRGB(34, 197, 94)
                 saveKey(key)
                 TweenService:Create(Main, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
                     Size = UDim2.new(0, 340, 0, 0),
                     BackgroundTransparency = 1
                 }):Play()
-                task.wait(0.4)
+                task.wait(0.45)
                 ScreenGui:Destroy()
             else
-                Status.Text = "Invalid key"
+                Status.Text = "Invalid or expired key"
                 Status.TextColor3 = Color3.fromRGB(239, 68, 68)
                 TextBox.Text = ""
             end
@@ -288,7 +348,6 @@ if not alreadyValid then
         if enter then attemptUnlock() end
     end)
 
-    -- Block until unlocked
     while ScreenGui and ScreenGui.Parent do
         task.wait(0.1)
     end
